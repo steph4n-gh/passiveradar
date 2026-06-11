@@ -1,7 +1,9 @@
 # Rust
 /target
 /target_*
-*.rs.bk
+**/*.rs.bk
+*.pdb
+debug/
 
 # OS
 .DS_Store
