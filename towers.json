@@ -1,0 +1,54 @@
+{
+  "receiver": {
+    "latitude": 38.8951,
+    "longitude": -77.0364,
+    "elevation_m": 10.0
+  },
+  "towers": [
+    {
+      "name": "WETA-FM",
+      "callsign": "WETA",
+      "frequency_hz": 90900000.0,
+      "latitude": 38.9615,
+      "longitude": -77.1518,
+      "elevation_m": 350.0,
+      "erp_watts": 75000.0
+    },
+    {
+      "name": "WIYY-FM (98 Rock)",
+      "callsign": "WIYY",
+      "frequency_hz": 97900000.0,
+      "latitude": 39.3512,
+      "longitude": -76.6341,
+      "elevation_m": 420.0,
+      "erp_watts": 50000.0
+    },
+    {
+      "name": "WTOP-FM",
+      "callsign": "WTOP",
+      "frequency_hz": 103500000.0,
+      "latitude": 39.0435,
+      "longitude": -77.2014,
+      "elevation_m": 380.0,
+      "erp_watts": 100000.0
+    },
+    {
+      "name": "WKYS-FM",
+      "callsign": "WKYS",
+      "frequency_hz": 93900000.0,
+      "latitude": 38.9401,
+      "longitude": -77.0814,
+      "elevation_m": 286.0,
+      "erp_watts": 24500.0
+    },
+    {
+      "name": "WHUR-FM",
+      "callsign": "WHUR",
+      "frequency_hz": 96300000.0,
+      "latitude": 38.9244,
+      "longitude": -77.0156,
+      "elevation_m": 260.0,
+      "erp_watts": 24000.0
+    }
+  ]
+}

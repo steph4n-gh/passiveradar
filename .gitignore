@@ -1,0 +1,53 @@
+# Rust
+/target
+/target_*
+*.rs.bk
+
+# OS
+.DS_Store
+
+# Agent / Temp Directories
+.agents/
+fingerprints/
+test_out/
+
+# Artifacts
+research_notes.md
+research_report.md
+
+# Scratch Extensions
+*.diff
+*.patch
+*.o
+*.txt
+*.log
+*.orig
+*.rej
+*.bak
+*.worker
+
+# Scratch Scripts & Outputs (Root only)
+/check_*.py
+/check_*.rs
+/fix_*.py
+/print_*.rs
+/profile_test.rs
+/recover_part*.rs
+/rest_of_dashboard.rs
+/test_*.rs
+/test_*.py
+
+# Root Scratch Binaries
+/test_aarch64
+/test_borrow_speed
+/test_clone
+/test_decimator_logic
+/test_dispatch
+/test_empty_draw*
+/test_idx
+/test_macro
+/test_neon
+/test_rayon
+/test_script
+/test_simd
+/test_snr
