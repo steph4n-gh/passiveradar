@@ -2,6 +2,9 @@
 
 A high-performance, real-time software-defined radio (SDR) passive radar system written in Rust. This system exploits existing ambient RF illuminators (like FM radio towers) to detect and track aircraft via forward-scatter and bistatic reflections.
 
+> [!NOTE]
+> **Research & Experimental Notice**: This project is experimental in nature. The hardware pipeline is designed to work with simple indoor setups—specifically a vertical metal whip antenna mounted on a baking sheet (acting as an empirical ground plane) and connected to a HackRF One SDR receiver.
+
 ![Terminal UI Dashboard Screenshot](screenshot.png)
 
 ## Features
