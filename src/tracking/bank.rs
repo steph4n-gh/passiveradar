@@ -64,6 +64,38 @@ pub struct TrackedTarget {
     pub tracking_towers: Vec<String>,
 }
 
+impl TrackedTarget {
+    pub fn callsign(&self) -> String {
+        let classification = self.classification.to_lowercase();
+        if classification.contains("drone") || classification.contains("uav") {
+            format!("DRN-{:02}", self.id)
+        } else if classification.contains("ground") || classification.contains("vehicle") {
+            format!("VEH-{:02}", self.id)
+        } else if !self.classification.is_empty() && !self.classification.contains("Unknown") && !self.classification.contains("Target") {
+            let clean_name = self.classification.split_whitespace().next().unwrap_or(&self.classification);
+            let clean_name = clean_name.split('(').next().unwrap_or(clean_name).trim().to_uppercase();
+            if clean_name.len() >= 3 && clean_name.chars().all(|c| c.is_alphanumeric()) {
+                clean_name
+            } else if clean_name == "COMMERCIAL" || clean_name == "PROPELLER" || clean_name == "TURBOPROP" || clean_name == "LIGHT" || clean_name == "HELICOPTER" || clean_name == "SUPERSONIC" || clean_name == "HIGH-ALTITUDE" {
+                let prefix = match clean_name.as_str() {
+                    "COMMERCIAL" => "AAL",
+                    "PROPELLER" => "PRP",
+                    "TURBOPROP" => "TRB",
+                    "LIGHT" => "LGT",
+                    "HELICOPTER" => "COP",
+                    "SUPERSONIC" => "FTR",
+                    _ => "JETA",
+                };
+                format!("{}-{:02}", prefix, self.id)
+            } else {
+                format!("FLT-{:02}", self.id)
+            }
+        } else {
+            format!("TRK-{:02}", self.id)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CandidatePlot {
     pub frequency: f64,
@@ -613,9 +645,9 @@ impl TrackingBank {
         if towers_data.len() >= 3 {
             let mut to_prune = Vec::new();
             for target in &mut self.targets {
-                if target.state != TrackState::Terminated && target.hits >= 3 {
+                if target.state != TrackState::Terminated && target.hits >= 15 {
                     let obs = Self::compute_cech_obstruction(&target.ekf.state, towers_data);
-                    if obs > 35.0 {
+                    if obs > 300.0 {
                         log.push(format!(
                             "TrackedTarget Bank: Pruned inconsistent ghost Target {} ({}) due to Čech Obstruction (obs: {:.1} Hz)",
                             target.id, target.classification, obs
@@ -670,14 +702,15 @@ impl TrackingBank {
                 if target.state == TrackState::Coasting {
                     target.coasting_frames += 1;
                     
-                    // Dynamic coast limit: well-established tracks coast longer to survive large dropouts
-                    let max_coast_frames = if target.hits > 50 {
-                        300 // ~60 seconds
+                    // Dynamic coast limit: well-established tracks coast longer to survive large dropouts (time-based)
+                    let max_coast_time = if target.hits > 50 {
+                        40.0 // seconds
                     } else if target.hits > 20 {
-                        150 // ~30 seconds
+                        20.0 // seconds
                     } else {
-                        50  // ~10 seconds
+                        7.0  // seconds
                     };
+                    let max_coast_frames = (max_coast_time / dt).round().max(1.0) as u32;
 
                     if target.coasting_frames >= max_coast_frames {
                         target.state = TrackState::Terminated;
@@ -702,14 +735,15 @@ impl TrackingBank {
                             || target.classification.contains("AAL")
                             || target.classification.contains("UAL");
 
-                    // Raised thresholds: reduces churn from brief signal dropouts
-                    let max_misses = if is_airliner && target.state == TrackState::Active {
-                        25
+                    // Raised thresholds: reduces churn from brief signal dropouts (time-based)
+                    let max_miss_time = if is_airliner && target.state == TrackState::Active {
+                        3.2 // seconds
                     } else if target.state == TrackState::Suspect {
-                        18 // Give suspect tracks more time to accumulate hits
+                        2.3 // seconds
                     } else {
-                        14 // Normal active tracks: ~2.8 seconds before coasting
+                        1.8 // seconds
                     };
+                    let max_misses = (max_miss_time / dt).round().max(1.0) as usize;
 
                     if target.misses >= max_misses {
                         if target.state == TrackState::Active {
@@ -1718,18 +1752,18 @@ mod tests {
 
         let empty_peaks: &[(f32, f32)] = &[];
 
-        // Run updates with NO peaks for 14 iterations (new threshold for non-airliner Active tracks)
-        for _ in 0..14 {
+        // Run updates with NO peaks for 18 iterations (new time-based threshold for non-airliner Active tracks)
+        for _ in 0..18 {
             bank.update(&tower_pos, fc, dt, empty_peaks, &mut log);
         }
 
-        // After 14 iterations:
-        // - Drone target (ID 1) should be Coasting (not yet Terminated — needs 25 more coast frames)
-        // - Airliners (ID 2 and 3) should still be active (their threshold is 25)
+        // After 18 iterations:
+        // - Drone target (ID 1) should be Coasting (threshold 1.8s / 0.1s = 18 misses)
+        // - Airliners (ID 2 and 3) should still be active (threshold 3.2s / 0.1s = 32 misses)
         assert_eq!(
             bank.targets.iter().find(|t| t.id == 1).unwrap().state,
             TrackState::Coasting,
-            "Drone target should be coasting after 14 misses"
+            "Drone target should be coasting after 18 misses"
         );
         assert_eq!(
             bank.targets.iter().find(|t| t.id == 2).unwrap().state,
@@ -1742,13 +1776,13 @@ mod tests {
             "Airliner target 2 should still be active"
         );
 
-        // Run 55 more iterations to push the drone through coasting into Terminated
-        // (New dynamic coasting limit for low-hit tracks is 50 frames)
-        for _ in 0..55 {
+        // Run 70 more iterations to push the drone through coasting into Terminated
+        // (New dynamic coasting limit for low-hit tracks is 7.0s / 0.1s = 70 frames)
+        for _ in 0..70 {
             bank.update(&tower_pos, fc, dt, empty_peaks, &mut log);
         }
 
-        // After 14 + 55 = 69 total iterations: drone should be Terminated
+        // After 18 + 70 = 88 total iterations: drone should be Terminated
         assert_eq!(
             bank.targets.iter().find(|t| t.id == 1).unwrap().state,
             TrackState::Terminated,
@@ -1776,8 +1810,8 @@ mod tests {
         );
 
         // Run enough additional iterations to push airliners through Coasting -> Terminated
-        // Airliners have had 14+25+1 = 40 total misses at this point, need 25 to coast, then 25 to terminate
-        // They entered coasting at miss 25, and have been coasting for 40-25 = 15 frames. Need 10 more.
+        // Airliners entered coasting at miss 32, and need 70 coasting frames.
+        // Currently at iteration 89 (89 - 32 = 57 coast frames). Need 13 more, run 15.
         for _ in 0..15 {
             bank.update(&tower_pos, fc, dt, empty_peaks, &mut log);
         }

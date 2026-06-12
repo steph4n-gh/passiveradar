@@ -6,7 +6,7 @@ use std::time::Instant;
 
 #[test]
 fn test_profile() {
-    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
     for _ in 0..200 {
         db.add_spectrum(vec![0.0; 1000]);
     }
@@ -30,7 +30,7 @@ fn test_profile() {
 
 #[test]
 fn test_clone_speed() {
-    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
     for _ in 0..200 {
         db.add_spectrum(vec![0.0; 1000]);
     }
@@ -51,7 +51,7 @@ fn test_clone_speed() {
 
 #[test]
 fn test_draw_speed() {
-    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
     for _ in 0..200 {
         db.add_spectrum(vec![0.0; 1000]);
     }
@@ -77,7 +77,7 @@ fn test_draw_speed() {
 
 #[test]
 fn test_span_count() {
-    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
     for _ in 0..200 {
         db.add_spectrum(vec![0.0; 1000]);
     }

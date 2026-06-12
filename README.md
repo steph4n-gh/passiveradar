@@ -2,6 +2,8 @@
 
 A high-performance, real-time software-defined radio (SDR) passive radar system written in Rust. This system exploits existing ambient RF illuminators (like FM radio towers) to detect and track aircraft via forward-scatter and bistatic reflections.
 
+![Terminal UI Dashboard Screenshot](screenshot.png)
+
 ## Features
 
 - **Real-Time DSP Pipeline**: Ingests IQ samples from SDR hardware (or high-fidelity simulation) at rates up to 2.4+ MSPS.
@@ -59,8 +61,37 @@ cargo run --bin passiveradar --release -- --disable-gpu
 - `-r, --rate <RATE>`: SDR input sample rate in MSPS (default: 2.048).
 - `--lna <GAIN>`: LNA gain in dB (default: 32.0).
 - `--vga <GAIN>`: VGA gain in dB (default: 30.0).
+- `--port <PORT>`: Custom WebSocket listener port for streaming telemetry (default: 8085).
+- `--web-port <PORT>`: Custom HTTP Web HUD listener port serving frontend files (default: 8080).
+- `--host <HOST>`: Custom WebSocket listener host address (default: "127.0.0.1").
+- `--heading <HEADING>`: Compass alignment rotation heading in degrees (default: 0.0).
+- `--lat <LAT>`: Override default receiver latitude.
+- `--lon <LON>`: Override default receiver longitude.
 - `--disable-gpu`: Forces the DSP engine to fallback to CPU `rustfft` computation.
 - `--compat`: Enables compatibility mode for older terminals (ASCII lines).
+
+## Web Companion HUD
+
+The system hosts an integrated, concurrent web server that broadcasts real-time telemetry and waterfall data directly to a browser:
+1. Start the radar stack using `cargo run`.
+2. Open your browser and navigate to `http://localhost:8080`.
+3. The cybernetic HUD provides:
+   - **Plan Position Indicator (PPI) Scope**: Track trails, vector heading line, and locked bracket target overlays.
+   - **Range-Doppler Waterfall**: Scrolling plasma spectrograph indicating raw echo strengths.
+   - **Interactive Audio Engine**: Real-time synthesized Doppler beeps and ambient radar soundscapes (using Web Audio API).
+   - **3D Elevation & JEM Profiles**: Displays 3D target altitude traces and micro-Doppler spectral signatures.
+   - **Retro Hacker Shell**: Controls clutter jamming, radar frequency scanning, and threat spoofing scenarios.
+
+### D.C. Metro Area Optimal FM Clusters
+
+When running in the D.C., Bethesda, or Potomac areas, the dense FM radio spectrum allows tracking multiple towers concurrently within a single SDR bandwidth. 
+
+If running without the `-f` flag, the auto-tuning engine will select these clusters automatically. To override and target a specific cluster:
+
+*   **90 MHz Lower Cluster (5 Towers)**: Tune to `-f 90.2` (with `--rate 6` or higher) or `-f 89.3` (with `--rate 2.048`).
+    *   *Coverage*: `88.5 MHz` (WAMU), `89.3 MHz` (WPFW), `90.1 MHz` (WCSP), `90.9 MHz` (WETA), and `91.9 MHz` (WGTS).
+*   **95 MHz Middle Cluster (4 Towers)**: Tune to `-f 95.1` (with `--rate 6` or higher) or `-f 94.7` (with `--rate 2.048`).
+    *   *Coverage*: `93.9 MHz` (WKYS), `94.7 MHz` (WIAD), `95.5 MHz` (WPGC), and `96.3 MHz` (WHUR).
 
 ## Terminal Controls
 
@@ -69,15 +100,18 @@ cargo run --bin passiveradar --release -- --disable-gpu
 - **L**: Toggle System Logs panel.
 - **T**: Toggle Active Towers panel.
 - **W**: Toggle Waterfall panel.
+- **R**: Toggle Tactical Records panel.
+- **U**: Toggle showing Suspect (unconfirmed) tracks.
 
 ## Architecture
 
 The system is decoupled into isolated threads to prevent UI rendering from blocking the strict DSP deadlines:
-1. **SDR Ingestion**: Continuously pulls raw IQ blocks from hardware.
+1. **SDR Ingest & Recycler**: Continuously pulls raw IQ blocks from hardware using a zero-allocation buffer pool.
 2. **DSP Pipeline**:
-   - Digital Down Conversion (DDC)
-   - SIMD FIR Decimation
-   - NLMS Clutter Cancellation (Direct path rejection)
-   - GPU/Multithreaded Cross-Ambiguity Function (CAF)
-3. **Tracking & EKF**: Extracts peaks from the CAF matrix and updates the tracking bank.
-4. **TUI Render**: Throttles string allocations and draws cached data to the screen.
+   - Digital Down Conversion (DDC) and complex rotating phasor downsampling.
+   - SIMD FIR Decimation.
+   - NLMS Clutter Cancellation (Direct path / multipath rejection).
+   - GPU-accelerated or multithreaded Zero-Allocation Cross-Ambiguity Function (CAF).
+3. **Tracking & EKF**: Extracts peaks from the CAF matrix, filters ghost/mirror tracks via Čech obstruction checks, and updates the EKF state.
+4. **TUI & Web HUD Stream**: Feeds terminal rendering widgets and broadcasts telemetry JSONs over WebSockets.
+

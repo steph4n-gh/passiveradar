@@ -4,7 +4,7 @@ use ratatui::Terminal;
 use std::time::Instant;
 
 fn main() {
-    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
     db.update_caf(vec![vec![0.5; 256]; 200]);
 
     let backend = TestBackend::new(200, 200);

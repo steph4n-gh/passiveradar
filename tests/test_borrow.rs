@@ -4,7 +4,7 @@ use std::time::Instant;
 
 #[test]
 fn test_borrow_speed() {
-    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
     for _ in 0..200 { db.add_spectrum(vec![0.0; 1000]); }
     let area = Rect::new(0, 0, 300, 300);
     let mut backend = ratatui::backend::TestBackend::new(300, 300);

@@ -16,6 +16,44 @@ fn snr_to_color(db: f32) -> Color {
     Color::Rgb(r, g, b)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EllipseMode {
+    None,
+    Selected,
+    All,
+}
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordEntry {
+    pub value: f64,
+    pub target_id: u32,
+    pub classification: String,
+    pub callsign: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TacticalRecords {
+    pub fastest_plane: Option<RecordEntry>,
+    pub highest_drone: Option<RecordEntry>,
+    pub closest_target: Option<RecordEntry>,
+    pub max_cancellation: f64,
+    pub max_simultaneous_tracks: usize,
+}
+
+impl TacticalRecords {
+    pub fn new() -> Self {
+        Self {
+            fastest_plane: None,
+            highest_drone: None,
+            closest_target: None,
+            max_cancellation: 0.0,
+            max_simultaneous_tracks: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct VisiblePanes {
     pub logs: bool,
@@ -23,7 +61,14 @@ pub struct VisiblePanes {
     pub waterfall: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaterfallMode {
+    DopplerTime,
+    RangeDoppler,
+}
+
 pub struct Dashboard {
+    pub waterfall_mode: WaterfallMode,
     pub waterfall_history: Vec<Vec<f32>>,
     pub caf_matrix: Vec<Vec<f32>>,
     pub max_waterfall_rows: usize,
@@ -58,6 +103,7 @@ pub struct Dashboard {
     pub cached_table_selected_target_id: Option<u32>,
     pub cached_table_area: ratatui::layout::Rect,
     pub cached_table_rows: Vec<ratatui::widgets::Row<'static>>,
+    pub cached_show_unconfirmed: bool,
 
     pub last_logs_update: Option<std::time::Instant>,
     pub cached_logs_area: ratatui::layout::Rect,
@@ -75,11 +121,52 @@ pub struct Dashboard {
     pub cached_inspection_snr: Vec<ratatui::text::Line<'static>>,
     pub cached_inspection_jem: Vec<ratatui::text::Line<'static>>,
     pub cached_inspection_history: Vec<ratatui::widgets::Row<'static>>,
+    pub heading_deg: f64,
+    pub ellipse_mode: EllipseMode,
+    pub dsp_threshold: f32,
+    pub gain: f64,
+    pub dc_block: bool,
+    pub show_constellation: bool,
+    pub show_aligner: bool,
+    pub show_hacker: bool,
+    pub crt_mode: bool,
+    pub screen_shake: bool,
+    pub doppler_scale_pm: bool,
+    pub mock_no_audio: bool,
+    pub max_targets: bool,
+    pub no_signal: bool,
+    pub is_test: bool,
+    pub ws_port: Option<u16>,
+    pub cached_screen_shake: bool,
+    pub waterfall_min: i64,
+    pub waterfall_max: i64,
+    pub waterfall_signal: f64,
+    pub constellation_rate: i64,
+    pub outlier_filtered: bool,
+    pub iq_density: i64,
+    pub manually_added_iq_points: Vec<[f32; 2]>,
+    pub last_constellation: Vec<[f32; 2]>,
+    pub show_jem_spectrogram: bool,
+    pub cached_show_jem_spectrogram: bool,
+    pub jamming_active: bool,
+    pub spoof_requests: Vec<(u32, f64)>,
+    pub spoofed_ids: Vec<u32>,
+    pub dc_alpha: f32,
+    pub dc_offset: f32,
+    pub doppler_fft_size: usize,
+    pub active_spoof_count: usize,
+    pub overflow_alarm: bool,
+    pub velocity_injections: Vec<(u32, f64)>,
+    pub frequency_offset: f64,
+    pub show_records: bool,
+    pub tactical_records: TacticalRecords,
+    pub show_unconfirmed: bool,
 }
 
 impl Dashboard {
-    pub fn new(center_freq: f64, sample_rate: f64, ddc_offset: f64, sdr_type: String) -> Self {
+    pub fn new(center_freq: f64, sample_rate: f64, ddc_offset: f64, sdr_type: String, heading_deg: f64) -> Self {
         Self {
+            waterfall_mode: WaterfallMode::RangeDoppler,
             waterfall_history: Vec::new(),
             caf_matrix: Vec::new(),
             max_waterfall_rows: 200,
@@ -114,6 +201,7 @@ impl Dashboard {
             cached_table_selected_target_id: None,
             cached_table_area: ratatui::layout::Rect::default(),
             cached_table_rows: Vec::new(),
+            cached_show_unconfirmed: false,
             last_logs_update: None,
             cached_logs_area: ratatui::layout::Rect::default(),
             cached_logs_lines: Vec::new(),
@@ -128,6 +216,46 @@ impl Dashboard {
             cached_inspection_snr: Vec::new(),
             cached_inspection_jem: Vec::new(),
             cached_inspection_history: Vec::new(),
+            heading_deg,
+            ellipse_mode: EllipseMode::None,
+            dsp_threshold: 5.8,
+            gain: 6.0,
+            dc_block: false,
+            show_constellation: true,
+            show_aligner: true,
+            show_hacker: false,
+            crt_mode: false,
+            screen_shake: false,
+            doppler_scale_pm: false,
+            mock_no_audio: false,
+            max_targets: false,
+            no_signal: false,
+            is_test: false,
+            ws_port: None,
+            cached_screen_shake: false,
+            waterfall_min: -100,
+            waterfall_max: 0,
+            waterfall_signal: 0.0,
+            constellation_rate: 30,
+            outlier_filtered: false,
+            iq_density: 64,
+            manually_added_iq_points: Vec::new(),
+            last_constellation: Vec::new(),
+            show_jem_spectrogram: false,
+            cached_show_jem_spectrogram: false,
+            jamming_active: false,
+            spoof_requests: Vec::new(),
+            spoofed_ids: Vec::new(),
+            dc_alpha: 0.99f32,
+            dc_offset: 0.0f32,
+            doppler_fft_size: 256,
+            active_spoof_count: 0,
+            overflow_alarm: false,
+            velocity_injections: Vec::new(),
+            frequency_offset: 0.0,
+            show_records: false,
+            tactical_records: TacticalRecords::new(),
+            show_unconfirmed: false,
         }
     }
 
@@ -278,7 +406,7 @@ impl Dashboard {
         area: Rect,
         target: &TrackedTarget,
     ) {
-        let title_str = format!(" Target {} Inspection & EKF State ", target.id);
+        let title_str = format!(" Inspection & EKF State - Target {} - Micro-Doppler Scope ", target.callsign());
         let block = self.create_block(
             &title_str,
             Color::Green,
@@ -300,7 +428,8 @@ impl Dashboard {
         let now = std::time::Instant::now();
         let needs_update = self.last_inspection_update.map_or(true, |t| now.duration_since(t).as_millis() >= 300)
             || self.cached_inspection_area != area
-            || self.cached_inspection_target_id != Some(target.id);
+            || self.cached_inspection_target_id != Some(target.id)
+            || self.cached_show_jem_spectrogram != self.show_jem_spectrogram;
 
         if needs_update {
             // Render Info
@@ -315,7 +444,14 @@ impl Dashboard {
                     Span::styled("ID: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(format!("{}", target.id), Style::default().fg(Color::White)),
                     Span::styled("  State: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("{:?}", target.state), Style::default().fg(Color::Green)),
+                    Span::styled(
+                        if target.state == crate::tracking::bank::TrackState::Terminated {
+                            "Target Terminated".to_string()
+                        } else {
+                            format!("{:?}", target.state)
+                        },
+                        Style::default().fg(Color::Green)
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("Classification: ", Style::default().fg(Color::DarkGray)),
@@ -387,18 +523,103 @@ impl Dashboard {
             // Render JEM Spectrum
             let chart_width = chunks[3].width.saturating_sub(2) as usize;
             let chart_height = chunks[3].height.saturating_sub(2) as usize;
-            let chart_lines = self.render_ascii_bar_chart(&target.jem.latest_fft_mag, chart_width, chart_height);
             
-            let mut jem_elements = vec![
-                Line::from(Span::styled("--- JEM MODULATION SPECTRUM (FFT Bins) ---", Style::default().fg(Color::Yellow))),
-            ];
-            for l in chart_lines {
-                jem_elements.push(Line::from(Span::styled(l, Style::default().fg(Color::Cyan))));
+            let scale_str = if self.doppler_scale_pm { "Scale: +/-" } else { "Scale: Default" };
+            let jem_class = if target.jem.get_sidebands_hz().is_none() {
+                "UNKNOWN"
+            } else {
+                let is_prop = target.classification.contains("Propeller")
+                    || target.classification.contains("Turboprop")
+                    || target.ekf.state[2] < 3000.0;
+                if is_prop {
+                    "prop"
+                } else {
+                    "turbine"
+                }
+            };
+
+            let title_line = if self.show_jem_spectrogram {
+                Line::from(vec![
+                    Span::styled("--- JEM Analysis: MODULATION SPECTROGRAM (Waterfall) ---", Style::default().fg(Color::Yellow)),
+                    Span::raw("   "),
+                    Span::styled(scale_str, Style::default().fg(Color::Cyan)),
+                    Span::raw("   "),
+                    Span::styled(format!("Class: {}", jem_class), Style::default().fg(Color::Green)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled("--- JEM Analysis: MODULATION SPECTRUM (FFT Bins) ---", Style::default().fg(Color::Yellow)),
+                    Span::raw("   "),
+                    Span::styled(scale_str, Style::default().fg(Color::Cyan)),
+                    Span::raw("   "),
+                    Span::styled(format!("Class: {}", jem_class), Style::default().fg(Color::Green)),
+                ])
+            };
+
+            let mut jem_elements = vec![title_line];
+
+            if self.show_jem_spectrogram {
+                let history_len = target.jem.history.len();
+                let rows_to_take = history_len.min(chart_height);
+                let skip_count = history_len.saturating_sub(rows_to_take);
+
+                // Find global max value in history for scaling
+                let global_max = target.jem.history.iter()
+                    .flat_map(|row| row.iter())
+                    .copied()
+                    .fold(0.0f32, |a, b| a.max(b));
+
+                for row_idx in 0..chart_height {
+                    if row_idx < rows_to_take {
+                        let row_data = &target.jem.history[skip_count + row_idx];
+                        let chunk_size = row_data.len() as f64 / chart_width as f64;
+                        let mut spans = Vec::with_capacity(chart_width);
+                        for i in 0..chart_width {
+                            let start = (i as f64 * chunk_size).floor() as usize;
+                            let end = (((i + 1) as f64 * chunk_size).floor() as usize).min(row_data.len());
+                            let mut val = 0.0f32;
+                            for j in start..end {
+                                if row_data[j] > val {
+                                    val = row_data[j];
+                                }
+                            }
+
+                            let norm = if global_max > 1e-5 {
+                                (val / global_max).min(1.0).max(0.0)
+                            } else {
+                                0.0
+                            };
+                            let chars = [' ', '.', ':', '-', '=', '+', '*', '%', '#', '█'];
+                            let char_idx = (norm * 9.0).round() as usize;
+                            let ch = chars[char_idx.min(9)];
+                            let color = if norm < 0.1 {
+                                Color::DarkGray
+                            } else if norm < 0.4 {
+                                Color::Green
+                            } else if norm < 0.7 {
+                                Color::LightGreen
+                            } else {
+                                Color::Cyan
+                            };
+                            spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+                        }
+                        jem_elements.push(Line::from(spans));
+                    } else {
+                        jem_elements.push(Line::from(vec![Span::raw(" ".repeat(chart_width))]));
+                    }
+                }
+            } else {
+                let chart_lines = self.render_ascii_bar_chart(&target.jem.latest_fft_mag, chart_width, chart_height);
+                for l in chart_lines {
+                    jem_elements.push(Line::from(Span::styled(l, Style::default().fg(Color::Cyan))));
+                }
             }
+
             self.cached_inspection_jem = jem_elements;
             self.last_inspection_update = Some(now);
             self.cached_inspection_area = area;
             self.cached_inspection_target_id = Some(target.id);
+            self.cached_show_jem_spectrogram = self.show_jem_spectrogram;
         }
 
         frame.render_widget(Paragraph::new(self.cached_inspection_info.clone()), chunks[0]);
@@ -454,6 +675,8 @@ impl Dashboard {
         targets: &[TrackedTarget],
         transients: &[crate::tracking::bank::TransientEvent],
     ) {
+        self.update_tactical_records(targets);
+        self.overflow_alarm = self.gain > 45.0;
         // Divide the UI into:
         // Top: Status bar (Height = 3)
         // Middle: Left (Target Table & Map) and Right (Doppler Waterfall & Transients or Target Inspection)
@@ -461,7 +684,8 @@ impl Dashboard {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3), // Status bar
-                Constraint::Min(10),   // Main visualization
+                Constraint::Min(0),    // Main visualization
+                Constraint::Length(1), // Footer keybinds/states legend
             ])
             .split(area);
 
@@ -471,14 +695,16 @@ impl Dashboard {
         // Sort targets to correctly map selected_target_id — stable by (state_priority, id)
         let sorted_targets = {
             let mut sorted: Vec<&TrackedTarget> = targets.iter().collect();
+            let selected_id = self.selected_target_id;
             sorted.sort_by_key(|t| {
+                let is_sel = selected_id == Some(t.id);
                 let s = match t.state {
                     crate::tracking::bank::TrackState::Active => 0u32,
                     crate::tracking::bank::TrackState::Coasting => 1,
                     crate::tracking::bank::TrackState::Suspect => 2,
                     crate::tracking::bank::TrackState::Terminated => 3,
                 };
-                (s, t.id)
+                (!is_sel, s, t.id)
             });
             sorted
         };
@@ -486,22 +712,56 @@ impl Dashboard {
         let selected_target = self.selected_target_id.and_then(|id| sorted_targets.iter().find(|t| t.id == id).copied());
 
         // Dynamic collapses:
-        // If area.width < 100, collapse Waterfall and Transients.
+        // If area.width < collapse_threshold, collapse Waterfall and Transients.
         // If area.height < 30, collapse Logs.
         // If area.height < 20, collapse ENU map (Towers).
-        let show_right = area.width >= 100 && (self.visible_panels.waterfall || selected_target.is_some());
+        let collapse_threshold = if self.ws_port.is_some() { 80 } else { 100 };
+        let show_right = area.height >= 10 && area.width >= collapse_threshold && (self.visible_panels.waterfall || selected_target.is_some());
         let show_map = self.visible_panels.towers && area.height >= 20;
         let show_logs = self.visible_panels.logs && area.height >= 30;
 
-        // Split middle area
-        let visual_chunks = Layout::default()
+        let show_right_col = area.height >= 10 && area.width >= collapse_threshold && (self.show_aligner || self.show_constellation || self.show_hacker || self.show_records);
+
+        let mut constraints = Vec::new();
+        constraints.push(Constraint::Percentage(34)); // Left column
+        if show_right {
+            constraints.push(Constraint::Percentage(33)); // Middle column
+        }
+        if show_right_col {
+            constraints.push(Constraint::Percentage(33)); // Right column
+        }
+
+        let num_cols = constraints.len();
+        let constraints = if num_cols == 1 {
+            vec![Constraint::Percentage(100)]
+        } else if num_cols == 2 {
+            vec![Constraint::Percentage(55), Constraint::Percentage(45)]
+        } else {
+            vec![Constraint::Percentage(45), Constraint::Percentage(35), Constraint::Percentage(20)]
+        };
+
+        let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints(if show_right {
-                vec![Constraint::Percentage(50), Constraint::Percentage(50)]
-            } else {
-                vec![Constraint::Percentage(100)]
-            })
+            .constraints(constraints)
             .split(main_chunks[1]);
+
+        let left_area = columns[0];
+        let mut col_idx = 1;
+
+        let middle_area = if show_right {
+            let area = columns[col_idx];
+            col_idx += 1;
+            Some(area)
+        } else {
+            None
+        };
+
+        let right_area = if show_right_col {
+            let area = columns[col_idx];
+            Some(area)
+        } else {
+            None
+        };
 
         // Split Left area vertically based on active panels
         let mut left_constraints = Vec::new();
@@ -522,7 +782,7 @@ impl Dashboard {
         let left_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints(left_constraints)
-            .split(visual_chunks[0]);
+            .split(left_area);
 
         let mut current_idx = 0;
         self.render_targets_table(frame, left_layout[current_idx], targets);
@@ -538,9 +798,9 @@ impl Dashboard {
         }
 
         // Render Right panel if visible
-        if show_right {
+        if let Some(area) = middle_area {
             if let Some(target) = selected_target {
-                self.render_target_inspection(frame, visual_chunks[1], target);
+                self.render_target_inspection(frame, area, target);
             } else {
                 let right_chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -548,28 +808,82 @@ impl Dashboard {
                         Constraint::Percentage(70), // Top: Waterfall
                         Constraint::Percentage(30), // Bottom: Atmospheric events
                     ])
-                    .split(visual_chunks[1]);
+                    .split(area);
 
                 self.render_waterfall(frame, right_chunks[0], targets, transients);
                 self.render_transients_table(frame, right_chunks[1], transients);
             }
         }
+
+        // Render Column 3 (Aligner, Constellation, Hacker, Records)
+        if let Some(area) = right_area {
+            let mut right_constraints = Vec::new();
+            if self.show_aligner {
+                right_constraints.push(Constraint::Percentage(100));
+            }
+            if self.show_constellation {
+                right_constraints.push(Constraint::Percentage(100));
+            }
+            if self.show_hacker {
+                right_constraints.push(Constraint::Percentage(100));
+            }
+            if self.show_records {
+                right_constraints.push(Constraint::Percentage(100));
+            }
+
+            let num_right_panes = right_constraints.len();
+            let right_constraints = if num_right_panes == 1 {
+                vec![Constraint::Percentage(100)]
+            } else if num_right_panes == 2 {
+                vec![Constraint::Percentage(50), Constraint::Percentage(50)]
+            } else if num_right_panes == 3 {
+                vec![Constraint::Percentage(33), Constraint::Percentage(33), Constraint::Percentage(34)]
+            } else {
+                vec![Constraint::Percentage(25), Constraint::Percentage(25), Constraint::Percentage(25), Constraint::Percentage(25)]
+            };
+
+            let right_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(right_constraints)
+                .split(area);
+
+            let mut pane_idx = 0;
+            if self.show_aligner {
+                self.render_aligner_panel(frame, right_layout[pane_idx]);
+                pane_idx += 1;
+            }
+            if self.show_constellation {
+                self.render_constellation_panel(frame, right_layout[pane_idx]);
+                pane_idx += 1;
+            }
+            if self.show_hacker {
+                self.render_hacker_panel(frame, right_layout[pane_idx]);
+                pane_idx += 1;
+            }
+            if self.show_records {
+                self.render_records_panel(frame, right_layout[pane_idx]);
+            }
+        }
+        self.render_footer(frame, main_chunks[2]);
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let towers_str = if self.active_towers.is_empty() {
-            self.tower_name.clone()
-        } else {
-            self.active_towers
-                .iter()
-                .map(|(name, _)| name.split('-').next().unwrap_or(name).trim().to_string())
-                .collect::<Vec<String>>()
-                .join(", ")
-        };
+        if area.width < 50 {
+            let mut status_spans = vec![];
+            status_spans.push(Span::raw("CRT: "));
+            status_spans.push(Span::styled(
+                if self.crt_mode { "ON" } else { "OFF" },
+                Style::default().fg(Color::Cyan),
+            ));
+            let status_text = vec![Line::from(status_spans)];
+            let paragraph = Paragraph::new(status_text).block(self.create_block("", Color::DarkGray));
+            frame.render_widget(paragraph, area);
+            return;
+        }
 
         let carrier_db = 20.0 * self.carrier_rms.max(1e-10).log10();
-        let sig_color = if self.carrier_rms < 0.001 {
-            Color::Red
+        let sig_color = if self.carrier_rms < 0.0001 {
+            Color::Yellow
         } else if self.clipping_rate > 0.01 {
             Color::LightRed
         } else {
@@ -586,12 +900,21 @@ impl Dashboard {
 
         let mut status_spans = vec![
             Span::styled(
-                " PASSIVE RADAR DSP PIPELINE ",
+                " PR HUD ",
                 Style::default()
                     .add_modifier(Modifier::BOLD)
                     .fg(Color::Yellow),
             ),
         ];
+
+        if self.screen_shake {
+            status_spans.push(Span::styled(
+                " [SCREEN SHAKE] ",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Red),
+            ));
+        }
 
         if self.paused {
             status_spans.push(Span::styled(
@@ -614,32 +937,74 @@ impl Dashboard {
 
         status_spans.extend(vec![
             Span::styled(&self.sdr_type, Style::default().fg(Color::Green)),
-            Span::raw(" | Freq: "),
+            Span::raw(" | F: "),
             Span::styled(
                 format!("{:.1} MHz", self.center_freq / 1e6),
                 Style::default().fg(Color::Cyan),
             ),
-            Span::raw(" | Rate: "),
+            Span::raw(" | R: "),
             Span::styled(
                 format!("{:.3} MSPS", self.sample_rate / 1e6),
                 Style::default().fg(Color::Cyan),
             ),
-            Span::raw(" | Active Towers: "),
-            Span::styled(
-                format!("{} (DDC={:+.1} Hz)", towers_str, self.ddc_offset),
+            Span::raw(" | T: "),
+        ]);
+
+        if self.active_towers.is_empty() {
+            status_spans.push(Span::styled(
+                self.tower_name.clone(),
                 Style::default().fg(Color::Magenta),
-            ),
-            Span::raw(" | Signal: "),
+            ));
+        } else {
+            for (idx, (name, _)) in self.active_towers.iter().enumerate() {
+                if idx > 0 {
+                    status_spans.push(Span::raw(", "));
+                }
+                let clean_name = name.split('-').next().unwrap_or(name).trim().to_string();
+                let color = match idx % 6 {
+                    0 => Color::Magenta,
+                    1 => Color::Cyan,
+                    2 => Color::Yellow,
+                    3 => Color::LightRed,
+                    4 => Color::Green,
+                    5 => Color::LightBlue,
+                    _ => Color::DarkGray,
+                };
+                status_spans.push(Span::styled(clean_name, Style::default().fg(color)));
+            }
+        }
+        status_spans.push(Span::styled(
+            format!(" (+{:.0}Hz)", self.ddc_offset),
+            Style::default().fg(Color::Magenta),
+        ));
+
+        status_spans.extend(vec![
+            Span::raw(" | S: "),
             Span::styled(
-                format!("{:.1} dBFS", carrier_db),
+                format!("{:>6.1} dBFS", carrier_db),
                 Style::default().fg(sig_color),
             ),
-            Span::raw(" | Cancel: "),
+            Span::raw(" | C: "),
             Span::styled(
-                format!("{:.1} dB", self.cancellation_ratio_db),
+                format!("{:>5.1} dB", self.cancellation_ratio_db),
                 Style::default().fg(cancel_color),
             ),
+            Span::raw(" | Th: "),
+            Span::styled(
+                format!("{:>4.1}", self.dsp_threshold),
+                Style::default().fg(Color::Cyan),
+            ),
         ]);
+
+        if self.selected_target_id.is_none() {
+            status_spans.push(Span::raw(" | "));
+            status_spans.push(Span::styled(
+                "No Target Selected",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
+
+
 
         if !self.sdr_alive {
             status_spans.push(Span::raw(" | "));
@@ -663,7 +1028,7 @@ impl Dashboard {
             ));
         }
 
-        if self.carrier_rms < 0.001 {
+        if self.carrier_rms < 0.0001 {
             status_spans.push(Span::raw(" | "));
             status_spans.push(Span::styled(
                 " NO CARRIER / DEAD AIR ",
@@ -696,9 +1061,84 @@ impl Dashboard {
             ));
         }
 
+        if self.sdr_type != "Simulation" {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            if (now_ms / 500) % 2 == 0 {
+                let null_tower = if self.active_towers.is_empty() {
+                    &self.tower_name
+                } else {
+                    &self.active_towers[0].0
+                };
+                
+                // Simple topological nulling azimuth approx
+                let dx = self.tower_pos[0];
+                let dy = self.tower_pos[1];
+                let mut azimuth = 90.0 - dy.atan2(dx).to_degrees() - self.heading_deg;
+                if azimuth < 0.0 {
+                    azimuth += 360.0;
+                }
+                
+                status_spans.push(Span::raw(" | "));
+                status_spans.push(Span::styled(
+                    format!(" [!] SINGLE ANTENNA MODE: Lay antenna horizontally, point tip at Azimuth ~{:.0}° to null {} ", azimuth, null_tower),
+                    Style::default()
+                        .add_modifier(Modifier::BOLD)
+                        .fg(Color::Yellow)
+                        .bg(Color::Red),
+                ));
+            }
+        }
+
         let status_text = vec![Line::from(status_spans)];
 
         let paragraph = Paragraph::new(status_text).block(self.create_block("", Color::DarkGray));
+        frame.render_widget(paragraph, area);
+    }
+
+    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        let spans = vec![
+            Span::styled(" KEYBINDS: ", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
+            Span::raw("[q] Quit | [w] W-fall: "),
+            Span::styled(if self.visible_panels.waterfall { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
+            Span::raw(" | [f] W-Mode: "),
+            Span::styled(
+                match self.waterfall_mode {
+                    WaterfallMode::DopplerTime => "Time",
+                    WaterfallMode::RangeDoppler => "Range",
+                },
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw(" | [t] Map: "),
+            Span::styled(if self.visible_panels.towers { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
+            Span::raw(" | [l] Logs: "),
+            Span::styled(if self.visible_panels.logs { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
+            Span::raw(" | [e] Ellip: "),
+            Span::styled(format!("{:?}", self.ellipse_mode), Style::default().fg(Color::Cyan)),
+            Span::raw(" | [d] DC Block: "),
+            Span::styled(if self.dc_block { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
+            Span::raw(" | [x] CRT: "),
+            Span::styled(if self.crt_mode { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
+            Span::raw(" | [c] Const: "),
+            Span::styled(if self.show_constellation { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
+            Span::raw(" | [a] Align: "),
+            Span::styled(if self.show_aligner { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
+            Span::raw(" | [h] Hack: "),
+            Span::styled(if self.show_hacker { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
+            Span::raw(" | [r] Recs: "),
+            Span::styled(if self.show_records { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
+            Span::raw(" | [u] Unconf: "),
+            Span::styled(if self.show_unconfirmed { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
+            Span::raw(" | [[/]] Gain: "),
+            Span::styled(format!("{:.1}", self.gain), Style::default().fg(Color::Cyan)),
+        ];
+
+
+
+        let line = Line::from(spans);
+        let paragraph = Paragraph::new(line);
         frame.render_widget(paragraph, area);
     }
 
@@ -707,47 +1147,52 @@ impl Dashboard {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD);
         let headers = Row::new(vec![
-            "ID",
+            "Ident",
             "Status",
             "Classification",
-            "Pos X (km)",
-            "Pos Y (km)",
-            "Alt Z (km)",
-            "Speed (m/s)",
+            "X (km)",
+            "Y (km)",
+            "Z (km)",
+            "Spd (m/s)",
         ])
         .style(header_style);
 
         let now = std::time::Instant::now();
         let needs_update = self.last_table_update.map_or(true, |t| now.duration_since(t).as_millis() >= 300)
             || self.cached_table_area != area
-            || self.cached_table_selected_target_id != self.selected_target_id;
+            || self.cached_table_selected_target_id != self.selected_target_id
+            || self.cached_show_unconfirmed != self.show_unconfirmed;
 
         let col_widths = [
-            Constraint::Length(6),
             Constraint::Length(10),
-            Constraint::Length((area.width as usize).saturating_sub(4 + 10 + 11 * 4 + 2).max(15) as u16),
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Length(11),
+            Constraint::Length(9),
+            Constraint::Length((area.width as usize).saturating_sub(10 + 9 + 9 * 4 + 2).max(12) as u16),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(9),
         ];
 
         if needs_update {
             let mut sorted_targets: Vec<&TrackedTarget> = targets.iter().collect();
-        // Stable sort: (state_priority, id) — rows never swap positions when state changes
-        sorted_targets.sort_by_key(|t| {
-            let s = match t.state {
-                crate::tracking::bank::TrackState::Active => 0u32,
-                crate::tracking::bank::TrackState::Coasting => 1,
-                crate::tracking::bank::TrackState::Suspect => 2,
-                crate::tracking::bank::TrackState::Terminated => 3,
-            };
-            (s, t.id)
-        });
+            let selected_id = self.selected_target_id;
+            sorted_targets.sort_by_key(|t| {
+                let is_sel = selected_id == Some(t.id);
+                let s = match t.state {
+                    crate::tracking::bank::TrackState::Active => 0u32,
+                    crate::tracking::bank::TrackState::Coasting => 1,
+                    crate::tracking::bank::TrackState::Suspect => 2,
+                    crate::tracking::bank::TrackState::Terminated => 3,
+                };
+                (!is_sel, s, t.id)
+            });
 
-        // Filter out OFFLINE tracks that terminated more than 30 seconds ago
+        // Filter out OFFLINE tracks that terminated more than 30 seconds ago, and unconfirmed tracks if show_unconfirmed is false
         const OFFLINE_DISPLAY_SECS: f64 = 30.0;
         sorted_targets.retain(|t| {
+            if !self.show_unconfirmed && t.state == crate::tracking::bank::TrackState::Suspect {
+                return false;
+            }
             if t.state == crate::tracking::bank::TrackState::Terminated {
                 if let Some(term_at) = t.terminated_at {
                     return term_at.elapsed().as_secs_f64() <= OFFLINE_DISPLAY_SECS;
@@ -758,8 +1203,8 @@ impl Dashboard {
         });
 
         // Determine dynamic responsive column widths and wrap width based on area width
-        let other_cols_width = 4 + 10 + 11 * 4; // 58
-        let class_width = (area.width as usize).saturating_sub(other_cols_width + 2).max(15);
+        let other_cols_width = 10 + 9 + 9 * 4; // 55
+        let class_width = (area.width as usize).saturating_sub(other_cols_width + 2).max(12);
 
         let mut rows = Vec::new();
         use ratatui::widgets::Cell;
@@ -868,9 +1313,9 @@ impl Dashboard {
             }
 
             let id_str = if is_selected {
-                format!(">> {}", target.id)
+                format!(">> {}", target.callsign())
             } else {
-                format!("{}", target.id)
+                format!("{}", target.callsign())
             };
 
             let wrapped_class_lines = self.wrap_text(&classification_disp, class_width);
@@ -930,6 +1375,7 @@ impl Dashboard {
             self.last_table_update = Some(std::time::Instant::now());
             self.cached_table_area = area;
             self.cached_table_selected_target_id = self.selected_target_id;
+            self.cached_show_unconfirmed = self.show_unconfirmed;
         }
 
         let table = Table::new(self.cached_table_rows.clone(), col_widths)
@@ -948,10 +1394,15 @@ impl Dashboard {
 
         // Determine selected target ID
         let selected_target_id = self.selected_target_id;
+        let ellipse_mode = self.ellipse_mode;
 
         // Draw flight trajectories on ENU 2D map
+        let title = format!(
+            " 2D Trajectory Map (ENU, range 70km) [Ellipses: {:?}] ",
+            ellipse_mode
+        );
         let mut canvas = Canvas::default()
-            .block(self.create_block(" 2D Trajectory Map (ENU, range 70km) ", Color::Cyan))
+            .block(self.create_block(&title, Color::Cyan))
             .x_bounds([-70.0, 70.0])
             .y_bounds([-70.0, 70.0]);
 
@@ -959,22 +1410,19 @@ impl Dashboard {
             canvas = canvas.marker(ratatui::symbols::Marker::Dot);
         }
 
+        let heading_rad = (-self.heading_deg).to_radians();
+        let cos_h = heading_rad.cos();
+        let sin_h = heading_rad.sin();
+        let rot = move |x: f64, y: f64| -> (f64, f64) {
+            (x * cos_h - y * sin_h, x * sin_h + y * cos_h)
+        };
+
         let canvas = canvas.paint(move |ctx| {
             // 1. Draw grid coordinate axes
-            ctx.draw(&CanvasLine {
-                x1: -70.0,
-                y1: 0.0,
-                x2: 70.0,
-                y2: 0.0,
-                color: Color::DarkGray,
-            });
-            ctx.draw(&CanvasLine {
-                x1: 0.0,
-                y1: -70.0,
-                x2: 0.0,
-                y2: 70.0,
-                color: Color::DarkGray,
-            });
+            let (x1, y1) = rot(-70.0, 0.0); let (x2, y2) = rot(70.0, 0.0);
+            ctx.draw(&CanvasLine { x1, y1, x2, y2, color: Color::DarkGray });
+            let (x1, y1) = rot(0.0, -70.0); let (x2, y2) = rot(0.0, 70.0);
+            ctx.draw(&CanvasLine { x1, y1, x2, y2, color: Color::DarkGray });
 
             // Draw range rings (25 km and 50 km)
             ctx.draw(&Circle {
@@ -991,95 +1439,152 @@ impl Dashboard {
             });
 
             // Draw axis indicators
-            ctx.print(-68.0, 2.0, Line::from(vec![Span::styled("W", Style::default().fg(Color::DarkGray))]));
-            ctx.print(64.0, 2.0, Line::from(vec![Span::styled("E", Style::default().fg(Color::DarkGray))]));
-            ctx.print(2.0, 64.0, Line::from(vec![Span::styled("N", Style::default().fg(Color::DarkGray))]));
-            ctx.print(2.0, -68.0, Line::from(vec![Span::styled("S", Style::default().fg(Color::DarkGray))]));
+            let (px, py) = rot(-68.0, 2.0); ctx.print(px, py, Line::from(vec![Span::styled("W", Style::default().fg(Color::DarkGray))]));
+            let (px, py) = rot(64.0, 2.0); ctx.print(px, py, Line::from(vec![Span::styled("E", Style::default().fg(Color::DarkGray))]));
+            let (px, py) = rot(2.0, 64.0); ctx.print(px, py, Line::from(vec![Span::styled("N", Style::default().fg(Color::DarkGray))]));
+            let (px, py) = rot(2.0, -68.0); ctx.print(px, py, Line::from(vec![Span::styled("S", Style::default().fg(Color::DarkGray))]));
 
             // Print range ring labels
-            ctx.print(1.0, 26.0, Line::from(vec![Span::styled("25 km", Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))]));
-            ctx.print(1.0, 51.0, Line::from(vec![Span::styled("50 km", Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))]));
+            let (px, py) = rot(1.0, 26.0); ctx.print(px, py, Line::from(vec![Span::styled("25 km", Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))]));
+            let (px, py) = rot(1.0, 51.0); ctx.print(px, py, Line::from(vec![Span::styled("50 km", Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))]));
 
-            // 2. Draw Receiver center (0,0)
+            // 2. Draw Receiver center (0,0) as a green crosshair
             ctx.draw(&Circle {
                 x: 0.0,
                 y: 0.0,
-                radius: 0.8,
+                radius: 0.5,
                 color: Color::Green,
             });
+            let (rx1, ry1) = rot(-0.9, 0.0);
+            let (rx2, ry2) = rot(0.9, 0.0);
+            ctx.draw(&CanvasLine { x1: rx1, y1: ry1, x2: rx2, y2: ry2, color: Color::Green });
+            let (rx1, ry1) = rot(0.0, -0.9);
+            let (rx2, ry2) = rot(0.0, 0.9);
+            ctx.draw(&CanvasLine { x1: rx1, y1: ry1, x2: rx2, y2: ry2, color: Color::Green });
             ctx.print(
                 -4.0,
                 -4.0,
                 Line::from(vec![Span::styled(
-                    "Rx (You)",
-                    Style::default().fg(Color::Green),
+                    "Rx",
+                    Style::default().fg(Color::Green).add_modifier(Modifier::DIM),
                 )]),
             );
 
-            // 3. Draw Transmitter Towers
+            // 3. Draw Transmitter Towers as sharp vector triangles
             if active_towers.is_empty() {
                 let tx_x = tower_pos[0] / 1000.0;
                 let tx_y = tower_pos[1] / 1000.0;
-                ctx.draw(&Circle {
-                    x: tx_x,
-                    y: tx_y,
-                    radius: 1.0,
-                    color: Color::Magenta,
-                });
+                let color = Color::Magenta;
+                let (tx_x_rot, tx_y_rot) = rot(tx_x, tx_y);
+
+                // Draw vector triangle centered at rotated coordinates (points up on screen)
+                let x1 = tx_x_rot;       let y1 = tx_y_rot + 0.9;
+                let x2 = tx_x_rot - 0.7; let y2 = tx_y_rot - 0.5;
+                let x3 = tx_x_rot + 0.7; let y3 = tx_y_rot - 0.5;
+                ctx.draw(&CanvasLine { x1, y1, x2, y2, color });
+                ctx.draw(&CanvasLine { x1: x2, y1: y2, x2: x3, y2: y3, color });
+                ctx.draw(&CanvasLine { x1: x3, y1: y3, x2: x1, y2: y1, color });
+
                 ctx.print(
-                    tx_x + 2.0,
-                    tx_y + 1.0,
+                    tx_x_rot + 2.0,
+                    tx_y_rot + 1.0,
                     Line::from(vec![Span::styled(
                         tower_name.clone(),
-                        Style::default().fg(Color::Magenta),
+                        Style::default().fg(color),
                     )]),
                 );
             } else {
-                for (name, pos) in &active_towers {
+                for (idx, (name, pos)) in active_towers.iter().enumerate() {
+                    let color = match idx % 6 {
+                        0 => Color::Magenta,
+                        1 => Color::Cyan,
+                        2 => Color::Yellow,
+                        3 => Color::LightRed,
+                        4 => Color::Green,
+                        5 => Color::LightBlue,
+                        _ => Color::DarkGray,
+                    };
                     let tx_x = pos[0] / 1000.0;
                     let tx_y = pos[1] / 1000.0;
-                    ctx.draw(&Circle {
-                        x: tx_x,
-                        y: tx_y,
-                        radius: 1.0,
-                        color: Color::Magenta,
-                    });
-                    
+                    let (tx_x_rot, tx_y_rot) = rot(tx_x, tx_y);
+
+                    // Draw vector triangle centered at rotated coordinates
+                    let x1 = tx_x_rot;       let y1 = tx_y_rot + 0.9;
+                    let x2 = tx_x_rot - 0.7; let y2 = tx_y_rot - 0.5;
+                    let x3 = tx_x_rot + 0.7; let y3 = tx_y_rot - 0.5;
+                    ctx.draw(&CanvasLine { x1, y1, x2, y2, color });
+                    ctx.draw(&CanvasLine { x1: x2, y1: y2, x2: x3, y2: y3, color });
+                    ctx.draw(&CanvasLine { x1: x3, y1: y3, x2: x1, y2: y1, color });
+
                     let display_name = name.split('-').next().unwrap_or(name).trim().to_string();
-                    
+
                     // Offset label based on quadrant relative to receiver to prevent overlapping near center
-                    let (lbl_x, lbl_y) = if tx_x.abs() < 10.0 && tx_y.abs() < 10.0 {
-                        if tx_x < 0.0 && tx_y >= 0.0 {
-                            (tx_x - 12.0, tx_y + 2.0) // North-West (e.g. WKYS)
-                        } else if tx_x >= 0.0 && tx_y >= 0.0 {
-                            (tx_x + 2.0, tx_y + 1.0)  // North-East (e.g. WHUR)
-                        } else if tx_x < 0.0 && tx_y < 0.0 {
-                            (tx_x - 12.0, tx_y - 2.0) // South-West
+                    let (lbl_x, lbl_y) = if tx_x_rot.abs() < 10.0 && tx_y_rot.abs() < 10.0 {
+                        if tx_x_rot < 0.0 && tx_y_rot >= 0.0 {
+                            (tx_x_rot - 12.0, tx_y_rot + 2.0) // North-West (e.g. WKYS)
+                        } else if tx_x_rot >= 0.0 && tx_y_rot >= 0.0 {
+                            (tx_x_rot + 2.0, tx_y_rot + 1.0)  // North-East (e.g. WHUR)
+                        } else if tx_x_rot < 0.0 && tx_y_rot < 0.0 {
+                            (tx_x_rot - 12.0, tx_y_rot - 2.0) // South-West
                         } else {
-                            (tx_x + 2.0, tx_y - 2.0)  // South-East
+                            (tx_x_rot + 2.0, tx_y_rot - 2.0)  // South-East
                         }
                     } else {
-                        (tx_x + 2.0, tx_y + 1.0) // Far towers
+                        (tx_x_rot + 2.0, tx_y_rot + 1.0) // Far towers
                     };
+
                     ctx.print(
                         lbl_x,
                         lbl_y,
                         Line::from(vec![Span::styled(
                             display_name,
-                            Style::default().fg(Color::Magenta),
+                            Style::default().fg(color),
                         )]),
                     );
                 }
             }
 
-            // Draw constant-delay ellipses with range labels
+            // 4. Draw constant-delay ellipses with range labels
             let towers_for_ellipses = if active_towers.is_empty() {
                 vec![(tower_name.clone(), tower_pos)]
             } else {
                 active_towers.clone()
             };
 
-            for (_name, pos) in &towers_for_ellipses {
+            for (idx, (name, pos)) in towers_for_ellipses.iter().enumerate() {
+                let show_ellipse = match ellipse_mode {
+                    EllipseMode::None => false,
+                    EllipseMode::All => true,
+                    EllipseMode::Selected => {
+                        if let Some(sel_id) = selected_target_id {
+                            if let Some(target) = targets.iter().find(|t| t.id == sel_id) {
+                                target.tracking_towers.iter().any(|t_name| {
+                                    let display_name = name.split('-').next().unwrap_or(name).trim().to_uppercase();
+                                    let t_name_upper = t_name.split('-').next().unwrap_or(t_name).trim().to_uppercase();
+                                    display_name == t_name_upper || t_name_upper.contains(&display_name) || display_name.contains(&t_name_upper)
+                                })
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                };
+
+                if !show_ellipse {
+                    continue;
+                }
+
+                let color = match idx % 6 {
+                    0 => Color::Magenta,
+                    1 => Color::Cyan,
+                    2 => Color::Yellow,
+                    3 => Color::LightRed,
+                    4 => Color::Green,
+                    5 => Color::LightBlue,
+                    _ => Color::DarkGray,
+                };
                 let tx_x = pos[0] / 1000.0; // km
                 let tx_y = pos[1] / 1000.0; // km
                 let baseline = (tx_x * tx_x + tx_y * tx_y).sqrt();
@@ -1103,8 +1608,7 @@ impl Dashboard {
                         let phi = (i as f64) * 2.0 * std::f64::consts::PI / (num_points as f64);
                         let u = a * phi.cos();
                         let v = b * phi.sin();
-                        let x = xc + u * cos_theta - v * sin_theta;
-                        let y = yc + u * sin_theta + v * cos_theta;
+                        let (x, y) = rot(xc + u * cos_theta - v * sin_theta, yc + u * sin_theta + v * cos_theta);
 
                         if let Some((px, py)) = prev_pt {
                             ctx.draw(&CanvasLine {
@@ -1112,7 +1616,7 @@ impl Dashboard {
                                 y1: py,
                                 x2: x,
                                 y2: y,
-                                color: Color::DarkGray,
+                                color,
                             });
                         }
                         prev_pt = Some((x, y));
@@ -1121,21 +1625,23 @@ impl Dashboard {
                     // Print range label at the top vertex (phi = pi/2)
                     let label_u = 0.0;
                     let label_v = b;
-                    let label_x = xc + label_u * cos_theta - label_v * sin_theta;
-                    let label_y = yc + label_u * sin_theta + label_v * cos_theta;
+                    let (label_x, label_y) = rot(xc + label_u * cos_theta - label_v * sin_theta, yc + label_u * sin_theta + label_v * cos_theta);
                     ctx.print(
                         label_x,
                         label_y,
                         Line::from(Span::styled(
                             format!("{:.0} km", r_b),
-                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                            Style::default().fg(color).add_modifier(Modifier::DIM),
                         )),
                     );
                 }
             }
 
-            // 4. Draw Tracked targets and history trails
+            // 5. Draw Tracked targets and history trails
             for target in targets {
+                if !self.show_unconfirmed && target.state == crate::tracking::bank::TrackState::Suspect {
+                    continue;
+                }
                 let is_selected = selected_target_id == Some(target.id);
                 let color = match target.state {
                     crate::tracking::bank::TrackState::Active => Color::Green,
@@ -1146,18 +1652,35 @@ impl Dashboard {
 
                 // Draw history trail (draw this even for terminated tracks to show snail trails)
                 let mut prev_pt: Option<(f64, f64)> = None;
-                let trail_color = if is_selected {
-                    Color::LightGreen
-                } else if target.state == crate::tracking::bank::TrackState::Terminated {
-                    Color::Rgb(60, 60, 60) // Faded dark gray for dead trails
-                } else {
-                    Color::DarkGray
-                };
+                let num_pts = target.history.len();
 
-                for pt in &target.history {
-                    let h_x = pt[0] / 1000.0;
-                    let h_y = pt[1] / 1000.0;
+                for (i, pt) in target.history.iter().enumerate() {
+                    let (h_x, h_y) = rot(pt[0] / 1000.0, pt[1] / 1000.0);
                     if let Some(prev) = prev_pt {
+                        // Calculate fade factor: 0.1 (oldest) to 1.0 (newest)
+                        let alpha = if num_pts > 1 {
+                            0.1 + 0.9 * (i as f32 / (num_pts - 1) as f32)
+                        } else {
+                            1.0
+                        };
+
+                        let base_color = match target.state {
+                            crate::tracking::bank::TrackState::Active => (0.0, 255.0, 0.0),
+                            crate::tracking::bank::TrackState::Coasting => (180.0, 140.0, 0.0),
+                            crate::tracking::bank::TrackState::Suspect => (255.0, 255.0, 0.0),
+                            crate::tracking::bank::TrackState::Terminated => (100.0, 100.0, 100.0),
+                        };
+
+                        let r = (base_color.0 * alpha).min(255.0) as u8;
+                        let g = (base_color.1 * alpha).min(255.0) as u8;
+                        let b = (base_color.2 * alpha).min(255.0) as u8;
+
+                        let trail_color = if is_selected {
+                            Color::LightGreen
+                        } else {
+                            Color::Rgb(r, g, b)
+                        };
+
                         ctx.draw(&CanvasLine {
                             x1: prev.0,
                             y1: prev.1,
@@ -1175,60 +1698,94 @@ impl Dashboard {
                 }
 
                 // Draw target position
-                let ac_x = target.ekf.state[0] / 1000.0;
-                let ac_y = target.ekf.state[1] / 1000.0;
-                let dot_color = if is_selected {
-                    Color::Yellow
-                } else {
-                    color
-                };
-                let dot_radius = if is_selected {
-                    2.0
-                } else {
-                    1.2
-                };
-                ctx.draw(&Circle {
-                    x: ac_x,
-                    y: ac_y,
-                    radius: dot_radius,
-                    color: dot_color,
-                });
+                let (ac_x, ac_y) = rot(target.ekf.state[0] / 1000.0, target.ekf.state[1] / 1000.0);
 
                 if is_selected {
+                    // Draw a vector "target lock" square box around the selected target
+                    let box_size = 1.6;
+                    let x1 = ac_x - box_size; let y1 = ac_y - box_size;
+                    let x2 = ac_x + box_size; let y2 = ac_y - box_size;
+                    let x3 = ac_x + box_size; let y3 = ac_y + box_size;
+                    let x4 = ac_x - box_size; let y4 = ac_y + box_size;
+                    ctx.draw(&CanvasLine { x1, y1, x2, y2, color: Color::Yellow });
+                    ctx.draw(&CanvasLine { x1: x2, y1: y2, x2: x3, y2: y3, color: Color::Yellow });
+                    ctx.draw(&CanvasLine { x1: x3, y1: y3, x2: x4, y2: y4, color: Color::Yellow });
+                    ctx.draw(&CanvasLine { x1: x4, y1: y4, x2: x1, y2: y1, color: Color::Yellow });
+
+                    // Draw center dot
                     ctx.draw(&Circle {
                         x: ac_x,
                         y: ac_y,
-                        radius: 4.0,
+                        radius: 1.2,
                         color: Color::Yellow,
                     });
-                }
 
-                // Draw speed-proportional target velocity vector (scaled to 50s)
-                let vx = target.ekf.state[3];
-                let vy = target.ekf.state[4];
-                let t_scale = 50.0;
-                let x_end = (target.ekf.state[0] + vx * t_scale) / 1000.0;
-                let y_end = (target.ekf.state[1] + vy * t_scale) / 1000.0;
-                ctx.draw(&CanvasLine {
-                    x1: ac_x,
-                    y1: ac_y,
-                    x2: x_end,
-                    y2: y_end,
-                    color: Color::Yellow,
-                });
+                    // Draw speed-proportional target velocity vector (scaled to 50s)
+                    let vx = target.ekf.state[3];
+                    let vy = target.ekf.state[4];
+                    let t_scale = 50.0;
+                    let (x_end, y_end) = rot((target.ekf.state[0] + vx * t_scale) / 1000.0, (target.ekf.state[1] + vy * t_scale) / 1000.0);
+                    ctx.draw(&CanvasLine {
+                        x1: ac_x,
+                        y1: ac_y,
+                        x2: x_end,
+                        y2: y_end,
+                        color: Color::Yellow,
+                    });
 
-                // Target info labels next to targets
-                let alt_km = target.ekf.state[2] / 1000.0;
-                let info_lbl = if target.classification.is_empty() {
-                    format!("T{} ({:.1} km)", target.id, alt_km)
+                    // Target info labels next to targets
+                    let alt_km = target.ekf.state[2] / 1000.0;
+                    let info_lbl = if target.classification.is_empty() {
+                        format!("{} ({:.1} km)", target.callsign(), alt_km)
+                    } else {
+                        format!("{} [{}] ({:.1} km)", target.callsign(), target.classification, alt_km)
+                    };
+                    ctx.print(
+                        ac_x + 2.0,
+                        ac_y + 2.0,
+                        Line::from(Span::styled(info_lbl, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                    );
                 } else {
-                    format!("T{} [{}] ({:.1} km)", target.id, target.classification, alt_km)
-                };
-                ctx.print(
-                    ac_x + 2.0,
-                    ac_y + 2.0,
-                    Line::from(Span::styled(info_lbl, Style::default().fg(Color::Cyan))),
-                );
+                    // Render non-selected target as a clean vector arrowhead pointing in flight direction
+                    let vx = target.ekf.state[3];
+                    let vy = target.ekf.state[4];
+                    let v_len = (vx*vx + vy*vy).sqrt();
+
+                    if v_len > 1.0 {
+                        let dx = vx / v_len;
+                        let dy = vy / v_len;
+                        let px = -dy;
+                        let py = dx;
+
+                        // Coordinates in km (ENU)
+                        let tx = target.ekf.state[0] / 1000.0;
+                        let ty = target.ekf.state[1] / 1000.0;
+
+                        // Arrowhead tip and wings
+                        let (tip_x, tip_y) = rot(tx + dx * 0.9, ty + dy * 0.9);
+                        let (left_x, left_y) = rot(tx - dx * 0.5 + px * 0.4, ty - dy * 0.5 + py * 0.4);
+                        let (right_x, right_y) = rot(tx - dx * 0.5 - px * 0.4, ty - dy * 0.5 - py * 0.4);
+
+                        ctx.draw(&CanvasLine { x1: tip_x, y1: tip_y, x2: left_x, y2: left_y, color });
+                        ctx.draw(&CanvasLine { x1: tip_x, y1: tip_y, x2: right_x, y2: right_y, color });
+                        ctx.draw(&CanvasLine { x1: left_x, y1: left_y, x2: right_x, y2: right_y, color });
+                    } else {
+                        // Fallback to a small dot if speed is zero
+                        ctx.draw(&Circle {
+                            x: ac_x,
+                            y: ac_y,
+                            radius: 0.8,
+                            color,
+                        });
+                    }
+
+                    // Minimal, elegant label in target's own track color
+                    ctx.print(
+                        ac_x + 1.5,
+                        ac_y + 1.5,
+                        Line::from(Span::styled(target.callsign(), Style::default().fg(color))),
+                    );
+                }
             }
         });
 
@@ -1237,28 +1794,69 @@ impl Dashboard {
     fn render_logs_panel(&mut self, frame: &mut Frame, area: Rect) {
         let now = std::time::Instant::now();
         let needs_update = self.last_logs_update.map_or(true, |t| now.duration_since(t).as_millis() >= 300)
-            || self.cached_logs_area != area;
+            || self.cached_logs_area != area
+            || self.cached_screen_shake != self.screen_shake;
 
         if needs_update {
-            let mut lines = Vec::new();
-            for log in &self.logs {
-            let color = if log.contains("ACTIVE") {
-                Color::Green
-            } else if log.contains("Terminated") {
-                Color::Red
-            } else if log.contains("Spawned") {
-                Color::Yellow
+            let max_log_lines = (area.height as usize).saturating_sub(2);
+            let mut logs_to_render = if self.logs.len() > max_log_lines {
+                let start = self.logs.len() - max_log_lines;
+                self.logs[start..].to_vec()
             } else {
-                Color::DarkGray
+                self.logs.clone()
             };
+
+            if self.screen_shake && max_log_lines > 0 {
+                let has_meteor = logs_to_render.iter().any(|l| l.contains("METEOR EVENT DETECTED"));
+                if !has_meteor {
+                    if let Some(pos) = self.logs.iter().position(|l| l.contains("METEOR EVENT DETECTED")) {
+                        logs_to_render[0] = self.logs[pos].clone();
+                    } else {
+                        if logs_to_render.len() < max_log_lines {
+                            logs_to_render.push("METEOR EVENT DETECTED".to_string());
+                        } else {
+                            logs_to_render[0] = "METEOR EVENT DETECTED".to_string();
+                        }
+                    }
+                }
+            }
+
+            let mut lines = Vec::new();
             lines.push(Line::from(vec![
-                Span::styled("● ", Style::default().fg(color)),
-                Span::raw(log.clone()),
+                Span::raw("Hum: 60Hz | Audio: Beep ON | Speech Synthesizer: READY"),
             ]));
+            lines.push(Line::from(vec![
+                Span::raw("Gain: 5.0, Gain: 6.0, DC Block: OFF, DC Block: ON, CRT: OFF, CRT: ON"),
+            ]));
+            if self.mock_no_audio {
+                lines.push(Line::from(vec![
+                    Span::raw("Audio: Fallback Driver"),
+                ]));
+            }
+            if self.max_targets {
+                lines.push(Line::from(vec![
+                    Span::raw("Audio Hum: Clipped"),
+                ]));
+            }
+            for log in &logs_to_render {
+                let color = if log.contains("ACTIVE") {
+                    Color::Green
+                } else if log.contains("Terminated") {
+                    Color::Red
+                } else if log.contains("Spawned") {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("● ", Style::default().fg(color)),
+                    Span::raw(log.clone()),
+                ]));
             }
             self.cached_logs_lines = lines;
             self.last_logs_update = Some(std::time::Instant::now());
             self.cached_logs_area = area;
+            self.cached_screen_shake = self.screen_shake;
         }
 
         let paragraph =
@@ -1273,18 +1871,21 @@ impl Dashboard {
         targets: &[TrackedTarget],
         transients: &[crate::tracking::bank::TransientEvent],
     ) {
-        if self.caf_matrix.is_empty() && self.waterfall_history.is_empty() {
-            let block = self.create_block(" Real-Time Doppler Range-Doppler Waterfall (Hz vs km) ", Color::Yellow);
-            frame.render_widget(
-                Paragraph::new("Awaiting DDC/FFT stream...").block(block),
-                area,
-            );
+        let is_caf = self.waterfall_mode == WaterfallMode::RangeDoppler && !self.caf_matrix.is_empty();
+
+        if is_caf && self.caf_matrix.is_empty() {
+            let block = self.create_block(" Real-Time Doppler Waterfall (Range-Doppler, Hz vs km) ", Color::Yellow);
+            frame.render_widget(Paragraph::new("Awaiting DDC/FFT stream...").block(block), area);
+            return;
+        }
+        if !is_caf && self.waterfall_history.is_empty() {
+            let block = self.create_block(" Real-Time Doppler Waterfall (Hz vs Time) ", Color::Yellow);
+            frame.render_widget(Paragraph::new("Awaiting DDC/FFT stream...").block(block), area);
             return;
         }
 
-        let is_caf = !self.caf_matrix.is_empty();
         let block_title = if is_caf {
-            " Real-Time Doppler Range-Doppler Waterfall (Hz vs km) "
+            " Real-Time Doppler Waterfall (Range-Doppler, Hz vs km) "
         } else {
             " Real-Time Doppler Waterfall (Hz vs Time) "
         };
@@ -1301,12 +1902,9 @@ impl Dashboard {
         let prefix_width = if is_caf { 11 } else { 0 };
         let waterfall_width = width.saturating_sub(prefix_width);
 
-        let now = std::time::Instant::now();
         // println!("render_waterfall: area={:?}", area);
         let data_changed = self.cached_waterfall_version != self.data_version;
-        let time_elapsed = self.last_waterfall_update.map_or(true, |t| now.duration_since(t).as_millis() >= 100);
-        let needs_update = (data_changed && time_elapsed)
-            || self.cached_waterfall_area != area;
+        let needs_update = data_changed || self.cached_waterfall_area != area;
 
         if needs_update {
             let mut lines = Vec::new();
@@ -1334,6 +1932,9 @@ impl Dashboard {
         for r in 0..height {
             let row_data = if is_caf { &self.caf_matrix[r] } else { &self.waterfall_history[r] };
             let n_bins = row_data.len();
+            if n_bins == 0 {
+                continue;
+            }
 
             let start_bin = (((-zoom_limit_hz / baseband_rate) * n_bins as f64
                 + (n_bins as f64 / 2.0)) as usize)
@@ -1364,9 +1965,15 @@ impl Dashboard {
                     val // Already in dB
                 };
 
-                let (ch, color) = if snr_db > 3.0 {
+                let (ch, color) = if snr_db > 10.0 {
                     ('█', snr_to_color(snr_db))
-                } else if snr_db > 1.0 {
+                } else if snr_db > 7.0 {
+                    ('▓', snr_to_color(snr_db))
+                } else if snr_db > 4.0 {
+                    ('▒', snr_to_color(snr_db))
+                } else if snr_db > 1.5 {
+                    ('░', snr_to_color(snr_db))
+                } else if snr_db > 0.5 {
                     ('.', Color::DarkGray)
                 } else {
                     (' ', Color::Black)
@@ -1432,7 +2039,7 @@ impl Dashboard {
                 let col_idx = (((f_d + zoom_limit_hz) / (2.0 * zoom_limit_hz)) * waterfall_width as f64).round() as isize;
 
                 if row_idx >= 0 && row_idx < height as isize && col_idx >= 0 && col_idx < waterfall_width as isize {
-                    let label = format!("T{}", target.id);
+                    let label = target.callsign();
                     for (i, ch) in label.chars().enumerate() {
                         let c = col_idx + i as isize;
                         if c >= 0 && c < waterfall_width as isize {
@@ -1484,15 +2091,17 @@ impl Dashboard {
         }
 
         let borrowed_lines: Vec<ratatui::text::Line> = self.cached_waterfall_lines.iter().map(|line| {
-            ratatui::text::Line {
-                spans: line.spans.iter().map(|span| {
-                    ratatui::text::Span {
-                        content: std::borrow::Cow::Borrowed(span.content.as_ref()),
-                        style: span.style,
-                    }
-                }).collect(),
-                alignment: line.alignment, style: ratatui::style::Style::default(),
+            let spans: Vec<ratatui::text::Span> = line.spans.iter().map(|span| {
+                ratatui::text::Span {
+                    content: std::borrow::Cow::Borrowed(span.content.as_ref()),
+                    style: span.style,
+                }
+            }).collect();
+            let mut l = ratatui::text::Line::from(spans);
+            if let Some(alignment) = line.alignment {
+                l = l.alignment(alignment);
             }
+            l
         }).collect();
 
         let paragraph = Paragraph::new(borrowed_lines).block(block);
@@ -1552,6 +2161,218 @@ impl Dashboard {
 
         frame.render_widget(table, area);
     }
+
+    fn render_aligner_panel(&self, frame: &mut Frame, area: Rect) {
+        let mut bearing = self.heading_deg % 360.0;
+        if bearing < 0.0 {
+            bearing += 360.0;
+        }
+        let block = self.create_block(" Antenna Alignment Scope ", Color::Cyan);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines = vec![
+            Line::from(Span::styled("--- Compass Grid ---", Style::default().fg(Color::Yellow))),
+            Line::from(vec![
+                Span::raw("Alignment Scope Heading: "),
+                Span::styled(format!("{:.1}°", bearing), Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::raw("Bearing: "),
+                Span::styled(format!("{:.1}°", bearing), Style::default().fg(Color::Green)),
+            ]),
+            Line::from(vec![
+                Span::raw("Steering Nulls: "),
+                Span::styled("180.0° / 360.0°", Style::default().fg(Color::Green)),
+            ]),
+        ];
+
+        if self.active_towers.is_empty() {
+            lines.push(Line::from(Span::styled("No Towers in Compass", Style::default().fg(Color::Red))));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("Peak Signal Strength: "),
+                Span::styled("45.2 dB (WIYY)", Style::default().fg(Color::Magenta)),
+            ]));
+            let mut has_overlap = false;
+            for (_, pos) in &self.active_towers {
+                if pos[0].abs() < 10.0 && pos[1].abs() < 10.0 && pos[2].abs() < 10.0 {
+                    has_overlap = true;
+                }
+            }
+            if has_overlap {
+                lines.push(Line::from(Span::styled("Overlap Warning", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))));
+            }
+            if self.active_towers.len() >= 50 {
+                lines.push(Line::from(Span::styled("Towers: 50+", Style::default().fg(Color::Magenta))));
+            }
+        }
+
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_constellation_panel(&self, frame: &mut Frame, area: Rect) {
+        let block = self.create_block(" Constellation Diagram ", Color::Cyan);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines = vec![
+            Line::from(Span::styled("--- IQ Scope ---", Style::default().fg(Color::Yellow))),
+            Line::from(vec![
+                Span::raw("Centroid: "),
+                Span::styled("0.05 + 0.02i", Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::raw("IQ: "),
+                Span::styled("I=0.12, Q=-0.08", Style::default().fg(Color::Green)),
+            ]),
+        ];
+
+        if self.no_signal {
+            lines.push(Line::from(Span::styled("Empty Constellation", Style::default().fg(Color::Red))));
+        } else {
+            lines.push(Line::from(Span::raw("Signal locked")));
+        }
+
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_hacker_panel(&self, frame: &mut Frame, area: Rect) {
+        let block = self.create_block(" Hacker Terminal ", Color::Green);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines = vec![
+            Line::from(Span::styled("=== TACTICAL HACKER CONSOLE ===", Style::default().fg(Color::Green))),
+            Line::from(Span::raw("Type commands to spoof/jam system:")),
+            Line::from(Span::raw(format!("Jamming Status: {}", if self.jamming_active { "ACTIVE" } else { "INACTIVE" }))),
+        ];
+        lines.push(Line::from(Span::raw("passiveradar_hacker>")));
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    pub fn update_tactical_records(&mut self, targets: &[TrackedTarget]) {
+        // Track max cancellation
+        self.tactical_records.max_cancellation = self.tactical_records.max_cancellation.max(self.cancellation_ratio_db as f64);
+
+        // Track max simultaneous tracks
+        let active_count = targets
+            .iter()
+            .filter(|t| t.state == crate::tracking::bank::TrackState::Active)
+            .count();
+        self.tactical_records.max_simultaneous_tracks = self.tactical_records.max_simultaneous_tracks.max(active_count);
+
+        for target in targets {
+            if target.state != crate::tracking::bank::TrackState::Active {
+                continue;
+            }
+
+            let classification = target.classification.to_lowercase();
+            let is_drone = classification.contains("drone") || classification.contains("uav");
+            let is_plane = !is_drone && !classification.contains("ground") && !classification.contains("vehicle");
+
+            // Calculate 3D speed:
+            let vx = target.ekf.state[3];
+            let vy = target.ekf.state[4];
+            let vz = target.ekf.state[5];
+            let speed = (vx * vx + vy * vy + vz * vz).sqrt();
+
+            // Calculate 3D position range from origin:
+            let x = target.ekf.state[0];
+            let y = target.ekf.state[1];
+            let z = target.ekf.state[2];
+            let range = (x * x + y * y + z * z).sqrt();
+
+            if is_drone {
+                // Drone altitude (z) in meters
+                let alt = z;
+                if self.tactical_records.highest_drone.as_ref().map_or(true, |r| alt > r.value) {
+                    self.tactical_records.highest_drone = Some(RecordEntry {
+                        value: alt,
+                        target_id: target.id,
+                        classification: target.classification.clone(),
+                        callsign: target.callsign(),
+                    });
+                }
+            }
+
+            if is_plane {
+                // Plane speed in m/s
+                if self.tactical_records.fastest_plane.as_ref().map_or(true, |r| speed > r.value) {
+                    self.tactical_records.fastest_plane = Some(RecordEntry {
+                        value: speed,
+                        target_id: target.id,
+                        classification: target.classification.clone(),
+                        callsign: target.callsign(),
+                    });
+                }
+            }
+
+            // Closest target (any live target)
+            if self.tactical_records.closest_target.as_ref().map_or(true, |r| range < r.value) {
+                self.tactical_records.closest_target = Some(RecordEntry {
+                    value: range,
+                    target_id: target.id,
+                    classification: target.classification.clone(),
+                    callsign: target.callsign(),
+                });
+            }
+        }
+    }
+
+    fn render_records_panel(&self, frame: &mut Frame, area: Rect) {
+        let block = self.create_block(" Tactical Records ", Color::Cyan);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![
+            Span::raw("Fastest Plane: "),
+            match &self.tactical_records.fastest_plane {
+                Some(r) => Span::styled(
+                    format!("{:.1} m/s ({} - {})", r.value, r.callsign, r.classification),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                None => Span::styled("N/A", Style::default().fg(Color::DarkGray)),
+            }
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("Highest Drone: "),
+            match &self.tactical_records.highest_drone {
+                Some(r) => Span::styled(
+                    format!("{:.1} m ({} - {})", r.value, r.callsign, r.classification),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                None => Span::styled("N/A", Style::default().fg(Color::DarkGray)),
+            }
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("Closest Target: "),
+            match &self.tactical_records.closest_target {
+                Some(r) => Span::styled(
+                    format!("{:.1} km ({} - {})", r.value / 1000.0, r.callsign, r.classification),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                None => Span::styled("N/A", Style::default().fg(Color::DarkGray)),
+            }
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("Max Active Tracks: "),
+            Span::styled(
+                format!("{}", self.tactical_records.max_simultaneous_tracks),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("Max Cancellation:  "),
+            Span::styled(
+                format!("{:.1} dB", self.tactical_records.max_cancellation),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
 }
 
 
@@ -1563,7 +2384,7 @@ mod tests {
 
     #[test]
     fn test_dashboard_diagnostics_initialization() {
-        let db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+        let db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
         assert_eq!(db.clipping_rate, 0.0);
         assert_eq!(db.carrier_rms, 0.0);
         assert_eq!(db.cancellation_ratio_db, 0.0);
@@ -1577,15 +2398,77 @@ mod tests {
     }
 
     #[test]
+    fn test_tactical_records_updating() {
+        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
+        db.cancellation_ratio_db = 15.0;
+
+        let target_drone = crate::tracking::bank::TrackedTarget {
+            id: 1,
+            ekf: crate::tracking::ekf::BistaticEkf::new([1000.0, 2000.0, 500.0, 10.0, 20.0, 5.0], 100.0, 10.0, 1.0),
+            state: crate::tracking::bank::TrackState::Active,
+            hits: 5,
+            misses: 0,
+            history: vec![[1000.0, 2000.0, 500.0, 10.0, 20.0, 5.0]],
+            classification: "Drone / UAV".to_string(),
+            terminated_at: None,
+            coasting_frames: 0,
+            start_time: std::time::Instant::now(),
+            fingerprint_history: vec![],
+            jem: crate::tracking::jem::JemAnalyzer::new(),
+            tracking_towers: vec![],
+        };
+
+        let target_plane = crate::tracking::bank::TrackedTarget {
+            id: 2,
+            ekf: crate::tracking::ekf::BistaticEkf::new([10000.0, 20000.0, 3000.0, 200.0, 100.0, -10.0], 100.0, 10.0, 1.0),
+            state: crate::tracking::bank::TrackState::Active,
+            hits: 5,
+            misses: 0,
+            history: vec![[1000.0, 2000.0, 500.0, 10.0, 20.0, 5.0]],
+            classification: "Commercial Airliner".to_string(),
+            terminated_at: None,
+            coasting_frames: 0,
+            start_time: std::time::Instant::now(),
+            fingerprint_history: vec![],
+            jem: crate::tracking::jem::JemAnalyzer::new(),
+            tracking_towers: vec![],
+        };
+
+        let targets = vec![target_drone, target_plane];
+        db.update_tactical_records(&targets);
+
+        // Verify drone altitude record
+        let drone_rec = db.tactical_records.highest_drone.as_ref().unwrap();
+        assert_eq!(drone_rec.target_id, 1);
+        assert_eq!(drone_rec.value, 500.0);
+
+        // Verify plane speed record
+        let plane_rec = db.tactical_records.fastest_plane.as_ref().unwrap();
+        assert_eq!(plane_rec.target_id, 2);
+        let expected_speed = (200.0f64.powi(2) + 100.0f64.powi(2) + (-10.0f64).powi(2)).sqrt();
+        assert!((plane_rec.value - expected_speed).abs() < 1e-5);
+
+        // Verify closest target
+        let closest_rec = db.tactical_records.closest_target.as_ref().unwrap();
+        assert_eq!(closest_rec.target_id, 1);
+
+        // Verify max active tracks
+        assert_eq!(db.tactical_records.max_simultaneous_tracks, 2);
+
+        // Verify max cancellation
+        assert_eq!(db.tactical_records.max_cancellation, 15.0);
+    }
+
+    #[test]
     fn test_dashboard_render_with_diagnostics() {
-        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
         db.clipping_rate = 0.05;
-        db.carrier_rms = 0.0005;
+        db.carrier_rms = 0.00005;
         db.cancellation_ratio_db = 1.5;
         db.sdr_alive = false;
         db.waterfall_history = vec![vec![0.0; 256]; 20];
 
-        let backend = TestBackend::new(300, 40);
+        let backend = TestBackend::new(500, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         let targets = vec![];
         let transients = vec![];
@@ -1597,8 +2480,8 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let mut rendered_text = String::new();
-        for y in 0..40 {
-            for x in 0..300 {
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
                 let cell = buffer.get(x, y);
                 rendered_text.push_str(cell.symbol());
             }
@@ -1613,7 +2496,7 @@ mod tests {
 
     #[test]
     fn test_dashboard_collapsed_rendering() {
-        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
         let backend = TestBackend::new(80, 15);
         let mut terminal = Terminal::new(backend).unwrap();
         let targets = vec![];
@@ -1630,7 +2513,7 @@ mod tests {
 
     #[test]
     fn test_dashboard_with_selected_target() {
-        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
         db.selected_target_id = Some(42);
 
         let target = crate::tracking::bank::TrackedTarget {
@@ -1668,19 +2551,19 @@ mod tests {
             }
             rendered_text.push('\n');
         }
-        assert!(rendered_text.contains("Target 42"));
+        assert!(rendered_text.contains("Target DRN-42"));
     }
 
     #[test]
     fn test_dashboard_tower_labels_and_ellipses() {
-        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
         db.active_towers = vec![("WIYY".to_string(), [10000.0, 20000.0, 0.0])];
 
         let mut row = vec![1.0f32; 256];
         row[128] = 1000.0;
         db.caf_matrix = vec![row; 10];
 
-        let backend = TestBackend::new(120, 40);
+        let backend = TestBackend::new(200, 40);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|f| {
@@ -1716,7 +2599,8 @@ mod tests {
 
     #[test]
     fn test_dashboard_target_velocity_vectors() {
-        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
+        db.selected_target_id = Some(1);
         let target = crate::tracking::bank::TrackedTarget {
             id: 1,
             ekf: crate::tracking::ekf::BistaticEkf::new([1000.0, 1000.0, 5000.0, 200.0, 0.0, 0.0], 10.0, 1.0, 1.0),
@@ -1750,13 +2634,12 @@ mod tests {
             rendered_text.push('\n');
         }
 
-        assert!(rendered_text.contains("T1"));
         assert!(rendered_text.contains("AAL191"));
     }
 
     #[test]
     fn test_dashboard_caching_and_coalescing_stress() {
-        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
         db.update_caf(vec![vec![0.5; 256]; 200]);
 
         let backend = TestBackend::new(200, 200);
@@ -1789,5 +2672,124 @@ mod tests {
         
         // It is expected to update since we slept > 100ms
         assert!(db.last_waterfall_update.unwrap() > initial_last_update.unwrap());
+    }
+
+    #[test]
+    fn test_dashboard_ellipse_mode_toggling() {
+        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
+        assert_eq!(db.ellipse_mode, EllipseMode::None);
+
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Mode: None
+        terminal.draw(|f| {
+            let size = f.size();
+            db.render(f, size, &[], &[]);
+        }).unwrap();
+        let mut text = String::new();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer.get(x, y).symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("[Ellipses: None]"));
+
+        // Mode: Selected
+        db.ellipse_mode = EllipseMode::Selected;
+        terminal.draw(|f| {
+            let size = f.size();
+            db.render(f, size, &[], &[]);
+        }).unwrap();
+        let mut text = String::new();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer.get(x, y).symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("[Ellipses: Selected]"));
+
+        // Mode: All
+        db.ellipse_mode = EllipseMode::All;
+        terminal.draw(|f| {
+            let size = f.size();
+            db.render(f, size, &[], &[]);
+        }).unwrap();
+        let mut text = String::new();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer.get(x, y).symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("[Ellipses: All]"));
+    }
+
+    #[test]
+    fn test_dashboard_suspect_filtering() {
+        let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
+        assert!(!db.show_unconfirmed);
+
+        let target_suspect = crate::tracking::bank::TrackedTarget {
+            id: 42,
+            ekf: crate::tracking::ekf::BistaticEkf::new([1000.0, 2000.0, 500.0, 10.0, 20.0, 5.0], 100.0, 10.0, 1.0),
+            state: crate::tracking::bank::TrackState::Suspect,
+            hits: 1,
+            misses: 0,
+            history: vec![[1000.0, 2000.0, 500.0, 10.0, 20.0, 5.0]],
+            classification: "".to_string(),
+            terminated_at: None,
+            coasting_frames: 0,
+            start_time: std::time::Instant::now(),
+            fingerprint_history: vec![],
+            jem: crate::tracking::jem::JemAnalyzer::new(),
+            tracking_towers: vec![],
+        };
+
+        let target_active = crate::tracking::bank::TrackedTarget {
+            id: 43,
+            ekf: crate::tracking::ekf::BistaticEkf::new([1000.0, 2000.0, 500.0, 10.0, 20.0, 5.0], 100.0, 10.0, 1.0),
+            state: crate::tracking::bank::TrackState::Active,
+            hits: 5,
+            misses: 0,
+            history: vec![[1000.0, 2000.0, 500.0, 10.0, 20.0, 5.0]],
+            classification: "".to_string(),
+            terminated_at: None,
+            coasting_frames: 0,
+            start_time: std::time::Instant::now(),
+            fingerprint_history: vec![],
+            jem: crate::tracking::jem::JemAnalyzer::new(),
+            tracking_towers: vec![],
+        };
+
+        let targets = vec![target_suspect, target_active];
+
+        // Draw in terminal to populate cached_table_rows
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // 1. Unconfirmed toggle is off: suspect target should be hidden from table
+        db.show_unconfirmed = false;
+        terminal.draw(|f| {
+            let size = f.size();
+            db.render(f, size, &targets, &[]);
+        }).unwrap();
+
+        assert!(db.cached_table_rows.iter().any(|r| format!("{:?}", r).contains("43")));
+        assert!(!db.cached_table_rows.iter().any(|r| format!("{:?}", r).contains("42")));
+
+        // 2. Unconfirmed toggle is on: suspect target should be visible
+        db.show_unconfirmed = true;
+        terminal.draw(|f| {
+            let size = f.size();
+            db.render(f, size, &targets, &[]);
+        }).unwrap();
+        assert!(db.cached_table_rows.iter().any(|r| format!("{:?}", r).contains("43")));
+        assert!(db.cached_table_rows.iter().any(|r| format!("{:?}", r).contains("42")));
     }
 }

@@ -30,6 +30,10 @@ impl DcBlocker {
             output.push(self.process(x));
         }
     }
+
+    pub fn set_alpha(&mut self, alpha: f32) {
+        self.alpha = alpha;
+    }
 }
 
 /// A Normalized Least Mean Squares (NLMS) adaptive filter for clutter cancellation.
@@ -133,6 +137,183 @@ impl NlmsCanceler {
         output.clear();
         for &x in input {
             output.push(self.process(x));
+        }
+    }
+}
+
+fn complex_cholesky_6x6(a: &[[Complex<f32>; 6]; 6]) -> Option<[[Complex<f32>; 6]; 6]> {
+    let mut l = [[Complex::new(0.0, 0.0); 6]; 6];
+    for i in 0..6 {
+        for j in 0..=i {
+            let mut sum = a[i][j];
+            for k in 0..j {
+                sum -= l[i][k] * l[j][k].conj();
+            }
+            if i == j {
+                if sum.re <= 0.0 {
+                    return None;
+                }
+                l[i][j] = Complex::new(sum.re.sqrt(), 0.0);
+            } else {
+                l[i][j] = sum / l[j][j].re;
+            }
+        }
+    }
+    Some(l)
+}
+
+fn complex_cholesky_solve_6(a: &[[Complex<f32>; 6]; 6], b: &[Complex<f32>; 6]) -> Option<[Complex<f32>; 6]> {
+    let l = complex_cholesky_6x6(a)?;
+    // Forward substitution L * y = b
+    let mut y = [Complex::new(0.0, 0.0); 6];
+    for i in 0..6 {
+        let mut sum = b[i];
+        for k in 0..i {
+            sum -= l[i][k] * y[k];
+        }
+        y[i] = sum / l[i][i].re;
+    }
+    // Backward substitution L^H * x = y
+    let mut x = [Complex::new(0.0, 0.0); 6];
+    for i in (0..6).rev() {
+        let mut sum = y[i];
+        for k in i+1..6 {
+            sum -= l[k][i].conj() * x[k];
+        }
+        x[i] = sum / l[i][i].re;
+    }
+    Some(x)
+}
+
+/// Extensive Cancellation Algorithm (ECA) filter
+/// Uses exact Orthogonal Subspace Projection on blocks of samples to obliterate 
+/// the direct path and stationary clutter down to the noise floor.
+pub struct EcaCanceler {
+    history: [Complex<f32>; 6],
+    x_ext: Vec<Complex<f32>>,
+}
+
+impl EcaCanceler {
+    pub fn new() -> Self {
+        Self {
+            history: [Complex::new(0.0, 0.0); 6],
+            x_ext: Vec::with_capacity(10000),
+        }
+    }
+
+    pub fn process_block(
+        &mut self,
+        input: &[Complex<f32>],
+        clean_surv_output: &mut Vec<Complex<f32>>,
+        surrogate_ref_output: &mut Vec<Complex<f32>>,
+    ) {
+        let n = input.len();
+        clean_surv_output.clear();
+        surrogate_ref_output.clear();
+        if n == 0 { return; }
+        
+        let taps = 6;
+        let mut r = [[Complex::new(0.0, 0.0); 6]; 6];
+        let mut p = [Complex::new(0.0, 0.0); 6];
+
+        // Construct extended signal x_ext = [history, input]
+        self.x_ext.resize(n + 6, Complex::new(0.0, 0.0));
+        self.x_ext[0..6].copy_from_slice(&self.history);
+        self.x_ext[6..n+6].copy_from_slice(input);
+
+        // 1. Compute r[0][d] for d in 0..5 using O(N) operations
+        for d in 0..taps {
+            let mut sum = Complex::new(0.0, 0.0);
+            for i in 0..n {
+                sum += self.x_ext[5 + i].conj() * self.x_ext[5 + i - d];
+            }
+            r[0][d] = sum;
+        }
+
+        // 2. Compute the rest of the upper triangle of r using O(1) sliding window updates
+        for d in 0..taps {
+            for j in 1..(taps - d) {
+                let term_in = self.x_ext[5 - j].conj() * self.x_ext[5 - j - d];
+                let term_out = self.x_ext[5 - j + n].conj() * self.x_ext[5 - j + n - d];
+                r[j][j + d] = r[j - 1][j - 1 + d] + term_in - term_out;
+            }
+        }
+
+        // 3. Fill in the lower triangle of r using Hermitian symmetry
+        for j in 0..taps {
+            for k in 0..j {
+                r[j][k] = r[k][j].conj();
+            }
+        }
+
+        // 4. Compute p[j] for j in 0..5 using O(N) operations
+        for j in 0..taps {
+            let mut sum = Complex::new(0.0, 0.0);
+            for i in 0..n {
+                sum += self.x_ext[5 + i - j].conj() * input[i];
+            }
+            p[j] = sum;
+        }
+
+        // Diagonal regularization (Ridge / Tikhonov)
+        // We use tau to inject a tiny bit of "virtual noise" scaled by the block size.
+        // This prevents the linear predictor from achieving "perfect cancellation" of the
+        // constant-modulus phase signal, preserving the target echoes!
+        let tau = 1e-3 * n as f32; 
+        for j in 0..taps {
+            r[j][j] += Complex::new(tau, 0.0);
+        }
+
+        let weights = match complex_cholesky_solve_6(&r, &p) {
+            Some(w) => w,
+            None => [Complex::new(0.0, 0.0); 6],
+        };
+
+        // 5. Generate outputs
+        for i in 0..n {
+            let mut y_clutter = Complex::new(0.0, 0.0);
+            for k in 0..taps {
+                y_clutter += self.x_ext[5 + i - k] * weights[k];
+            }
+            
+            surrogate_ref_output.push(y_clutter);
+            clean_surv_output.push(input[i] - y_clutter);
+        }
+
+        // Update history
+        for i in 0..6 {
+            self.history[i] = if n > 5 - i {
+                input[n - 1 - (5 - i)]
+            } else {
+                self.history[self.history.len() - (5 - i) + n]
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_eca_projection() {
+        let mut canceler = EcaCanceler::new();
+        let mut input = vec![Complex::new(0.0, 0.0); 100];
+
+        // Create a strong direct path (sine wave)
+        for i in 0..100 {
+            let val = Complex::new((i as f32).cos(), (i as f32).sin());
+            input[i] = val * 1000.0; // Massive direct path
+        }
+
+        let mut clean_surv = Vec::new();
+        let mut surr_ref = Vec::new();
+        canceler.process_block(&input, &mut clean_surv, &mut surr_ref);
+
+        // Block-based projection means it's cancelled identically across the entire block!
+        for i in 10..100 {
+            assert!(clean_surv[i].norm() < 0.1, "Failed to cancel direct path, got {}", clean_surv[i]);
+            assert!(surr_ref[i].norm() > 900.0, "Failed to capture surrogate reference");
         }
     }
 }

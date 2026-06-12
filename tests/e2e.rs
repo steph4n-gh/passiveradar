@@ -2,6 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::SystemTime;
+use std::sync::Mutex;
+
+static E2E_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 fn get_temp_dir() -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -29,6 +32,7 @@ fn run_e2e_test(
     expected: &[&str],
     unexpected: &[&str],
 ) {
+    let _lock = E2E_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let tmp_dir = get_temp_dir();
     let script_file = tmp_dir.join("script.txt");
     fs::write(&script_file, script).expect("Failed to write script file");
@@ -52,7 +56,7 @@ fn run_e2e_test(
         .status()
         .expect("Failed to run binary");
 
-    assert!(status.success(), "Binary exited with error status");
+    eprintln!("status: {}, stderr: {:?}", status, std::fs::read_to_string(out_dir.join("..").join("stderr.txt"))); assert!(status.success(), "Binary exited with error status");
 
     let frame_file = out_dir.join("frame.txt");
     if frame_file.exists() {

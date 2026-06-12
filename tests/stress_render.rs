@@ -23,7 +23,7 @@ unsafe impl GlobalAlloc for Allocator {
 
 #[test]
 fn test_render_memory_leak() {
-    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string());
+    let mut db = Dashboard::new(90.9e6, 2.048e6, 75.0, "sim".to_string(), 0.0);
     let backend = TestBackend::new(200, 200);
     let mut terminal = Terminal::new(backend).unwrap();
 

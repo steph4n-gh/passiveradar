@@ -6,6 +6,33 @@
   },
   "towers": [
     {
+      "name": "WAMU-FM",
+      "callsign": "WAMU",
+      "frequency_hz": 88500000.0,
+      "latitude": 38.936167,
+      "longitude": -77.0925,
+      "elevation_m": 310.0,
+      "erp_watts": 47000.0
+    },
+    {
+      "name": "WPFW-FM",
+      "callsign": "WPFW",
+      "frequency_hz": 89300000.0,
+      "latitude": 38.936111,
+      "longitude": -77.091944,
+      "elevation_m": 310.0,
+      "erp_watts": 50000.0
+    },
+    {
+      "name": "WCSP-FM",
+      "callsign": "WCSP",
+      "frequency_hz": 90100000.0,
+      "latitude": 38.95028,
+      "longitude": -77.07944,
+      "elevation_m": 280.0,
+      "erp_watts": 24000.0
+    },
+    {
       "name": "WETA-FM",
       "callsign": "WETA",
       "frequency_hz": 90900000.0,
@@ -13,6 +40,51 @@
       "longitude": -77.1518,
       "elevation_m": 350.0,
       "erp_watts": 75000.0
+    },
+    {
+      "name": "WGTS-FM",
+      "callsign": "WGTS",
+      "frequency_hz": 91900000.0,
+      "latitude": 38.891778,
+      "longitude": -77.131639,
+      "elevation_m": 300.0,
+      "erp_watts": 23500.0
+    },
+    {
+      "name": "WKYS-FM",
+      "callsign": "WKYS",
+      "frequency_hz": 93900000.0,
+      "latitude": 38.9401,
+      "longitude": -77.0814,
+      "elevation_m": 286.0,
+      "erp_watts": 24500.0
+    },
+    {
+      "name": "WIAD-FM",
+      "callsign": "WIAD",
+      "frequency_hz": 94700000.0,
+      "latitude": 38.963694,
+      "longitude": -77.104694,
+      "elevation_m": 300.0,
+      "erp_watts": 20500.0
+    },
+    {
+      "name": "WPGC-FM",
+      "callsign": "WPGC",
+      "frequency_hz": 95500000.0,
+      "latitude": 38.863889,
+      "longitude": -76.911111,
+      "elevation_m": 300.0,
+      "erp_watts": 50000.0
+    },
+    {
+      "name": "WHUR-FM",
+      "callsign": "WHUR",
+      "frequency_hz": 96300000.0,
+      "latitude": 38.9244,
+      "longitude": -77.0156,
+      "elevation_m": 260.0,
+      "erp_watts": 24000.0
     },
     {
       "name": "WIYY-FM (98 Rock)",
@@ -31,24 +103,6 @@
       "longitude": -77.2014,
       "elevation_m": 380.0,
       "erp_watts": 100000.0
-    },
-    {
-      "name": "WKYS-FM",
-      "callsign": "WKYS",
-      "frequency_hz": 93900000.0,
-      "latitude": 38.9401,
-      "longitude": -77.0814,
-      "elevation_m": 286.0,
-      "erp_watts": 24500.0
-    },
-    {
-      "name": "WHUR-FM",
-      "callsign": "WHUR",
-      "frequency_hz": 96300000.0,
-      "latitude": 38.9244,
-      "longitude": -77.0156,
-      "elevation_m": 260.0,
-      "erp_watts": 24000.0
     }
   ]
 }

@@ -1,4 +1,29 @@
 use num_complex::Complex;
+use std::sync::LazyLock;
+
+#[allow(dead_code)]
+static HAS_AVX2_FMA: LazyLock<bool> = LazyLock::new(|| {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+});
+
+#[allow(dead_code)]
+static HAS_NEON: LazyLock<bool> = LazyLock::new(|| {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("neon")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+});
 
 /// A standard FIR filter with an efficient circular buffer structure.
 pub struct FirFilter {
@@ -64,12 +89,12 @@ impl FirFilter {
         assert!(window.len() >= self.num_taps);
 
         #[cfg(target_arch = "x86_64")]
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        if *HAS_AVX2_FMA {
             return unsafe { self.compute_x86_64(window) };
         }
 
         #[cfg(target_arch = "aarch64")]
-        if std::arch::is_aarch64_feature_detected!("neon") {
+        if *HAS_NEON {
             return unsafe { self.compute_aarch64(window) };
         }
 
@@ -190,13 +215,13 @@ impl DecimatorStage {
         self.buffer.extend_from_slice(input);
         
         #[cfg(target_arch = "x86_64")]
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        if *HAS_AVX2_FMA {
             unsafe { self.process_block_avx(output) };
             return;
         }
 
         #[cfg(target_arch = "aarch64")]
-        if std::arch::is_aarch64_feature_detected!("neon") {
+        if *HAS_NEON {
             unsafe { self.process_block_neon(output) };
             return;
         }
@@ -282,6 +307,18 @@ impl MultiStageDecimator {
         }
     }
 
+    /// Create a decimator targeting a decimation factor of 8 (e.g. 2.048 MSPS -> 256 kHz).
+    pub fn new_8x() -> Self {
+        // Stage 1: factor = 8, cutoff = 0.05, taps = 63
+        let s1 = DecimatorStage::new(8, 0.05, 63);
+
+        Self {
+            stages: vec![s1],
+            buf1: Vec::new(),
+            buf2: Vec::new(),
+        }
+    }
+
     /// Process a block of samples through all decimation stages.
     pub fn process(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
         if self.stages.is_empty() {
@@ -298,14 +335,18 @@ impl MultiStageDecimator {
         buf2.clear();
         output.clear();
 
-        // Stage 1
-        self.stages[0].process_block(input, &mut buf1);
-
-        // Stage 2
-        self.stages[1].process_block(&buf1, &mut buf2);
-
-        // Stage 3
-        self.stages[2].process_block(&buf2, output);
+        let num_stages = self.stages.len();
+        if num_stages == 1 {
+            self.stages[0].process_block(input, output);
+        } else if num_stages == 2 {
+            self.stages[0].process_block(input, &mut buf1);
+            self.stages[1].process_block(&buf1, output);
+        } else {
+            // Assume 3 stages (for 256x)
+            self.stages[0].process_block(input, &mut buf1);
+            self.stages[1].process_block(&buf1, &mut buf2);
+            self.stages[2].process_block(&buf2, output);
+        }
 
         // Put buffers back
         self.buf1 = buf1;
@@ -334,6 +375,20 @@ impl DigitalDownConverter {
         }
     }
 
+    pub fn new_8x(offset_frequency: f64, sample_rate: f64) -> Self {
+        let phase_step = (2.0 * std::f64::consts::PI * offset_frequency / sample_rate) as f32;
+        Self {
+            phase: 0.0,
+            phase_step,
+            decimator: MultiStageDecimator::new_8x(),
+            mixed_buf: Vec::new(),
+        }
+    }
+
+    pub fn update_offset(&mut self, offset_frequency: f64, sample_rate: f64) {
+        self.phase_step = (2.0 * std::f64::consts::PI * offset_frequency / sample_rate) as f32;
+    }
+
     pub fn process_block(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
         // Reuse pre-allocated buffer
         self.mixed_buf.clear();
@@ -360,9 +415,12 @@ impl DigitalDownConverter {
             }
         }
 
-        // Update phase for next block (wrap to [0, 2π))
-        self.phase = (self.phase + self.phase_step * input.len() as f32)
-            % (2.0 * std::f32::consts::PI);
+        // Extract phase directly from the exact complex state of carrier to prevent accumulator drift
+        let mut next_phase = -carrier.im.atan2(carrier.re);
+        if next_phase < 0.0 {
+            next_phase += 2.0 * std::f32::consts::PI;
+        }
+        self.phase = next_phase;
 
         // Decimate down to narrowband rate
         self.decimator.process(&self.mixed_buf, output);
@@ -425,6 +483,14 @@ mod tests {
                 "Mismatch at {}: out={:?}, exp={:?}", i, out, exp
             );
         }
+    }
+
+    #[test]
+    fn test_ddc_update_offset() {
+        let mut ddc = DigitalDownConverter::new(75.0, 2.048e6);
+        assert!((ddc.phase_step - (2.0 * std::f64::consts::PI * 75.0 / 2.048e6) as f32).abs() < 1e-6);
+        ddc.update_offset(150.0, 2.048e6);
+        assert!((ddc.phase_step - (2.0 * std::f64::consts::PI * 150.0 / 2.048e6) as f32).abs() < 1e-6);
     }
 }
 

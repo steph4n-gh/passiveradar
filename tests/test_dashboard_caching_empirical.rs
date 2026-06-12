@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn test_dashboard_cache_stress_and_leak() {
-    let mut db = Dashboard::new(100e6, 2.4e6, 0.0, "HackRF".to_string());
+    let mut db = Dashboard::new(100e6, 2.4e6, 0.0, "HackRF".to_string(), 0.0);
     
     // Add some logs
     db.add_log("Startup log 1".to_string());

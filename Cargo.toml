@@ -19,6 +19,7 @@ ureq = "2.9.7"
 rayon = "1.8"
 libc = "0.2"
 wgsl-fft = { version = "0.4.4", optional = true }
+tungstenite = "0.21.0"
 
 [features]
 default = ["gpu-fft"]
@@ -29,3 +30,15 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 0
+
+[profile.dev.package.ratatui]
+opt-level = 3
+
+[profile.dev.build-override]
+opt-level = 0

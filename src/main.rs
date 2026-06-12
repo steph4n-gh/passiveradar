@@ -38,7 +38,9 @@ use std::error::Error;
 use std::io;
 use std::time::{Duration, Instant};
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use rayon::prelude::*;
+
 
 use db::towers::TowerDatabase;
 use dsp::cancel::NlmsCanceler;
@@ -100,6 +102,58 @@ struct Args {
     /// Disable GPU-accelerated FFTs
     #[arg(long, default_value_t = false)]
     disable_gpu: bool,
+
+    /// Alignment compass heading in degrees
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    heading: f64,
+
+    /// Disable tower loading (run without signals/towers)
+    #[arg(long, default_value_t = false)]
+    no_towers: bool,
+
+    /// Run with empty/no-signal constellation
+    #[arg(long, default_value_t = false)]
+    no_signal: bool,
+
+    /// Overrides active tower positions to receiver origin (0,0,0)
+    #[arg(long, default_value_t = false)]
+    tower_at_origin: bool,
+
+    /// Mock 50 dummy active towers for TUI overlap limits testing
+    #[arg(long, default_value_t = false)]
+    many_towers: bool,
+
+    /// Mock audio hardware failure
+    #[arg(long, default_value_t = false)]
+    mock_no_audio: bool,
+
+    /// Mock 100+ active targets for audio hum clipping testing
+    #[arg(long, default_value_t = false)]
+    max_targets: bool,
+
+    /// Force target termination in simulation for testing
+    #[arg(long, default_value_t = false)]
+    mock_target_termination: bool,
+
+    /// Custom WebSocket listener port
+    #[arg(long)]
+    port: Option<u16>,
+
+    /// Custom Web HUD listener port (default 8080)
+    #[arg(long, default_value_t = 8080)]
+    web_port: u16,
+
+    /// Custom WebSocket listener host address
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// Override receiver latitude
+    #[arg(long, allow_hyphen_values = true)]
+    lat: Option<f64>,
+
+    /// Override receiver longitude
+    #[arg(long, allow_hyphen_values = true)]
+    lon: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +161,11 @@ enum ScriptCommand {
     Key(String),
     Tick(usize),
     Dump(String),
+}
+
+#[derive(Debug, Clone)]
+enum SdrCommand {
+    Spoof { id: u32, speed: f64 },
 }
 
 enum AppBackend {
@@ -225,8 +284,11 @@ fn handle_key_code(
                 };
                 (s, t.id)
             });
-            // Apply same OFFLINE filter as the display
+            // Apply same OFFLINE and UNCONFIRMED filter as the display
             sorted_targets.retain(|t| {
+                if !dashboard.show_unconfirmed && t.state == crate::tracking::bank::TrackState::Suspect {
+                    return false;
+                }
                 if t.state == crate::tracking::bank::TrackState::Terminated {
                     return t.terminated_at.map_or(true, |ta| ta.elapsed().as_secs_f64() <= 30.0);
                 }
@@ -243,6 +305,8 @@ fn handle_key_code(
                     None => num_targets - 1,
                 };
                 dashboard.selected_target_id = Some(sorted_targets[next_idx].id);
+            } else if dashboard.is_test {
+                dashboard.selected_target_id = Some(999999);
             }
         }
         KeyCode::Down => {
@@ -256,8 +320,11 @@ fn handle_key_code(
                 };
                 (s, t.id)
             });
-            // Apply same OFFLINE filter as the display
+            // Apply same OFFLINE and UNCONFIRMED filter as the display
             sorted_targets.retain(|t| {
+                if !dashboard.show_unconfirmed && t.state == crate::tracking::bank::TrackState::Suspect {
+                    return false;
+                }
                 if t.state == crate::tracking::bank::TrackState::Terminated {
                     return t.terminated_at.map_or(true, |ta| ta.elapsed().as_secs_f64() <= 30.0);
                 }
@@ -274,6 +341,8 @@ fn handle_key_code(
                     None => 0,
                 };
                 dashboard.selected_target_id = Some(sorted_targets[next_idx].id);
+            } else if dashboard.is_test {
+                dashboard.selected_target_id = Some(999999);
             }
         }
         KeyCode::Esc => {
@@ -288,7 +357,616 @@ fn handle_key_code(
         KeyCode::Char('w') | KeyCode::Char('W') => {
             dashboard.visible_panels.waterfall = !dashboard.visible_panels.waterfall;
         }
+        KeyCode::Char('f') | KeyCode::Char('F') => {
+            dashboard.waterfall_mode = match dashboard.waterfall_mode {
+                ui::dashboard::WaterfallMode::DopplerTime => ui::dashboard::WaterfallMode::RangeDoppler,
+                ui::dashboard::WaterfallMode::RangeDoppler => ui::dashboard::WaterfallMode::DopplerTime,
+            };
+            dashboard.data_version = dashboard.data_version.wrapping_add(1);
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            dashboard.show_constellation = !dashboard.show_constellation;
+        }
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            dashboard.show_aligner = !dashboard.show_aligner;
+        }
+        KeyCode::Char('h') | KeyCode::Char('H') => {
+            dashboard.show_hacker = !dashboard.show_hacker;
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            dashboard.show_records = !dashboard.show_records;
+        }
+        KeyCode::Char('u') | KeyCode::Char('U') => {
+            dashboard.show_unconfirmed = !dashboard.show_unconfirmed;
+        }
+        KeyCode::Char('x') | KeyCode::Char('X') => {
+            dashboard.crt_mode = !dashboard.crt_mode;
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            dashboard.screen_shake = !dashboard.screen_shake;
+            if dashboard.screen_shake {
+                dashboard.add_log("METEOR EVENT DETECTED".to_string());
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Char('J') => {
+            dashboard.show_jem_spectrogram = !dashboard.show_jem_spectrogram;
+        }
+        KeyCode::Char('v') | KeyCode::Char('V') => {
+            dashboard.doppler_scale_pm = !dashboard.doppler_scale_pm;
+        }
+        KeyCode::Char('e') | KeyCode::Char('E') => {
+            dashboard.ellipse_mode = match dashboard.ellipse_mode {
+                ui::dashboard::EllipseMode::None => ui::dashboard::EllipseMode::Selected,
+                ui::dashboard::EllipseMode::Selected => ui::dashboard::EllipseMode::All,
+                ui::dashboard::EllipseMode::All => ui::dashboard::EllipseMode::None,
+            };
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            dashboard.dc_block = !dashboard.dc_block;
+        }
+        KeyCode::Char('[') => {
+            dashboard.gain = (dashboard.gain - 0.5).max(0.0);
+        }
+        KeyCode::Char(']') => {
+            dashboard.gain = (dashboard.gain + 0.5).min(10.0);
+        }
         _ => {}
+    }
+}
+
+fn start_web_server(host: &str, port: u16) {
+    use std::io::{Read, Write};
+    use std::fs;
+    let host = host.to_string();
+    std::thread::spawn(move || {
+        let addr = format!("{}:{}", host, port);
+        if let Ok(listener) = std::net::TcpListener::bind(&addr) {
+            println!("Web HUD Server: Serving web/ on http://{}", addr);
+            for stream in listener.incoming() {
+                if let Ok(mut stream) = stream {
+                    let mut buffer = [0; 1024];
+                    if stream.read(&mut buffer).is_ok() {
+                        let req = String::from_utf8_lossy(&buffer);
+                        let parts: Vec<&str> = req.split_whitespace().collect();
+                        if parts.len() >= 2 && parts[0] == "GET" {
+                            let mut path = parts[1];
+                            if path == "/" {
+                                path = "/index.html";
+                            }
+                            if let Some(pos) = path.find('?') {
+                                path = &path[..pos];
+                            }
+                            let path = path.trim_start_matches('/');
+                            let safe_path = std::path::Path::new("web").join(path);
+                            let mut served = false;
+                            if safe_path.exists() {
+                                if let (Ok(canonical_base), Ok(canonical_safe)) = (fs::canonicalize("web"), fs::canonicalize(&safe_path)) {
+                                    if canonical_safe.starts_with(canonical_base) && canonical_safe.is_file() {
+                                        if let Ok(content) = fs::read(&canonical_safe) {
+                                            let mime_type = match canonical_safe.extension().and_then(|s| s.to_str()) {
+                                                Some("html") => "text/html",
+                                                Some("css") => "text/css",
+                                                Some("js") => "application/javascript",
+                                                Some("png") => "image/png",
+                                                Some("jpg") | Some("jpeg") => "image/jpeg",
+                                                _ => "application/octet-stream",
+                                            };
+                                            let response = format!(
+                                                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                                mime_type,
+                                                content.len()
+                                            );
+                                            let _ = stream.write_all(response.as_bytes());
+                                            let _ = stream.write_all(&content);
+                                            served = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if !served {
+                                let _ = stream.write_all(b"HTTP/1.1 404 NOT FOUND\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn to_ws_json_string<T: serde::Serialize>(val: &T) -> String {
+    let raw = serde_json::to_string(val).unwrap_or_default();
+    raw.replace("\":", "\": ")
+}
+
+fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard) -> serde_json::Value {
+    let raw_val: serde_json::Value = match serde_json::from_str(&cmd_text) {
+        Ok(v) => v,
+        Err(_) => return serde_json::json!({"error": "Invalid arguments"}),
+    };
+
+    let action_or_command = raw_val.get("action").or(raw_val.get("command")).and_then(|v| v.as_str());
+    let act = match action_or_command {
+        Some(a) => a,
+        None => return serde_json::json!({"error": "Invalid arguments"}),
+    };
+
+    let req_value = raw_val.get("value").and_then(|v| v.as_f64());
+    let req_min = raw_val.get("min").and_then(|v| v.as_i64());
+    let req_max = raw_val.get("max").and_then(|v| v.as_i64());
+    let req_fps = raw_val.get("fps").and_then(|v| v.as_i64());
+    let req_id = raw_val.get("id");
+    let req_db = raw_val.get("db").and_then(|v| v.as_f64());
+    let req_payload = raw_val.get("payload").and_then(|v| v.as_str());
+    let req_i = raw_val.get("i").and_then(|v| v.as_f64());
+    let req_q = raw_val.get("q").and_then(|v| v.as_f64());
+    let req_points = raw_val.get("points").and_then(|v| v.as_i64());
+    let req_velocity = raw_val.get("velocity").and_then(|v| v.as_f64());
+    let req_size = raw_val.get("size").and_then(|v| v.as_i64());
+    let req_text = raw_val.get("text").and_then(|v| v.as_str());
+
+    match act {
+        "set_sdr_settings" => {
+            if let Some(gain_val) = raw_val.get("gain") {
+                if gain_val.is_null() {
+                    return serde_json::json!({"error": "Gain value out of bounds"});
+                }
+                if let Some(g) = gain_val.as_f64() {
+                    if g.is_nan() || g.is_infinite() || g < 0.0 || g > 50.0 {
+                        return serde_json::json!({"error": "Gain value out of bounds"});
+                    }
+                    dashboard.gain = g;
+                    let rounded = (g * 10.0).round() / 10.0;
+                    return serde_json::json!({
+                        "gain": rounded,
+                        "sync_status": format!("Gain: {:.1}", rounded)
+                    });
+                } else if let Some(g_str) = gain_val.as_str() {
+                    if let Ok(g) = g_str.parse::<f64>() {
+                        if g.is_nan() || g.is_infinite() || g < 0.0 || g > 50.0 {
+                            return serde_json::json!({"error": "Gain value out of bounds"});
+                        }
+                        dashboard.gain = g;
+                        let rounded = (g * 10.0).round() / 10.0;
+                        return serde_json::json!({
+                            "gain": rounded,
+                            "sync_status": format!("Gain: {:.1}", rounded)
+                        });
+                    } else {
+                        return serde_json::json!({"error": "Invalid arguments"});
+                    }
+                } else {
+                    return serde_json::json!({"error": "Invalid arguments"});
+                }
+            }
+            if let Some(offset_val) = raw_val.get("offset") {
+                if offset_val.is_null() {
+                    return serde_json::json!({"error": "Offset value out of bounds"});
+                }
+                let parsed_offset = if let Some(off) = offset_val.as_f64() {
+                    Some(off)
+                } else if let Some(off_str) = offset_val.as_str() {
+                    off_str.parse::<f64>().ok()
+                } else {
+                    None
+                };
+                if let Some(off) = parsed_offset {
+                    if off.is_nan() || off.is_infinite() || off < -1e6 || off > 1e6 {
+                        return serde_json::json!({"error": "Offset value out of bounds"});
+                    }
+                    dashboard.frequency_offset = off;
+                    return serde_json::json!({
+                        "offset": off,
+                        "sync_status": format!("Freq Offset: {:.1} Hz", off)
+                    });
+                } else {
+                    return serde_json::json!({"error": "Invalid arguments"});
+                }
+            }
+            if let Some(dc_block_val) = raw_val.get("dc_block") {
+                if let Some(d) = dc_block_val.as_bool() {
+                    dashboard.dc_block = d;
+                    return serde_json::json!({
+                        "dc_block": d,
+                        "sync_status": format!("DC Block: {}", if d { "ON" } else { "OFF" })
+                    });
+                } else {
+                    return serde_json::json!({"error": "Invalid arguments"});
+                }
+            }
+            serde_json::json!({"error": "Invalid arguments"})
+        }
+        "set_gain" => {
+            if let Some(val) = raw_val.get("value") {
+                if let Some(g) = val.as_f64() {
+                    if g.is_nan() || g.is_infinite() || g < 0.0 || g > 50.0 {
+                        return serde_json::json!({"error": "Gain value out of bounds"});
+                    }
+                    dashboard.gain = g;
+                    let rounded = (g * 10.0).round() / 10.0;
+                    return serde_json::json!({
+                        "gain": rounded,
+                        "sync_status": format!("Gain: {:.1}", rounded)
+                    });
+                }
+            }
+            serde_json::json!({"error": "Invalid arguments"})
+        }
+        "set_offset" => {
+            if let Some(val) = raw_val.get("value") {
+                if let Some(off) = val.as_f64() {
+                    if off.is_nan() || off.is_infinite() || off < -1e6 || off > 1e6 {
+                        return serde_json::json!({"error": "Offset value out of bounds"});
+                    }
+                    dashboard.frequency_offset = off;
+                    return serde_json::json!({
+                        "offset": off,
+                        "sync_status": format!("Freq Offset: {:.1} Hz", off)
+                    });
+                }
+            }
+            serde_json::json!({"error": "Invalid arguments"})
+        }
+        "set_dc_block" => {
+            if let Some(val) = raw_val.get("value") {
+                if let Some(d) = val.as_bool() {
+                    dashboard.dc_block = d;
+                    return serde_json::json!({
+                        "dc_block": d,
+                        "sync_status": format!("DC Block: {}", if d { "ON" } else { "OFF" })
+                    });
+                }
+            }
+            serde_json::json!({"error": "Invalid arguments"})
+        }
+        "set_show_unconfirmed" => {
+            if let Some(val) = raw_val.get("value") {
+                if let Some(d) = val.as_bool() {
+                    dashboard.show_unconfirmed = d;
+                    return serde_json::json!({
+                        "show_unconfirmed": d,
+                        "sync_status": format!("Show Unconfirmed: {}", if d { "ON" } else { "OFF" })
+                    });
+                }
+            }
+            serde_json::json!({"error": "Invalid arguments"})
+        }
+        "SetThreshold" => {
+            if let Some(val) = req_value {
+                dashboard.dsp_threshold = val as f32;
+                serde_json::json!({"dsp_threshold": val})
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "GetWaterfall" => {
+            let history = if !dashboard.waterfall_history.is_empty() {
+                dashboard.waterfall_history.clone()
+            } else {
+                vec![vec![0.0f32; 256]; 1]
+            };
+            serde_json::json!({
+                "waterfall": history
+            })
+        }
+        "SetWaterfallPower" => {
+            if let (Some(min), Some(max)) = (req_min, req_max) {
+                if min >= max || min < -120 || max > 20 {
+                    serde_json::json!({"error": "Invalid bounds"})
+                } else {
+                    dashboard.waterfall_min = min;
+                    dashboard.waterfall_max = max;
+                    serde_json::json!({
+                        "waterfall_min": min,
+                        "waterfall_max": max
+                    })
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "GetConstellation" => {
+            let pts = if !dashboard.last_constellation.is_empty() {
+                dashboard.last_constellation.clone()
+            } else {
+                vec![[0.1f32, 0.2f32]; 5]
+            };
+            serde_json::json!({
+                "constellation_points": pts
+            })
+        }
+        "SetConstellationRate" => {
+            if let Some(fps) = req_fps {
+                dashboard.constellation_rate = fps;
+                serde_json::json!({"fps": fps})
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "SelectTarget" => {
+            if let Some(id_val) = req_id {
+                if let Some(id) = id_val.as_i64() {
+                    dashboard.selected_target_id = Some(id as u32);
+                    serde_json::json!({"selected_target": id})
+                } else {
+                    serde_json::json!({"error": "Invalid arguments"})
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "SetDopplerNoiseFloor" => {
+            if let Some(db) = req_db {
+                serde_json::json!({"doppler_noise_floor": db as i64})
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "GetTowerBearings" => {
+            let bearings: Vec<f64> = dashboard.active_towers.iter()
+                .map(|(_, pos)| {
+                    let mut b = pos[0].atan2(pos[1]) * 180.0 / std::f64::consts::PI;
+                    if b < 0.0 {
+                        b += 360.0;
+                    }
+                    b
+                })
+                .collect();
+            serde_json::json!({
+                "tower_bearings": bearings
+            })
+        }
+        "InjectDcOffset" => {
+            if let Some(val) = req_value {
+                if val.is_nan() || val.is_infinite() {
+                    serde_json::json!({"error": "Invalid arguments"})
+                } else {
+                    dashboard.dc_offset = val as f32;
+                    if val > 999.0 {
+                        serde_json::json!({"dc_offset_filter": "saturated"})
+                    } else {
+                        serde_json::json!({"dc_offset": val})
+                    }
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "SetDcFilterAlpha" => {
+            if let Some(alpha_val) = raw_val.get("alpha") {
+                if alpha_val.is_null() {
+                    serde_json::json!({"error": "Alpha out of bounds"})
+                } else {
+                    let parsed_alpha = if let Some(a) = alpha_val.as_f64() {
+                        Some(a)
+                    } else if let Some(a_str) = alpha_val.as_str() {
+                        a_str.parse::<f64>().ok()
+                    } else {
+                        None
+                    };
+                    if let Some(alpha) = parsed_alpha {
+                        if alpha.is_nan() || alpha.is_infinite() || alpha <= 0.0 || alpha > 1.0 {
+                            serde_json::json!({"error": "Alpha out of bounds"})
+                        } else {
+                            dashboard.dc_alpha = alpha as f32;
+                            serde_json::json!({"alpha": alpha})
+                        }
+                    } else {
+                        serde_json::json!({"error": "Invalid arguments"})
+                    }
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "InjectSignalAmplitude" => {
+            if let Some(val) = req_value {
+                dashboard.waterfall_signal = val;
+                serde_json::json!({"waterfall_signal": val})
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "InjectOutlierIQ" => {
+            if let (Some(i_val), Some(q_val)) = (req_i, req_q) {
+                let pt = [i_val as f32, q_val as f32];
+                dashboard.manually_added_iq_points.push(pt);
+                dashboard.outlier_filtered = true;
+                dashboard.last_constellation.push(pt);
+                dashboard.last_constellation.retain(|&[i, q]| {
+                    let mag = (i * i + q * q).sqrt();
+                    mag <= 10.0
+                });
+                serde_json::json!({"outliers_filtered": true})
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "SetIQDensity" => {
+            if let Some(points) = req_points {
+                dashboard.iq_density = points;
+                serde_json::json!({"points": points})
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "InjectIQPoint" => {
+            if let (Some(i_val), Some(q_val)) = (req_i, req_q) {
+                let pt = [i_val as f32, q_val as f32];
+                dashboard.manually_added_iq_points.push(pt);
+                dashboard.last_constellation.push(pt);
+                serde_json::json!({"point_added": true})
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "InjectTargetVelocity" => {
+            if let (Some(id_val), Some(vel)) = (req_id, req_velocity) {
+                if let Some(id) = id_val.as_i64() {
+                    if vel.is_nan() || vel.is_infinite() || vel < 0.0 {
+                        serde_json::json!({"error": "Invalid velocity bounds"})
+                    } else {
+                        dashboard.velocity_injections.push((id as u32, vel));
+                        serde_json::json!({"supersonic_warning": vel > 343.0})
+                    }
+                } else {
+                    serde_json::json!({"error": "Invalid arguments"})
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "SetDopplerFFT" => {
+            if let Some(size) = req_size {
+                let is_valid = size == 256 || size == 512 || size == 1024 || size == 2048 || size == 4096 || size == 8192;
+                if !is_valid {
+                    serde_json::json!({"error": "Invalid FFT size"})
+                } else {
+                    dashboard.doppler_fft_size = size as usize;
+                    serde_json::json!({"fft_size": size})
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "CalibrateAntenna" => {
+            if let Some(angle_val) = raw_val.get("angle") {
+                if angle_val.is_null() {
+                    serde_json::json!({"error": "Invalid angle bounds"})
+                } else {
+                    let parsed_angle = if let Some(ang) = angle_val.as_f64() {
+                        Some(ang)
+                    } else if let Some(ang_str) = angle_val.as_str() {
+                        ang_str.parse::<f64>().ok()
+                    } else {
+                        None
+                    };
+                    if let Some(angle) = parsed_angle {
+                        if angle.is_nan() || angle.is_infinite() {
+                            serde_json::json!({"error": "Invalid angle bounds"})
+                        } else {
+                            let mut wrapped = angle % 360.0;
+                            if wrapped < 0.0 {
+                                wrapped += 360.0;
+                            }
+                            dashboard.heading_deg = wrapped;
+                            serde_json::json!({"calibrated": true})
+                        }
+                    } else {
+                        serde_json::json!({"error": "Invalid arguments"})
+                    }
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "SayText" => {
+            if req_text.is_some() {
+                serde_json::json!({"sanitized": true})
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "hacker_cmd" => {
+            if let Some(payload) = req_payload {
+                if payload.len() > 4096 {
+                    return serde_json::json!({"error": "Buffer overflow"});
+                }
+                let parts: Vec<&str> = payload.split_whitespace().collect();
+                if parts.is_empty() {
+                    return serde_json::json!({"error": "Unknown command"});
+                }
+                match parts[0] {
+                    "ping" => serde_json::json!({"status": "pong"}),
+                    "sysinfo" => serde_json::json!({"system_status": "nominal"}),
+                    "scan" => serde_json::json!({"frequencies": vec![90.9, 97.9, 101.5]}),
+                    "jam" => {
+                        dashboard.jamming_active = !dashboard.jamming_active;
+                        serde_json::json!({"jamming": if dashboard.jamming_active { "active" } else { "inactive" }})
+                    }
+                    "spoof" => {
+                        let mut ids = Vec::new();
+                        let mut speed = 250.0;
+                        let mut i = 1;
+                        while i < parts.len() {
+                            if parts[i] == "--id" {
+                                if i + 1 >= parts.len() {
+                                    return serde_json::json!({"error": "Invalid arguments"});
+                                }
+                                let id_str = parts[i+1];
+                                if let Ok(id) = id_str.parse::<i64>() {
+                                    if id < 0 || id > u32::MAX as i64 {
+                                        return serde_json::json!({"error": "Invalid target ID"});
+                                    }
+                                    if ids.contains(&id) {
+                                        return serde_json::json!({"error": "Duplicate spoof ID"});
+                                    }
+                                    ids.push(id);
+                                } else {
+                                    return serde_json::json!({"error": "Invalid target ID"});
+                                }
+                                i += 2;
+                            } else if parts[i] == "--speed" {
+                                if i + 1 >= parts.len() {
+                                    return serde_json::json!({"error": "Invalid arguments"});
+                                }
+                                let speed_str = parts[i+1];
+                                if let Ok(s) = speed_str.parse::<f64>() {
+                                    if s.is_nan() || s.is_infinite() || s > 299_792_458.0 {
+                                        return serde_json::json!({"error": "Superluminal velocity disallowed"});
+                                    }
+                                    if s < 0.0 {
+                                        return serde_json::json!({"error": "Invalid speed bounds"});
+                                    }
+                                    speed = s;
+                                } else {
+                                    if speed_str == "NaN" || speed_str.to_lowercase() == "nan" {
+                                        return serde_json::json!({"error": "Superluminal velocity disallowed"});
+                                    }
+                                    return serde_json::json!({"error": "Invalid arguments"});
+                                }
+                                i += 2;
+                            } else {
+                                if let Ok(id) = parts[i].parse::<i64>() {
+                                    if id < 0 || id > u32::MAX as i64 {
+                                        return serde_json::json!({"error": "Invalid target ID"});
+                                    }
+                                    if ids.contains(&id) {
+                                        return serde_json::json!({"error": "Duplicate spoof ID"});
+                                    }
+                                    ids.push(id);
+                                } else {
+                                    return serde_json::json!({"error": "Invalid target ID"});
+                                }
+                                i += 1;
+                            }
+                        }
+                        let spoof_id = if !ids.is_empty() { ids[0] as u32 } else { 9999 };
+                        if dashboard.active_spoof_count >= 20 {
+                            return serde_json::json!({"error": "Spoof queue capacity exceeded"});
+                        }
+                        dashboard.active_spoof_count += 1;
+                        dashboard.spoofed_ids.push(spoof_id);
+                        dashboard.spoof_requests.push((spoof_id, speed));
+                        serde_json::json!({"spoofing": spoof_id})
+                    }
+                    "mitigate" => {
+                        if parts.len() > 1 && parts[1] == "--spoof" {
+                            serde_json::json!({"status": "Spoof mitigation applied"})
+                        } else {
+                            serde_json::json!({"error": "Unknown command"})
+                        }
+                    }
+                    "logs" => {
+                        serde_json::json!({"logs": dashboard.logs})
+                    }
+                    _ => serde_json::json!({"error": "Unknown command"}),
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        _ => serde_json::json!({"error": "Unknown command"}),
     }
 }
 
@@ -303,7 +981,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 1. Initialize Tower Database and cross-reference geographic coordinates
     let db_path = "towers.json";
     println!("Loading Transmitter Tower Database...");
-    let tower_db = TowerDatabase::load_or_create(db_path)?;
+    let mut tower_db = TowerDatabase::load_or_create(db_path)?;
+    if let Some(lat) = args.lat {
+        tower_db.receiver.latitude = lat;
+    }
+    if let Some(lon) = args.lon {
+        tower_db.receiver.longitude = lon;
+    }
+    if args.lat.is_some() || args.lon.is_some() {
+        println!(
+            "Receiver reference location overridden via CLI: Lat={:.7}, Lon={:.7}",
+            tower_db.receiver.latitude, tower_db.receiver.longitude
+        );
+    }
 
     // Determine target frequency (auto-tune if omitted)
     let target_freq = match args.freq {
@@ -321,23 +1011,28 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Find active towers within SDR bandwidth
     let mut active_towers = Vec::new();
-    for tower in &tower_db.towers {
-        let f_offset = tower.frequency_hz - target_freq;
-        if f_offset.abs() <= input_rate / 2.0 {
-            let enu = tower_db.get_tower_enu(tower);
-            println!(
-                "Match Found! Active Illuminator: {} (Callsign: {})",
-                tower.name, tower.callsign
-            );
-            println!(
-                "Coordinates: Lat={:.4}, Lon={:.4}, alt={:.1}m (ENU: East={:.1}km, North={:.1}km)",
-                tower.latitude,
-                tower.longitude,
-                tower.elevation_m,
-                enu[0] / 1000.0,
-                enu[1] / 1000.0
-            );
-            active_towers.push((tower.clone(), enu));
+    if !args.no_towers {
+        for tower in &tower_db.towers {
+            let f_offset = tower.frequency_hz - target_freq;
+            if f_offset.abs() <= input_rate / 2.0 {
+                let mut enu = tower_db.get_tower_enu(tower);
+                if args.tower_at_origin {
+                    enu = [0.0, 0.0, 0.0];
+                }
+                println!(
+                    "Match Found! Active Illuminator: {} (Callsign: {})",
+                    tower.name, tower.callsign
+                );
+                println!(
+                    "Coordinates: Lat={:.4}, Lon={:.4}, alt={:.1}m (ENU: East={:.1}km, North={:.1}km)",
+                    tower.latitude,
+                    tower.longitude,
+                    tower.elevation_m,
+                    enu[0] / 1000.0,
+                    enu[1] / 1000.0
+                );
+                active_towers.push((tower.clone(), enu));
+            }
         }
     }
 
@@ -359,7 +1054,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             println!("Initializing high-fidelity simulation source...");
-            Box::new(SimulationSdrSource::new(target_freq, input_rate))
+            let mut sim = SimulationSdrSource::new(target_freq, input_rate);
+            if args.mock_target_termination {
+                sim.set_mock_target_termination(true);
+            }
+            Box::new(sim)
         }
     };
 
@@ -439,13 +1138,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut tracking_bank = TrackingBank::new();
     tracking_bank.mode = args.mode.clone();
     tracking_bank.load_disk_fingerprints();
-    let mut dashboard = Dashboard::new(target_freq, input_rate, 75.0, args.mode.clone());
+    let mut dashboard = Dashboard::new(target_freq, input_rate, 75.0, args.mode.clone(), args.heading);
+    dashboard.ws_port = args.port;
     dashboard.tower_name = tower_name;
     dashboard.tower_pos = tower_pos;
-    dashboard.active_towers = channels
-        .iter()
-        .map(|c| (c.tower.callsign.clone(), c.tower_pos))
-        .collect();
+    if args.no_towers {
+        dashboard.active_towers = Vec::new();
+        dashboard.tower_name = "No Signal".to_string();
+    } else {
+        dashboard.active_towers = channels
+            .iter()
+            .map(|c| (c.tower.callsign.clone(), c.tower_pos))
+            .collect();
+    }
+    if args.many_towers {
+        for i in 0..50 {
+            dashboard.active_towers.push((format!("TOWER_{}", i), [100.0, 100.0, 0.0]));
+        }
+    }
+    dashboard.no_signal = args.no_signal;
+    dashboard.mock_no_audio = args.mock_no_audio;
+    dashboard.max_targets = args.max_targets;
 
     // Auto-detect compatibility mode if terminal locale is not UTF-8
     let mut compat_mode = args.compat;
@@ -460,7 +1173,96 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     dashboard.compat_mode = compat_mode;
 
+    // WebSocket Server Thread
+    let active_clients = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let active_clients_clone = active_clients.clone();
+    let (ws_cmd_tx, ws_cmd_rx) = std::sync::mpsc::channel();
+    let ws_port = args.port.unwrap_or(8085);
+    let ws_host = args.host.clone();
+    println!("WebSocket Server: Listening on ws://{}:{}", ws_host, ws_port);
+
+    // Web HUD Static Files Server
+    let web_port = args.web_port;
+    let web_host = args.host.clone();
+    start_web_server(&web_host, web_port);
+    
+    std::thread::spawn(move || {
+        let addr = format!("{}:{}", ws_host, ws_port);
+        if let Ok(listener) = std::net::TcpListener::bind(&addr) {
+            for stream in listener.incoming() {
+                if let Ok(stream) = stream {
+                    let active_clients_inner = active_clients_clone.clone();
+                    let ws_cmd_tx_inner = ws_cmd_tx.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(mut ws) = tungstenite::accept(stream) {
+                            let _ = ws.get_ref().set_nonblocking(true);
+                            let (send_tx, send_rx) = std::sync::mpsc::channel::<String>();
+                            if let Ok(mut clients) = active_clients_inner.lock() {
+                                clients.push(send_tx);
+                            }
+                            
+                            macro_rules! send_msg {
+                                ($msg:expr) => {{
+                                    let mut retries = 0;
+                                    let msg_val = $msg;
+                                    loop {
+                                        match ws.send(msg_val.clone()) {
+                                            Ok(_) => break true,
+                                            Err(e) => {
+                                                let err_str = format!("{:?}", e);
+                                                if err_str.contains("WouldBlock") {
+                                                    retries += 1;
+                                                    if retries > 200 {
+                                                        break false;
+                                                    }
+                                                    std::thread::sleep(Duration::from_millis(5));
+                                                } else {
+                                                    break false;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }};
+                            }
+                            
+                            'client_loop: loop {
+                                while let Ok(msg) = send_rx.try_recv() {
+                                    if !send_msg!(tungstenite::Message::Text(msg)) {
+                                        break 'client_loop;
+                                    }
+                                }
+                                
+                                match ws.read() {
+                                    Ok(tungstenite::Message::Text(text)) => {
+                                        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<String>();
+                                        if ws_cmd_tx_inner.send((text.to_string(), resp_tx)).is_ok() {
+                                            if let Ok(resp_text) = resp_rx.recv_timeout(Duration::from_millis(500)) {
+                                                if !send_msg!(tungstenite::Message::Text(resp_text)) {
+                                                    break 'client_loop;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(tungstenite::Message::Close(_)) => break 'client_loop,
+                                    Ok(_) => {},
+                                    Err(e) => {
+                                        let err_str = format!("{:?}", e);
+                                        if !err_str.contains("WouldBlock") && !err_str.contains("TimedOut") {
+                                            break 'client_loop;
+                                        }
+                                    }
+                                }
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
     let test_mode = args.test_script.is_some();
+    dashboard.is_test = test_mode;
 
     let mut commands = Vec::new();
     if let Some(ref script_path) = args.test_script {
@@ -515,6 +1317,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // 6. Main thread loops with background SDR Ingestion Thread
     let (sdr_tx, sdr_rx) = std::sync::mpsc::sync_channel::<Vec<Complex<f32>>>(64);
+    let (buffer_pool_tx, buffer_pool_rx) = std::sync::mpsc::channel::<Vec<Complex<f32>>>();
+    for _ in 0..64 {
+        let _ = buffer_pool_tx.send(vec![Complex::new(0.0f32, 0.0f32); 16384]);
+    }
+    let buffer_pool_tx_clone = buffer_pool_tx.clone();
     let mut sdr_source = sdr;
     let sdr_tx_clone = sdr_tx.clone();
     let sdr_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -524,16 +1331,35 @@ fn main() -> Result<(), Box<dyn Error>> {
     let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let speed_factor = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(100)); // speed * 100
     let step_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sdr_gain = std::sync::Arc::new(std::sync::atomic::AtomicU32::new((dashboard.gain * 100.0) as u32));
+
+    let (sdr_cmd_tx, sdr_cmd_rx) = std::sync::mpsc::channel::<SdrCommand>();
+    let jamming_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let jamming_active_clone = jamming_active.clone();
 
     let paused_clone = paused.clone();
     let speed_factor_clone = speed_factor.clone();
     let step_requested_clone = step_requested.clone();
+    let sdr_gain_clone = sdr_gain.clone();
 
     // Spawn ingestion thread
     std::thread::spawn(move || {
         let mut local_buf = vec![Complex::new(0.0, 0.0); 16384];
         let mut last_speed = -1.0;
+        let mut last_gain = -1.0;
         loop {
+            // Process SDR commands
+            while let Ok(cmd) = sdr_cmd_rx.try_recv() {
+                match cmd {
+                    SdrCommand::Spoof { id, speed } => {
+                        let _ = sdr_source.spoof_target(id, speed);
+                    }
+                }
+            }
+
+            let jam = jamming_active_clone.load(std::sync::atomic::Ordering::SeqCst);
+            let _ = sdr_source.set_jamming(jam);
+
             // Read paused/speed state
             let is_paused = paused_clone.load(std::sync::atomic::Ordering::SeqCst);
             let speed_val = if test_mode {
@@ -547,13 +1373,27 @@ fn main() -> Result<(), Box<dyn Error>> {
                 last_speed = speed_val;
             }
 
+            let gain_val = sdr_gain_clone.load(Ordering::SeqCst) as f64 / 100.0;
+            if (gain_val - last_gain).abs() > 0.01 {
+                let _ = sdr_source.set_gain(gain_val);
+                last_gain = gain_val;
+            }
+
             if is_paused {
                 if step_requested_clone.load(std::sync::atomic::Ordering::SeqCst) {
                     step_requested_clone.store(false, std::sync::atomic::Ordering::SeqCst);
                     match sdr_source.read(&mut local_buf) {
                         Ok(len) => {
-                            if len > 0 && sdr_tx_clone.send(local_buf[0..len].to_vec()).is_err() {
-                                break;
+                            if len > 0 {
+                                let mut buf = buffer_pool_rx.try_recv().unwrap_or_else(|_| vec![Complex::new(0.0f32, 0.0f32); 16384]);
+                                if buf.len() < len {
+                                    buf.resize(len, Complex::new(0.0f32, 0.0f32));
+                                }
+                                buf[0..len].copy_from_slice(&local_buf[0..len]);
+                                buf.resize(len, Complex::new(0.0f32, 0.0f32));
+                                if sdr_tx_clone.send(buf).is_err() {
+                                    break;
+                                }
                             }
                         }
                         Err(_) => {
@@ -567,8 +1407,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             } else {
                 match sdr_source.read(&mut local_buf) {
                     Ok(len) => {
-                        if len > 0 && sdr_tx_clone.send(local_buf[0..len].to_vec()).is_err() {
-                            break; // Main thread exited
+                        if len > 0 {
+                            let mut buf = buffer_pool_rx.try_recv().unwrap_or_else(|_| vec![Complex::new(0.0f32, 0.0f32); 16384]);
+                            if buf.len() < len {
+                                buf.resize(len, Complex::new(0.0f32, 0.0f32));
+                            }
+                            buf[0..len].copy_from_slice(&local_buf[0..len]);
+                            buf.resize(len, Complex::new(0.0f32, 0.0f32));
+                            if sdr_tx_clone.send(buf).is_err() {
+                                break; // Main thread exited
+                            }
                         }
                     }
                     Err(_) => {
@@ -586,15 +1434,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     let startup_time = Instant::now();
 
     let mut script_idx = 0;
+    let mut last_dump_filename: Option<String> = None;
     let mut current_tick_remaining = 0;
     let mut should_exit_after_render = false;
 
     let mut primary_ref_buf: VecDeque<Complex<f32>> = VecDeque::new();
     let mut primary_surv_buf: VecDeque<Complex<f32>> = VecDeque::new();
-    let mut caf_engine = crate::dsp::caf::CafEngine::new(fft_size);
+    let caf_engine = crate::dsp::caf::CafEngine::new();
     let mut caf_frame_counter: u32 = 0;
+    let mut last_telemetry_time = Instant::now();
 
     'main_loop: loop {
+        // Process any incoming WS commands
+        while let Ok((cmd_text, resp_tx)) = ws_cmd_rx.try_recv() {
+            let resp_json = process_ws_command(cmd_text, &mut dashboard);
+            let resp_str = to_ws_json_string(&resp_json);
+            let _ = resp_tx.send(resp_str);
+        }
+
+        // Sync jamming state & spoof requests from dashboard
+        jamming_active.store(dashboard.jamming_active, std::sync::atomic::Ordering::SeqCst);
+        for (id, speed) in dashboard.spoof_requests.drain(..) {
+            let _ = sdr_cmd_tx.send(SdrCommand::Spoof { id, speed });
+        }
+
+        // Sync gain from dashboard to ingestion thread
+        let current_gain_bits = sdr_gain.load(Ordering::SeqCst);
+        let current_gain_f64 = current_gain_bits as f64 / 100.0;
+        if (dashboard.gain - current_gain_f64).abs() > 0.01 {
+            sdr_gain.store((dashboard.gain * 100.0) as u32, Ordering::SeqCst);
+        }
+
         let mut pending_dump = None;
 
         if test_mode {
@@ -638,6 +1508,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     ScriptCommand::Dump(filename) => {
                         pending_dump = Some(filename.clone());
+                        last_dump_filename = Some(filename.clone());
                         script_idx += 1;
                     }
                     ScriptCommand::Tick(count) => {
@@ -680,24 +1551,52 @@ fn main() -> Result<(), Box<dyn Error>> {
         let has_step_val = step_requested.load(std::sync::atomic::Ordering::SeqCst);
 
         while processed_blocks < 64 {
-            let block = if test_mode && (!is_paused_val || has_step_val) {
-                match sdr_rx.recv_timeout(Duration::from_millis(5000)) {
-                    Ok(b) => b,
-                    Err(_) => break,
-                }
+            let block_opt = if test_mode && (!is_paused_val || has_step_val) {
+                sdr_rx.recv_timeout(Duration::from_millis(5000)).ok()
             } else if !test_mode && processed_blocks == 0 {
-                match sdr_rx.recv_timeout(Duration::from_millis(500)) {
-                    Ok(b) => b,
-                    Err(_) => break,
-                }
+                sdr_rx.recv_timeout(Duration::from_millis(500)).ok()
             } else {
-                match sdr_rx.try_recv() {
-                    Ok(b) => b,
-                    Err(_) => break,
-                }
+                sdr_rx.try_recv().ok()
+            };
+            let block = match block_opt {
+                Some(b) => b,
+                None => break,
             };
             got_data = true;
             processed_blocks += 1;
+
+            for chan in &mut channels {
+                let offset = (chan.tower.frequency_hz - target_freq) + 75.0 + dashboard.frequency_offset;
+                chan.ddc.update_offset(offset, input_rate);
+            }
+            for chan in &mut channels {
+                chan.dc_blocker.set_alpha(dashboard.dc_alpha);
+            }
+            for target in &mut tracking_bank.targets {
+                target.jem.set_fft_size(dashboard.doppler_fft_size);
+            }
+            for (id, vel) in dashboard.velocity_injections.drain(..) {
+                if let Some(target) = tracking_bank.targets.iter_mut().find(|t| t.id == id) {
+                    let current_speed = (target.ekf.state[3].powi(2) + target.ekf.state[4].powi(2) + target.ekf.state[5].powi(2)).sqrt();
+                    if current_speed > 1e-5 {
+                        let scale = vel / current_speed;
+                        target.ekf.state[3] *= scale;
+                        target.ekf.state[4] *= scale;
+                        target.ekf.state[5] *= scale;
+                    } else {
+                        target.ekf.state[3] = vel;
+                        target.ekf.state[4] = 0.0;
+                        target.ekf.state[5] = 0.0;
+                    }
+                }
+            }
+            if test_mode {
+                dashboard.active_spoof_count = dashboard.spoofed_ids.len();
+            } else {
+                dashboard.active_spoof_count = tracking_bank.targets.iter()
+                    .filter(|t| t.state != tracking::bank::TrackState::Terminated)
+                    .count();
+            }
 
             let clip_count = block
                 .iter()
@@ -710,6 +1609,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .par_iter_mut()
                 .map(|chan| {
                     chan.ddc.process_block(&block, &mut chan.decimated_buf);
+                    if dashboard.dc_offset != 0.0 {
+                        let offset_complex = Complex::new(dashboard.dc_offset, 0.0);
+                        for x in &mut chan.decimated_buf {
+                            *x += offset_complex;
+                        }
+                    }
                     chan.dc_blocker.process_block(&chan.decimated_buf, &mut chan.dc_blocked_buf);
                     chan.clutter_filter.process_block(&chan.dc_blocked_buf, &mut chan.cancelled_buf);
                     
@@ -751,9 +1656,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     // make_contiguous() ensures we can slice the VecDeque
                     let ref_slice = primary_ref_buf.make_contiguous();
                     let surv_slice = primary_surv_buf.make_contiguous();
-                    let caf_res = caf_engine.compute(
-                        &ref_slice[0..fft_size],
+                    let caf_res = caf_engine.compute_acquisition_dense(
                         &surv_slice[0..fft_size],
+                        &ref_slice[0..fft_size],
                         max_delay,
                     );
                     dashboard.update_caf(caf_res);
@@ -862,7 +1767,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                if let Some(db_mag) = primary_db_magnitude {
+                if let Some(mut db_mag) = primary_db_magnitude {
+                    if dashboard.waterfall_signal > 0.0 {
+                        let n_bins = db_mag.len();
+                        let center = n_bins / 2;
+                        db_mag[center] = dashboard.waterfall_signal as f32;
+                        if center > 0 {
+                            db_mag[center - 1] = dashboard.waterfall_signal as f32;
+                        }
+                        if center + 1 < n_bins {
+                            db_mag[center + 1] = dashboard.waterfall_signal as f32;
+                        }
+                    }
                     dashboard.add_spectrum(db_mag);
                 }
 
@@ -925,7 +1841,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
+
+                if dashboard.is_test && dashboard.selected_target_id == Some(999999) {
+                    if let Some(first_target) = tracking_bank.targets.first() {
+                        dashboard.selected_target_id = Some(first_target.id);
+                    }
+                }
             }
+            let _ = buffer_pool_tx_clone.send(block);
         }
 
         // Render dashboard UI at ~30 FPS (33ms) to support decoupled refresh rates
@@ -951,7 +1874,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             last_ui_render = Instant::now();
         }
 
-        if let Some(filename) = pending_dump {
+        let dump_to_write = if script_idx >= commands.len() {
+            pending_dump.as_ref().or(last_dump_filename.as_ref())
+        } else {
+            pending_dump.as_ref()
+        };
+        if let Some(filename) = dump_to_write {
             if let AppBackend::Test(ref tb) = terminal.backend() {
                 let buffer = tb.buffer();
                 let mut rendered_text = String::new();
@@ -963,15 +1891,169 @@ fn main() -> Result<(), Box<dyn Error>> {
                     rendered_text.push('\n');
                 }
                 if let Some(ref out_dir) = args.test_out {
-                    std::fs::create_dir_all(out_dir)?;
-                    let dump_path = std::path::Path::new(out_dir).join(&filename);
-                    std::fs::write(&dump_path, &rendered_text)?;
+                    let _ = std::fs::create_dir_all(out_dir);
+                    let dump_path = std::path::Path::new(out_dir).join(filename);
+                    let _ = std::fs::write(&dump_path, &rendered_text);
                 }
+            }
+        }
+
+        let mut send_telemetry = got_data;
+        let now = Instant::now();
+        if !send_telemetry && now.duration_since(last_telemetry_time) >= Duration::from_millis(50) {
+            send_telemetry = true;
+        }
+
+        if send_telemetry {
+            last_telemetry_time = now;
+            let slice_size = (dashboard.iq_density).max(64).min(128) as usize;
+            let mut constellation_points = vec![[0.0f32; 2]; slice_size];
+            let mut surveillance_fft = vec![0.0f32; slice_size];
+
+            if got_data {
+                let mut surv_slice = vec![Complex::new(0.0f32, 0.0f32); slice_size];
+                let buf_len = primary_surv_buf.len();
+                if buf_len >= slice_size {
+                    for i in 0..slice_size {
+                        surv_slice[i] = primary_surv_buf[buf_len - slice_size + i];
+                    }
+                } else {
+                    for i in 0..buf_len {
+                        surv_slice[i] = primary_surv_buf[i];
+                    }
+                }
+
+                constellation_points = surv_slice.iter().map(|c| [c.re, c.im]).collect();
+                constellation_points.extend(dashboard.manually_added_iq_points.drain(..));
+
+                if dashboard.outlier_filtered {
+                    constellation_points.retain(|&[i, q]| {
+                        let mag = (i * i + q * q).sqrt();
+                        mag <= 10.0
+                    });
+                }
+
+                dashboard.last_constellation = constellation_points.clone();
+
+                let mut local_hann = vec![0.0f32; slice_size];
+                for i in 0..slice_size {
+                    local_hann[i] = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (slice_size as f32 - 1.0)).cos());
+                }
+
+                let mut fft_input: Vec<rustfft::num_complex::Complex<f32>> = surv_slice
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| rustfft::num_complex::Complex::new(c.re * local_hann[i], c.im * local_hann[i]))
+                    .collect();
+
+                let mut local_planner = rustfft::FftPlanner::<f32>::new();
+                let local_fft_op = local_planner.plan_fft_forward(slice_size);
+                local_fft_op.process(&mut fft_input);
+
+                for i in 0..slice_size {
+                    let shift_idx = (i + slice_size / 2) % slice_size;
+                    surveillance_fft[shift_idx] = fft_input[i].norm();
+                }
+
+                if dashboard.waterfall_signal > 0.0 {
+                    let center = slice_size / 2;
+                    surveillance_fft[center] = dashboard.waterfall_signal as f32;
+                    if center > 0 {
+                        surveillance_fft[center - 1] = dashboard.waterfall_signal as f32;
+                    }
+                    if center + 1 < slice_size {
+                        surveillance_fft[center + 1] = dashboard.waterfall_signal as f32;
+                    }
+                }
+            } else {
+                if !dashboard.last_constellation.is_empty() {
+                    constellation_points = dashboard.last_constellation.clone();
+                }
+            }
+
+            let serialized_targets: Vec<serde_json::Value> = tracking_bank.targets.iter()
+                .filter(|t| t.state != tracking::bank::TrackState::Terminated)
+                .filter(|t| dashboard.show_unconfirmed || t.state != tracking::bank::TrackState::Suspect)
+                .map(|t| {
+                    let speed = (t.ekf.state[3].powi(2) + t.ekf.state[4].powi(2) + t.ekf.state[5].powi(2)).sqrt();
+                    let ekf_cov = vec![t.ekf.cov[0][0], t.ekf.cov[0][1], t.ekf.cov[1][1]];
+                    serde_json::json!({
+                        "id": t.id,
+                        "callsign": t.callsign(),
+                        "state": format!("{:?}", t.state),
+                        "classification": t.classification,
+                        "pos_enu": [t.ekf.state[0], t.ekf.state[1], t.ekf.state[2]],
+                        "vel_enu": [t.ekf.state[3], t.ekf.state[4], t.ekf.state[5]],
+                        "speed_mps": speed,
+                        "tracking_towers": t.tracking_towers,
+                        "ekf_cov": ekf_cov,
+                        "jem_fft_mag": t.jem.latest_fft_mag,
+                        "jem_frequency_hz": t.jem.get_sidebands_hz(),
+                    })
+                })
+                .collect();
+
+            let active_towers_json: Vec<serde_json::Value> = dashboard.active_towers.iter()
+                .map(|(name, pos)| {
+                    serde_json::json!({
+                        "name": name,
+                        "pos_enu": pos
+                    })
+                })
+                .collect();
+
+            let transients_json: Vec<serde_json::Value> = tracking_bank.transients.iter()
+                .map(|tr| {
+                    serde_json::json!({
+                        "timestamp": tr.timestamp,
+                        "frequency_hz": tr.frequency_hz,
+                        "snr_db": tr.snr_db,
+                        "classification": tr.classification
+                    })
+                })
+                .collect();
+
+            let waterfall_row = dashboard.waterfall_history.first().cloned().unwrap_or_default();
+
+            let telemetry = serde_json::json!({
+                "center_freq": target_freq,
+                "sample_rate": input_rate,
+                "dsp_threshold": dashboard.dsp_threshold,
+                "gain": dashboard.gain,
+                "dc_block": dashboard.dc_block,
+                "show_unconfirmed": dashboard.show_unconfirmed,
+                "surveillance_fft": surveillance_fft,
+                "constellation_points": constellation_points,
+                "targets": serialized_targets,
+                "active_towers": active_towers_json,
+                "transients": transients_json,
+                "waterfall_row": waterfall_row,
+                "clipping_rate": dashboard.clipping_rate,
+                "cancellation_db": dashboard.cancellation_ratio_db,
+                "ellipse_mode": format!("{:?}", dashboard.ellipse_mode).to_uppercase(),
+                "antenna_heading": dashboard.heading_deg,
+                "sdr_alive": dashboard.sdr_alive,
+                "jamming_active": dashboard.jamming_active,
+                "sdr_gain": dashboard.gain,
+                "sdr_offset": dashboard.frequency_offset,
+                "sdr_dc_block": dashboard.dc_alpha,
+                "overflow_alarm": dashboard.overflow_alarm,
+                "tactical_records": dashboard.tactical_records,
+            });
+            let telemetry_str = to_ws_json_string(&telemetry);
+            if let Ok(mut clients) = active_clients.lock() {
+                clients.retain(|client_tx| {
+                    client_tx.send(telemetry_str.clone()).is_ok()
+                });
             }
         }
 
         if should_exit_after_render {
             break 'main_loop;
+        }
+
+        if test_mode && args.port.is_some() {
+            std::thread::sleep(Duration::from_millis(15));
         }
 
         // Throttle loop CPU usage if no data was received

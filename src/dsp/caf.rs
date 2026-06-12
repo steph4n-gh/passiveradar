@@ -1,217 +1,269 @@
 use num_complex::Complex;
-use rustfft::{num_complex::Complex as FftComplex, FftPlanner};
+use rustfft::{num_complex::Complex as FftComplex, FftPlanner, Fft};
+use std::sync::Arc;
 use rayon::prelude::*;
-use crate::dsp::fft::{FftBackend, DISABLE_GPU};
-use std::sync::atomic::Ordering;
+use std::sync::LazyLock;
 
-/// Apply a fractional delay using a cubic Lagrange interpolator (Farrow structure).
-/// Total delay = int_delay + frac_delay, where frac_delay is in [0, 1).
+#[allow(dead_code)]
+static HAS_AVX2_FMA: LazyLock<bool> = LazyLock::new(|| {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+});
+
+#[allow(dead_code)]
+static HAS_NEON: LazyLock<bool> = LazyLock::new(|| {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("neon")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+});
+
 #[inline(always)]
-pub fn interpolate_farrow(samples: &[Complex<f32>], index: usize, frac_delay: f32) -> Complex<f32> {
-    if index < 2 || index + 1 >= samples.len() {
-        // Return boundary sample or zero if out of bounds
-        if index < samples.len() {
-            return samples[index];
-        } else {
-            return Complex::new(0.0, 0.0);
-        }
+pub fn correlate_slices(surv: &[Complex<f32>], reference: &[Complex<f32>]) -> Complex<f32> {
+    #[cfg(target_arch = "x86_64")]
+    if *HAS_AVX2_FMA {
+        unsafe { return correlate_slices_avx2(surv, reference); }
     }
 
-    let d = frac_delay;
-    // Lagrange coefficients
-    let a_neg1 = -d * (d - 1.0) * (d - 2.0) / 6.0;
-    let a_0 = (d + 1.0) * (d - 1.0) * (d - 2.0) / 2.0;
-    let a_1 = -(d + 1.0) * d * (d - 2.0) / 2.0;
-    let a_2 = (d + 1.0) * d * (d - 1.0) / 6.0;
+    #[cfg(target_arch = "aarch64")]
+    if *HAS_NEON {
+        unsafe { return correlate_slices_neon(surv, reference); }
+    }
 
-    // Apply coefficients to samples[index + 1], samples[index], samples[index - 1], samples[index - 2]
-    samples[index + 1] * a_neg1
-        + samples[index] * a_0
-        + samples[index - 1] * a_1
-        + samples[index - 2] * a_2
+    correlate_slices_scalar(surv, reference)
 }
 
-/// Generate a delayed version of a sample block using the Farrow interpolator.
-pub fn delay_signal_farrow(
-    samples: &[Complex<f32>],
-    int_delay: usize,
-    frac_delay: f32,
-    output_len: usize,
-) -> Vec<Complex<f32>> {
-    let mut output = vec![Complex::new(0.0, 0.0); output_len];
-    for n in 0..output_len {
-        let ref_idx = n + int_delay;
-        if ref_idx < samples.len() {
-            output[n] = interpolate_farrow(samples, ref_idx, frac_delay);
-        }
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn correlate_slices_avx2(surv: &[Complex<f32>], reference: &[Complex<f32>]) -> Complex<f32> {
+    use std::arch::x86_64::*;
+    let len = surv.len();
+    let surv_ptr = surv.as_ptr() as *const f32;
+    let ref_ptr = reference.as_ptr() as *const f32;
+    let float_len = len * 2;
+    
+    let sign_mask = _mm256_set_ps(-0.0, 0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 0.0);
+    
+    let mut acc_re = _mm256_setzero_ps();
+    let mut acc_im = _mm256_setzero_ps();
+    
+    let mut i = 0;
+    while i + 8 <= float_len {
+        let w = _mm256_loadu_ps(surv_ptr.add(i));
+        let t = _mm256_loadu_ps(ref_ptr.add(i));
+        
+        acc_re = _mm256_fmadd_ps(w, t, acc_re);
+        
+        let w_shuf = _mm256_shuffle_ps(w, w, 0xB1);
+        let w_shuf_sign = _mm256_xor_ps(w_shuf, sign_mask);
+        acc_im = _mm256_fmadd_ps(w_shuf_sign, t, acc_im);
+        
+        i += 8;
     }
-    output
+    
+    let mut re_arr = [0.0; 8];
+    _mm256_storeu_ps(re_arr.as_mut_ptr(), acc_re);
+    let mut re = re_arr[0] + re_arr[1] + re_arr[2] + re_arr[3] + re_arr[4] + re_arr[5] + re_arr[6] + re_arr[7];
+    
+    let mut im_arr = [0.0; 8];
+    _mm256_storeu_ps(im_arr.as_mut_ptr(), acc_im);
+    let mut im = im_arr[0] + im_arr[1] + im_arr[2] + im_arr[3] + im_arr[4] + im_arr[5] + im_arr[6] + im_arr[7];
+    
+    let mut n = i / 2;
+    while n < len {
+        let s = surv[n];
+        let r = reference[n];
+        re += s.re * r.re + s.im * r.im;
+        im += s.im * r.re - s.re * r.im;
+        n += 1;
+    }
+    
+    Complex::new(re, im)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn correlate_slices_neon(surv: &[Complex<f32>], reference: &[Complex<f32>]) -> Complex<f32> {
+    use std::arch::aarch64::*;
+    let len = surv.len();
+    let surv_ptr = surv.as_ptr() as *const f32;
+    let ref_ptr = reference.as_ptr() as *const f32;
+    let float_len = len * 2;
+    
+    let mask_u32 = [0u32, 0x80000000u32, 0u32, 0x80000000u32];
+    let sign_mask = vld1q_u32(mask_u32.as_ptr());
+    
+    let mut acc_re = vdupq_n_f32(0.0);
+    let mut acc_im = vdupq_n_f32(0.0);
+    
+    let mut i = 0;
+    while i + 4 <= float_len {
+        let w = vld1q_f32(surv_ptr.add(i));
+        let t = vld1q_f32(ref_ptr.add(i));
+        
+        acc_re = vfmaq_f32(acc_re, w, t);
+        
+        let w_shuf = vrev64q_f32(w);
+        let w_shuf_sign = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(w_shuf), sign_mask));
+        acc_im = vfmaq_f32(acc_im, w_shuf_sign, t);
+        
+        i += 4;
+    }
+    
+    let mut re_arr = [0.0; 4];
+    vst1q_f32(re_arr.as_mut_ptr(), acc_re);
+    let mut re = re_arr[0] + re_arr[1] + re_arr[2] + re_arr[3];
+    
+    let mut im_arr = [0.0; 4];
+    vst1q_f32(im_arr.as_mut_ptr(), acc_im);
+    let mut im = im_arr[0] + im_arr[1] + im_arr[2] + im_arr[3];
+    
+    let mut n = i / 2;
+    while n < len {
+        let s = surv[n];
+        let r = reference[n];
+        re += s.re * r.re + s.im * r.im;
+        im += s.im * r.re - s.re * r.im;
+        n += 1;
+    }
+    
+    Complex::new(re, im)
+}
+
+#[inline(always)]
+pub fn correlate_slices_scalar(surv: &[Complex<f32>], reference: &[Complex<f32>]) -> Complex<f32> {
+    let mut re = 0.0f32;
+    let mut im = 0.0f32;
+    for n in 0..surv.len() {
+        let s = surv[n];
+        let r = reference[n];
+        re += s.re * r.re + s.im * r.im;
+        im += s.im * r.re - s.re * r.im;
+    }
+    Complex::new(re, im)
 }
 
 pub struct CafEngine {
-    fft_size: usize,
-    backend: FftBackend,
-    scratch: Vec<FftComplex<f32>>,
+    fft_512: Arc<dyn Fft<f32>>,
+    fft_1024: Arc<dyn Fft<f32>>,
 }
 
 impl CafEngine {
-    pub fn new(fft_size: usize) -> Self {
+    pub fn new() -> Self {
         let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(fft_size);
-        let scratch = vec![FftComplex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
-
-        #[allow(unused_mut)]
-        let mut backend = FftBackend::Cpu(fft);
-
-        #[cfg(feature = "gpu-fft")]
-        {
-            if !DISABLE_GPU.load(Ordering::SeqCst) && wgsl_fft::GpuFft::is_gpu_available() {
-                match wgsl_fft::GpuFft::new() {
-                    Ok(gpu) => {
-                        backend = FftBackend::Gpu(gpu);
-                    },
-                    Err(_) => {}
-                }
-            }
-        }
-
         Self {
-            fft_size,
-            backend,
-            scratch,
+            fft_512: planner.plan_fft_forward(512),
+            fft_1024: planner.plan_fft_forward(1024),
         }
     }
 
-    /// Computes the 2D Cross-Ambiguity Function (CAF) waterfall.
-    /// Returns a 2D matrix of shape [max_delay, fft_size] containing the magnitude-squared correlation.
-    pub fn compute(
-        &mut self,
-        reference: &[Complex<f32>],
-        surveillance: &[Complex<f32>],
+    /// Acquisition Mode (Dense): 
+    /// Fast-Time/Slow-Time (Welch) method. Chunk the data into 512-sample blocks, 
+    /// cross-correlate for delay, and FFT across 512 chunks for Doppler.
+    pub fn compute_acquisition_dense(
+        &self,
+        clean_surv: &[Complex<f32>],
+        surrogate_ref: &[Complex<f32>],
         max_delay: usize,
     ) -> Vec<Vec<f32>> {
-        let mut caf_result = vec![vec![0.0f32; self.fft_size]; max_delay];
-        let n_samples = reference.len().min(surveillance.len());
+        let chunk_size = 512;
+        let num_chunks = 512;
+        
+        let available_chunks = ((clean_surv.len().saturating_sub(max_delay)) / chunk_size)
+            .min(surrogate_ref.len().saturating_sub(max_delay) / chunk_size)
+            .min(num_chunks);
 
-        if n_samples < self.fft_size {
-            return caf_result; // Not enough samples
+        if available_chunks == 0 {
+            return vec![vec![0.0; num_chunks]; max_delay];
         }
 
-        let fft_size = self.fft_size;
+        // 1. Pre-allocate r_matrix sequentially on the main thread to avoid global allocator contention in parallel threads
+        let mut r_matrix = vec![vec![FftComplex::new(0.0, 0.0); num_chunks]; max_delay];
 
-        // Generate the time-domain cross correlation sequences
-        let mut inputs = vec![vec![FftComplex::new(0.0, 0.0); fft_size]; max_delay];
-        inputs.par_iter_mut().enumerate().for_each(|(delay, row)| {
-            for n in 0..fft_size {
-                let ref_idx = if n >= delay { n - delay } else { 0 };
-                let ref_sample = reference[ref_idx];
-                let surv_sample = surveillance[n];
-                let prod = Complex::new(
-                    surv_sample.re * ref_sample.re + surv_sample.im * ref_sample.im,
-                    surv_sample.im * ref_sample.re - surv_sample.re * ref_sample.im,
-                );
-                row[n] = FftComplex::new(prod.re, prod.im);
+        // Cross-correlate in parallel across delays (Fast-Time)
+        r_matrix.par_iter_mut().enumerate().for_each(|(d, row)| {
+            for m in 0..available_chunks {
+                let offset = m * chunk_size + max_delay;
+                let surv_chunk = &clean_surv[offset .. offset + chunk_size];
+                let ref_chunk = &surrogate_ref[offset - d .. offset - d + chunk_size];
+                let sum = correlate_slices(surv_chunk, ref_chunk);
+                row[m] = FftComplex::new(sum.re, sum.im);
             }
         });
 
-        let fft_results = match &self.backend {
-            FftBackend::Cpu(fft) => {
-                let mut outputs = inputs;
-                // Rayon par_iter_mut for CPU fallback
-                let scratch_len = fft.get_inplace_scratch_len();
-                outputs.par_iter_mut().for_each_init(
-                    || vec![FftComplex::new(0.0, 0.0); scratch_len],
-                    |scratch, row| {
-                        fft.process_with_scratch(row, scratch);
-                    }
-                );
-                outputs
-            }
-            #[cfg(feature = "gpu-fft")]
-            FftBackend::Gpu(gpu) => {
-                match gpu.fft(&inputs) {
-                    Ok(res) => res,
-                    Err(e) => {
-                        eprintln!("GPU CAF FFT failed at runtime: {}. Falling back to CPU.", e);
-                        let mut planner = FftPlanner::new();
-                        let cpu_fft = planner.plan_fft_forward(fft_size);
-                        let mut outputs = inputs;
-                        let scratch_len = cpu_fft.get_inplace_scratch_len();
-                        outputs.par_iter_mut().for_each_init(
-                            || vec![FftComplex::new(0.0, 0.0); scratch_len],
-                            |scratch, row| {
-                                cpu_fft.process_with_scratch(row, scratch);
-                            }
-                        );
-                        outputs
-                    }
+        // 2. Pre-allocate results and scratch buffers sequentially on the main thread
+        let scratch_len = self.fft_512.get_inplace_scratch_len();
+        let mut scratches = vec![vec![FftComplex::new(0.0, 0.0); scratch_len]; max_delay];
+        let mut result = vec![vec![0.0f32; num_chunks]; max_delay];
+
+        // FFT across chunks in parallel (Slow-Time)
+        r_matrix
+            .par_iter_mut()
+            .zip(scratches.par_iter_mut())
+            .zip(result.par_iter_mut())
+            .for_each(|((row, scratch), out_row)| {
+                self.fft_512.process_with_scratch(row, scratch);
+                
+                // Shift FFT and compute magnitude squared
+                for k in 0..num_chunks {
+                    let shifted_k = (k + num_chunks / 2) % num_chunks;
+                    out_row[shifted_k] = row[k].norm_sqr();
                 }
-            }
-        };
+            });
 
-        // Compute magnitude squared
-        caf_result.par_iter_mut().zip(fft_results.par_iter()).for_each(|(row, out_row)| {
-            for f in 0..fft_size {
-                let shift_idx = (f + fft_size / 2) % fft_size;
-                row[shift_idx] = out_row[f].norm_sqr();
-            }
-        });
-
-        caf_result
+        result
     }
 
-    /// Computes a single slice of the CAF at a fractional delay.
-    pub fn compute_fractional_slice(
-        &mut self,
-        reference: &[Complex<f32>],
-        surveillance: &[Complex<f32>],
-        int_delay: usize,
-        frac_delay: f32,
+    /// Tracking Mode (Sparse & De-spread): 
+    /// Take the predicted delay. Multiply Clean_Surv by the conjugate of Surrogate_Ref delayed.
+    /// Pass this element-wise product through a decimator to drop it from 256 kHz down to 8 kHz (32x).
+    /// Run a 1024-point FFT to resolve precise Doppler.
+    pub fn compute_tracking_sparse(
+        &self,
+        clean_surv: &[Complex<f32>],
+        surrogate_ref: &[Complex<f32>],
+        delay: usize,
     ) -> Vec<f32> {
-        let mut corr_product = vec![FftComplex::new(0.0, 0.0); self.fft_size];
-        let n_samples = reference.len().min(surveillance.len());
+        let decimation_factor = 32;
+        let fft_size = 1024;
+        let required_samples = delay + (fft_size - 1) * decimation_factor + 65;
 
-        if n_samples < self.fft_size {
-            return vec![0.0; self.fft_size];
+        if clean_surv.len() < required_samples || surrogate_ref.len() < required_samples {
+            return vec![0.0; fft_size];
         }
 
-        // Generate the fractionally delayed reference signal
-        let delayed_ref = delay_signal_farrow(reference, int_delay, frac_delay, self.fft_size);
+        let taps = [
+            0.00000000f32, 0.00009801f32, 0.00021781f32, 0.00037666f32, 0.00059265f32, 0.00088412f32, 0.00126903f32, 0.00176431f32, 0.00238522f32, 0.00314473f32, 0.00405295f32, 0.00511665f32, 0.00633879f32, 0.00771826f32, 0.00924963f32, 0.01092304f32, 0.01272432f32, 0.01463506f32, 0.01663294f32, 0.01869218f32, 0.02078398f32, 0.02287723f32, 0.02493914f32, 0.02693603f32, 0.02883414f32, 0.03060047f32, 0.03220354f32, 0.03361424f32, 0.03480654f32, 0.03575815f32, 0.03645112f32, 0.03687226f32, 0.03701355f32, 0.03687226f32, 0.03645112f32, 0.03575815f32, 0.03480654f32, 0.03361424f32, 0.03220354f32, 0.03060047f32, 0.02883414f32, 0.02693603f32, 0.02493914f32, 0.02287723f32, 0.02078398f32, 0.01869218f32, 0.01663294f32, 0.01463506f32, 0.01272432f32, 0.01092304f32, 0.00924963f32, 0.00771826f32, 0.00633879f32, 0.00511665f32, 0.00405295f32, 0.00314473f32, 0.00238522f32, 0.00176431f32, 0.00126903f32, 0.00088412f32, 0.00059265f32, 0.00037666f32, 0.00021781f32, 0.00009801f32, 0.00000000f32
+        ];
 
-        for n in 0..self.fft_size {
-            let ref_sample = delayed_ref[n];
-            let surv_sample = surveillance[n];
-            let prod = Complex::new(
-                surv_sample.re * ref_sample.re + surv_sample.im * ref_sample.im,
-                surv_sample.im * ref_sample.re - surv_sample.re * ref_sample.im,
-            );
-            corr_product[n] = FftComplex::new(prod.re, prod.im);
-        }
-
-        let mut fft_output = corr_product.clone();
-        match &self.backend {
-            FftBackend::Cpu(fft) => {
-                fft.process_with_scratch(&mut fft_output, &mut self.scratch);
+        let mut decimated = vec![FftComplex::new(0.0, 0.0); fft_size];
+        
+        for i in 0..fft_size {
+            let mut sum = Complex::new(0.0, 0.0);
+            for j in 0..65 {
+                let idx = delay + i * decimation_factor + j;
+                sum += clean_surv[idx] * surrogate_ref[idx - delay].conj() * taps[j];
             }
-            #[cfg(feature = "gpu-fft")]
-            FftBackend::Gpu(gpu) => {
-                match gpu.fft(&[corr_product]) {
-                    Ok(res) => {
-                        fft_output.copy_from_slice(&res[0]);
-                    }
-                    Err(_) => {
-                        let mut planner = FftPlanner::new();
-                        let cpu_fft = planner.plan_fft_forward(self.fft_size);
-                        cpu_fft.process_with_scratch(&mut fft_output, &mut self.scratch);
-                    }
-                }
-            }
+            decimated[i] = FftComplex::new(sum.re, sum.im);
         }
 
-        let mut result = vec![0.0; self.fft_size];
-        for f in 0..self.fft_size {
-            let shift_idx = (f + self.fft_size / 2) % self.fft_size;
-            result[shift_idx] = fft_output[f].norm();
+        let mut scratch = vec![FftComplex::new(0.0, 0.0); self.fft_1024.get_inplace_scratch_len()];
+        self.fft_1024.process_with_scratch(&mut decimated, &mut scratch);
+
+        let mut result = vec![0.0; fft_size];
+        for k in 0..fft_size {
+            let shifted_k = (k + fft_size / 2) % fft_size;
+            result[shifted_k] = decimated[k].norm_sqr();
         }
 
         result
@@ -223,83 +275,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_farrow_interpolation() {
-        // Create a sine wave signal: sin(2*pi*f*t)
-        let rate = 8000.0;
-        let freq = 100.0;
-        let mut samples = Vec::new();
-        for n in 0..100 {
-            let t = n as f32 / rate;
-            let val = (2.0 * std::f32::consts::PI * freq * t).sin();
-            samples.push(Complex::new(val, 0.0));
-        }
+    fn test_correlate_slices_equivalence() {
+        let surv = vec![
+            Complex::new(1.0, 2.0),
+            Complex::new(-3.0, 4.0),
+            Complex::new(0.5, -1.5),
+            Complex::new(-2.2, -3.3),
+            Complex::new(4.4, 5.5),
+            Complex::new(-1.1, 0.1),
+            Complex::new(0.0, 0.0),
+            Complex::new(3.0, -2.0),
+            Complex::new(1.2, 3.4),
+        ];
+        let reference = vec![
+            Complex::new(0.5, -0.5),
+            Complex::new(2.0, 1.0),
+            Complex::new(-1.0, 0.0),
+            Complex::new(3.0, 2.0),
+            Complex::new(-2.0, -1.0),
+            Complex::new(0.1, -0.2),
+            Complex::new(1.5, 2.5),
+            Complex::new(-3.0, 4.0),
+            Complex::new(2.1, -1.2),
+        ];
 
-        // Test at index 10 with fractional delay 0.5 (should equal sample at index 9.5)
-        let frac = 0.5;
-        let val_interp = interpolate_farrow(&samples, 10, frac);
+        let scalar_res = correlate_slices_scalar(&surv, &reference);
+        let simd_res = correlate_slices(&surv, &reference);
 
-        let t_ideal = 9.5 / rate;
-        let val_ideal = (2.0 * std::f32::consts::PI * freq * t_ideal).sin();
-
-        // Error should be extremely small for cubic Lagrange interpolation on a low freq sine wave
-        assert!((val_interp.re - val_ideal).abs() < 1e-4);
-    }
-
-    #[test]
-    fn test_caf_correlation() {
-        let fft_size = 128;
-        let mut engine = CafEngine::new(fft_size);
-
-        // Generate a reference signal (random noise)
-        let mut rng = rand::thread_rng();
-        let mut reference = vec![Complex::new(0.0, 0.0); 256];
-        for i in 0..256 {
-            use rand::Rng;
-            reference[i] = Complex::new(rng.gen::<f32>() - 0.5, rng.gen::<f32>() - 0.5);
-        }
-
-        // Generate surveillance signal as delayed and Doppler shifted version of reference
-        // Delay = 3 samples, Doppler = 10 bins shift (representing frequency shift)
-        let delay = 3;
-        let doppler_bin_shift = 10;
-        let mut surveillance = vec![Complex::new(0.0, 0.0); 256];
-        for n in 0..256 {
-            if n >= delay {
-                let phase = 2.0 * std::f32::consts::PI * (doppler_bin_shift as f32) * (n as f32)
-                    / (fft_size as f32);
-                let shift = Complex::from_polar(1.0, phase);
-                surveillance[n] = reference[n - delay] * shift;
-            }
-        }
-
-        let max_delay = 8;
-        let caf = engine.compute(&reference, &surveillance, max_delay);
-
-        // Find the peak in the 2D CAF matrix
-        let mut peak_val = 0.0;
-        let mut peak_delay = 0;
-        let mut peak_bin = 0;
-
-        for d in 0..max_delay {
-            for b in 0..fft_size {
-                if caf[d][b] > peak_val {
-                    peak_val = caf[d][b];
-                    peak_delay = d;
-                    peak_bin = b;
-                }
-            }
-        }
-
-        // Verify that the CAF correctly localized the delay and Doppler bin shift!
-        assert_eq!(peak_delay, delay, "Localized delay was incorrect");
-
-        // The peak bin should be centered + shift:
-        // center = fft_size / 2 = 64
-        // shift = 10 -> peak_bin should be 74
-        let expected_bin = fft_size / 2 + doppler_bin_shift;
-        assert_eq!(
-            peak_bin, expected_bin,
-            "Localized Doppler bin shift was incorrect"
-        );
+        assert!((scalar_res.re - simd_res.re).abs() < 1e-5, "Real parts differ: scalar={}, simd={}", scalar_res.re, simd_res.re);
+        assert!((scalar_res.im - simd_res.im).abs() < 1e-5, "Imag parts differ: scalar={}, simd={}", scalar_res.im, simd_res.im);
     }
 }

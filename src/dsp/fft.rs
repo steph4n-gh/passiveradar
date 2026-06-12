@@ -15,6 +15,7 @@ pub enum FftBackend {
 pub struct FftEngine {
     fft_size: usize,
     fft: Arc<dyn rustfft::Fft<f32>>,
+    backend: FftBackend,
     window: Vec<f32>,
     buffer: VecDeque<Complex<f32>>,
     scratch: Vec<FftComplex<f32>>,
@@ -38,9 +39,28 @@ impl FftEngine {
 
         let scratch = vec![FftComplex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
 
+        let backend = {
+            #[cfg(feature = "gpu-fft")]
+            {
+                if !DISABLE_GPU.load(std::sync::atomic::Ordering::SeqCst) {
+                    match wgsl_fft::GpuFft::new() {
+                        Ok(gpu) => FftBackend::Gpu(gpu),
+                        Err(_) => FftBackend::Cpu(fft.clone()),
+                    }
+                } else {
+                    FftBackend::Cpu(fft.clone())
+                }
+            }
+            #[cfg(not(feature = "gpu-fft"))]
+            {
+                FftBackend::Cpu(fft.clone())
+            }
+        };
+
         Self {
             fft_size,
             fft,
+            backend,
             window,
             buffer: VecDeque::with_capacity(fft_size * 2),
             scratch,
@@ -76,7 +96,31 @@ impl FftEngine {
         }
 
         // 2. Process forward FFT
-        self.fft.process_with_scratch(&mut self.fft_input, &mut self.scratch);
+        let mut processed_on_gpu = false;
+
+        if !DISABLE_GPU.load(std::sync::atomic::Ordering::SeqCst) {
+            #[cfg(feature = "gpu-fft")]
+            {
+                if let FftBackend::Gpu(ref gpu) = self.backend {
+                    let input_vec: Vec<Complex<f32>> = self.fft_input.iter().map(|c| Complex::new(c.re, c.im)).collect();
+                    if let Ok(mut results) = gpu.fft(&[input_vec]) {
+                        if !results.is_empty() {
+                            let output_vec = results.remove(0);
+                            for (i, c) in output_vec.into_iter().enumerate() {
+                                if i < self.fft_input.len() {
+                                    self.fft_input[i] = FftComplex::new(c.re, c.im);
+                                }
+                            }
+                            processed_on_gpu = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !processed_on_gpu {
+            self.fft.process_with_scratch(&mut self.fft_input, &mut self.scratch);
+        }
 
         // 3. Compute magnitude and perform fftshift to center DC (0 Hz) at index fft_size / 2
         for i in 0..self.fft_size {

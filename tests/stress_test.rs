@@ -9,7 +9,7 @@ use std::time::Instant;
 fn test_stress_render() {
     let backend = TestBackend::new(300, 300);
     let mut terminal = Terminal::new(backend).unwrap();
-    let mut dashboard = Dashboard::new(100e6, 2.4e6, 0.0, "SDR".into());
+    let mut dashboard = Dashboard::new(100e6, 2.4e6, 0.0, "SDR".into(), 0.0);
 
     let mut targets = Vec::new();
     for i in 0..100 {
