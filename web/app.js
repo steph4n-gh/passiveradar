@@ -448,7 +448,6 @@ function handleTelemetry(data) {
     }
 
     // Render components
-    const selTarget = targets.find(t => t.id === selectedTargetId);
     if (selTarget) {
         if (cicModeSelect && document.activeElement !== cicModeSelect) {
             cicModeSelect.value = selTarget.cic_mode || "Seismic";
