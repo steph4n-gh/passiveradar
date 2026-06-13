@@ -156,14 +156,27 @@ pub fn correlate_slices_scalar(surv: &[Complex<f32>], reference: &[Complex<f32>]
 pub struct CafEngine {
     fft_512: Arc<dyn Fft<f32>>,
     fft_1024: Arc<dyn Fft<f32>>,
+    r_matrix: Vec<Vec<FftComplex<f32>>>,
+    scratches: Vec<Vec<FftComplex<f32>>>,
+    result: Vec<Vec<f32>>,
 }
 
 impl CafEngine {
     pub fn new() -> Self {
         let mut planner = FftPlanner::new();
+        let fft_512 = planner.plan_fft_forward(512);
+        let fft_1024 = planner.plan_fft_forward(1024);
+        
+        let initial_max_delay = 128;
+        let num_chunks = 512;
+        let scratch_len = fft_512.get_inplace_scratch_len();
+        
         Self {
-            fft_512: planner.plan_fft_forward(512),
-            fft_1024: planner.plan_fft_forward(1024),
+            fft_512,
+            fft_1024,
+            r_matrix: vec![vec![FftComplex::new(0.0, 0.0); num_chunks]; initial_max_delay],
+            scratches: vec![vec![FftComplex::new(0.0, 0.0); scratch_len]; initial_max_delay],
+            result: vec![vec![0.0f32; num_chunks]; initial_max_delay],
         }
     }
 
@@ -171,7 +184,7 @@ impl CafEngine {
     /// Fast-Time/Slow-Time (Welch) method. Chunk the data into 512-sample blocks, 
     /// cross-correlate for delay, and FFT across 512 chunks for Doppler.
     pub fn compute_acquisition_dense(
-        &self,
+        &mut self,
         clean_surv: &[Complex<f32>],
         surrogate_ref: &[Complex<f32>],
         max_delay: usize,
@@ -187,11 +200,21 @@ impl CafEngine {
             return vec![vec![0.0; num_chunks]; max_delay];
         }
 
-        // 1. Pre-allocate r_matrix sequentially on the main thread to avoid global allocator contention in parallel threads
-        let mut r_matrix = vec![vec![FftComplex::new(0.0, 0.0); num_chunks]; max_delay];
+        let scratch_len = self.fft_512.get_inplace_scratch_len();
 
-        // Cross-correlate in parallel across delays (Fast-Time)
-        r_matrix.par_iter_mut().enumerate().for_each(|(d, row)| {
+        // Dynamically grow persistent buffers if max_delay exceeds current allocation
+        if self.r_matrix.len() < max_delay {
+            self.r_matrix.resize(max_delay, vec![FftComplex::new(0.0, 0.0); num_chunks]);
+        }
+        if self.scratches.len() < max_delay {
+            self.scratches.resize(max_delay, vec![FftComplex::new(0.0, 0.0); scratch_len]);
+        }
+        if self.result.len() < max_delay {
+            self.result.resize(max_delay, vec![0.0f32; num_chunks]);
+        }
+
+        let r_slice = &mut self.r_matrix[0..max_delay];
+        r_slice.par_iter_mut().enumerate().for_each(|(d, row)| {
             for m in 0..available_chunks {
                 let offset = m * chunk_size + max_delay;
                 let surv_chunk = &clean_surv[offset .. offset + chunk_size];
@@ -199,18 +222,19 @@ impl CafEngine {
                 let sum = correlate_slices(surv_chunk, ref_chunk);
                 row[m] = FftComplex::new(sum.re, sum.im);
             }
+            // Zero out remaining chunks
+            for m in available_chunks..num_chunks {
+                row[m] = FftComplex::new(0.0, 0.0);
+            }
         });
 
-        // 2. Pre-allocate results and scratch buffers sequentially on the main thread
-        let scratch_len = self.fft_512.get_inplace_scratch_len();
-        let mut scratches = vec![vec![FftComplex::new(0.0, 0.0); scratch_len]; max_delay];
-        let mut result = vec![vec![0.0f32; num_chunks]; max_delay];
+        let scratches_slice = &mut self.scratches[0..max_delay];
+        let result_slice = &mut self.result[0..max_delay];
 
-        // FFT across chunks in parallel (Slow-Time)
-        r_matrix
+        r_slice
             .par_iter_mut()
-            .zip(scratches.par_iter_mut())
-            .zip(result.par_iter_mut())
+            .zip(scratches_slice.par_iter_mut())
+            .zip(result_slice.par_iter_mut())
             .for_each(|((row, scratch), out_row)| {
                 self.fft_512.process_with_scratch(row, scratch);
                 
@@ -221,7 +245,12 @@ impl CafEngine {
                 }
             });
 
-        result
+        // Copy out the active slice to preserve external expectations
+        let mut out = vec![vec![0.0f32; num_chunks]; max_delay];
+        for d in 0..max_delay {
+            out[d].copy_from_slice(&result_slice[d][0..num_chunks]);
+        }
+        out
     }
 
     /// Tracking Mode (Sparse & De-spread): 
@@ -270,9 +299,284 @@ impl CafEngine {
     }
 }
 
+/// Channel Impulse Response (CIR): Zero-Doppler cross-correlation between
+/// surveillance and reference channels over a range of delay bins.
+pub fn compute_cir(
+    surv: &[Complex<f32>],
+    reference: &[Complex<f32>],
+    max_delay: usize,
+) -> Vec<f32> {
+    let block_size = 512;
+    if surv.len() < block_size + max_delay || reference.len() < block_size + max_delay {
+        return vec![0.0; max_delay];
+    }
+
+    let mut profile = vec![0.0f32; max_delay];
+    for d in 0..max_delay {
+        let surv_sub = &surv[max_delay..max_delay + block_size];
+        let ref_sub = &reference[max_delay - d..max_delay - d + block_size];
+        let sum = correlate_slices(surv_sub, ref_sub);
+        profile[d] = sum.norm();
+    }
+    profile
+}
+
+pub struct FarrowInterpolator {
+    pub history: [Complex<f32>; 4],
+}
+
+impl FarrowInterpolator {
+    pub fn new() -> Self {
+        Self {
+            history: [Complex::new(0.0, 0.0); 4],
+        }
+    }
+
+    pub fn push(&mut self, sample: Complex<f32>) {
+        self.history[0] = self.history[1];
+        self.history[1] = self.history[2];
+        self.history[2] = self.history[3];
+        self.history[3] = sample;
+    }
+
+    pub fn interpolate(&self, mu: f32) -> Complex<f32> {
+        let y_neg1 = self.history[0];
+        let y_0 = self.history[1];
+        let y_1 = self.history[2];
+        let y_2 = self.history[3];
+
+        let v3_re = -1.0 / 6.0 * y_neg1.re + 0.5 * y_0.re - 0.5 * y_1.re + 1.0 / 6.0 * y_2.re;
+        let v2_re = 0.5 * y_neg1.re - y_0.re + 0.5 * y_1.re;
+        let v1_re = -1.0 / 3.0 * y_neg1.re - 0.5 * y_0.re + y_1.re - 1.0 / 6.0 * y_2.re;
+        let v0_re = y_0.re;
+
+        let v3_im = -1.0 / 6.0 * y_neg1.im + 0.5 * y_0.im - 0.5 * y_1.im + 1.0 / 6.0 * y_2.im;
+        let v2_im = 0.5 * y_neg1.im - y_0.im + 0.5 * y_1.im;
+        let v1_im = -1.0 / 3.0 * y_neg1.im - 0.5 * y_0.im + y_1.im - 1.0 / 6.0 * y_2.im;
+        let v0_im = y_0.im;
+
+        let re = ((v3_re * mu + v2_re) * mu + v1_re) * mu + v0_re;
+        let im = ((v3_im * mu + v2_im) * mu + v1_im) * mu + v0_im;
+
+        Complex::new(re, im)
+    }
+
+    pub fn reset(&mut self) {
+        self.history = [Complex::new(0.0, 0.0); 4];
+    }
+}
+
+pub fn correlate_fractional_delay(
+    surv: &[Complex<f32>],
+    reference: &[Complex<f32>],
+    reference_start: f32,
+) -> f32 {
+    let block_size = surv.len();
+    let mut sum = Complex::new(0.0, 0.0);
+    let mut ref_energy = 0.0f32;
+    
+    for i in 0..block_size {
+        let target_idx = reference_start + i as f32;
+        let base = target_idx.floor() as i32;
+        let mu = target_idx - base as f32;
+        
+        let idx_neg1 = (base - 1).clamp(0, reference.len() as i32 - 1) as usize;
+        let idx_0 = base.clamp(0, reference.len() as i32 - 1) as usize;
+        let idx_1 = (base + 1).clamp(0, reference.len() as i32 - 1) as usize;
+        let idx_2 = (base + 2).clamp(0, reference.len() as i32 - 1) as usize;
+        
+        let y_neg1 = reference[idx_neg1];
+        let y_0 = reference[idx_0];
+        let y_1 = reference[idx_1];
+        let y_2 = reference[idx_2];
+        
+        let v3_re = -1.0 / 6.0 * y_neg1.re + 0.5 * y_0.re - 0.5 * y_1.re + 1.0 / 6.0 * y_2.re;
+        let v2_re = 0.5 * y_neg1.re - y_0.re + 0.5 * y_1.re;
+        let v1_re = -1.0 / 3.0 * y_neg1.re - 0.5 * y_0.re + y_1.re - 1.0 / 6.0 * y_2.re;
+        let v0_re = y_0.re;
+
+        let v3_im = -1.0 / 6.0 * y_neg1.im + 0.5 * y_0.im - 0.5 * y_1.im + 1.0 / 6.0 * y_2.im;
+        let v2_im = 0.5 * y_neg1.im - y_0.im + 0.5 * y_1.im;
+        let v1_im = -1.0 / 3.0 * y_neg1.im - 0.5 * y_0.im + y_1.im - 1.0 / 6.0 * y_2.im;
+        let v0_im = y_0.im;
+
+        let re = ((v3_re * mu + v2_re) * mu + v1_re) * mu + v0_re;
+        let im = ((v3_im * mu + v2_im) * mu + v1_im) * mu + v0_im;
+        let interp_ref = Complex::new(re, im);
+        
+        sum += surv[i] * interp_ref.conj();
+        ref_energy += interp_ref.norm_sqr();
+    }
+    
+    if ref_energy > 1e-6 {
+        sum.norm() / ref_energy.sqrt()
+    } else {
+        sum.norm()
+    }
+}
+
+/// Refines an integer delay peak to sub-sample precision using Farrow interpolation.
+/// Fits a parabola to the correlation magnitude at three fractional delays: d - 0.5, d, d + 0.5.
+/// Returns the refined delay as a float.
+pub fn refine_delay_farrow(
+    surv: &[Complex<f32>],
+    reference: &[Complex<f32>],
+    integer_delay: usize,
+) -> f32 {
+    let block_size = 512;
+    let max_cir_delay = 64;
+    if surv.len() < block_size + max_cir_delay || reference.len() < block_size + max_cir_delay {
+        return integer_delay as f32;
+    }
+    
+    let surv_sub = &surv[max_cir_delay..max_cir_delay + block_size];
+    let d_float = integer_delay as f32;
+    
+    let ref_start_neg = max_cir_delay as f32 - (d_float - 0.5);
+    let ref_start_zero = max_cir_delay as f32 - d_float;
+    let ref_start_pos = max_cir_delay as f32 - (d_float + 0.5);
+    
+    let m_neg = correlate_fractional_delay(surv_sub, reference, ref_start_neg);
+    let m_zero = correlate_fractional_delay(surv_sub, reference, ref_start_zero);
+    let m_pos = correlate_fractional_delay(surv_sub, reference, ref_start_pos);
+    
+    let a = 2.0 * (m_pos + m_neg - 2.0 * m_zero);
+    let b = m_pos - m_neg;
+    
+    if a >= 0.0 || a.abs() < 1e-6 {
+        return integer_delay as f32;
+    }
+    
+    let x_peak = -b / (2.0 * a);
+    let x_peak_clamped = x_peak.clamp(-0.5, 0.5);
+    
+    integer_delay as f32 + x_peak_clamped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compute_cir() {
+        let mut reference = vec![Complex::new(0.0, 0.0); 1000];
+        let mut surv = vec![Complex::new(0.0, 0.0); 1000];
+        
+        // Generate pseudo-noise reference signal using a recursive LCG
+        let mut seed: u64 = 12345;
+        for i in 0..1000 {
+            seed = (seed.wrapping_mul(1103515245).wrapping_add(12345)) & 0x7fffffff;
+            let phase = (seed as f32 / 2147483647.0) * 2.0 * std::f32::consts::PI;
+            reference[i] = Complex::new(phase.cos(), phase.sin());
+        }
+        
+        println!("First 5 reference values: {:?}", &reference[0..5]);
+        
+        // Inject direct path and delayed echo
+        // Echo delayed by 5 bins, with 0.5 amplitude
+        for i in 0..1000 {
+            surv[i] = reference[i]; // Direct path
+            if i >= 5 {
+                surv[i] += reference[i - 5] * 0.5; // Delayed path
+            }
+        }
+        
+        let profile = compute_cir(&surv, &reference, 20);
+        println!("CIR Profile: {:?}", profile);
+        
+        // Compare with scalar correlation directly for d = 0 and d = 1
+        let surv_sub = &surv[20..20 + 512];
+        let ref_sub_0 = &reference[20..20 + 512];
+        let ref_sub_1 = &reference[19..19 + 512];
+        let sum_0 = correlate_slices_scalar(surv_sub, ref_sub_0);
+        let sum_1 = correlate_slices_scalar(surv_sub, ref_sub_1);
+        println!("Scalar sum d=0: {}, d=1: {}", sum_0.norm(), sum_1.norm());
+        
+        assert_eq!(profile.len(), 20);
+        
+        // The peak at delay 0 should be the largest (direct path correlation)
+        assert!(profile[0] > profile[1], "profile[0] ({}) should be > profile[1] ({})", profile[0], profile[1]);
+        
+        // There should be a secondary local peak at delay 5 (echo correlation)
+        assert!(profile[5] > profile[4], "profile[5] ({}) should be > profile[4] ({})", profile[5], profile[4]);
+        assert!(profile[5] > profile[6], "profile[5] ({}) should be > profile[6] ({})", profile[5], profile[6]);
+        assert!(profile[5] > 0.1 * profile[0], "profile[5] ({}) should be > 0.1 * profile[0] ({})", profile[5], profile[0]);
+    }
+
+    #[test]
+    fn test_farrow_interpolator_cubic_lagrange() {
+        let mut farrow = FarrowInterpolator::new();
+        farrow.push(Complex::new(0.0, 0.0));
+        farrow.push(Complex::new(1.0, 0.0));
+        farrow.push(Complex::new(2.0, 0.0));
+        farrow.push(Complex::new(3.0, 0.0));
+
+        let val_zero = farrow.interpolate(0.0);
+        let val_mid = farrow.interpolate(0.5);
+        let val_one = farrow.interpolate(1.0);
+
+        assert!((val_zero.re - 1.0).abs() < 1e-5);
+        assert!((val_mid.re - 1.5).abs() < 1e-5);
+        assert!((val_one.re - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_refine_delay_farrow() {
+        let mut reference = vec![Complex::new(0.0, 0.0); 1000];
+        let mut surv = vec![Complex::new(0.0, 0.0); 1000];
+        
+        let mut raw_ref = vec![Complex::new(0.0, 0.0); 1100];
+        let mut seed: u64 = 54321;
+        for i in 0..1100 {
+            seed = (seed.wrapping_mul(1103515245).wrapping_add(12345)) & 0x7fffffff;
+            let phase = (seed as f32 / 2147483647.0) * 2.0 * std::f32::consts::PI;
+            raw_ref[i] = Complex::new(phase.cos(), phase.sin());
+        }
+
+        // Apply a moving average filter to band-limit the reference signal
+        for i in 0..1000 {
+            let mut sum = Complex::new(0.0, 0.0);
+            for k in 0..8 {
+                sum += raw_ref[i + k];
+            }
+            reference[i] = sum / 8.0;
+        }
+
+        for i in 0..1000 {
+            let target_idx = i as f32 - 5.25;
+            let base = target_idx.floor() as i32;
+            let mu = target_idx - base as f32;
+            
+            let idx_neg1 = (base - 1).clamp(0, 999) as usize;
+            let idx_0 = base.clamp(0, 999) as usize;
+            let idx_1 = (base + 1).clamp(0, 999) as usize;
+            let idx_2 = (base + 2).clamp(0, 999) as usize;
+            
+            let y_neg1 = reference[idx_neg1];
+            let y_0 = reference[idx_0];
+            let y_1 = reference[idx_1];
+            let y_2 = reference[idx_2];
+            
+            let v3_re = -1.0 / 6.0 * y_neg1.re + 0.5 * y_0.re - 0.5 * y_1.re + 1.0 / 6.0 * y_2.re;
+            let v2_re = 0.5 * y_neg1.re - y_0.re + 0.5 * y_1.re;
+            let v1_re = -1.0 / 3.0 * y_neg1.re - 0.5 * y_0.re + y_1.re - 1.0 / 6.0 * y_2.re;
+            let v0_re = y_0.re;
+
+            let v3_im = -1.0 / 6.0 * y_neg1.im + 0.5 * y_0.im - 0.5 * y_1.im + 1.0 / 6.0 * y_2.im;
+            let v2_im = 0.5 * y_neg1.im - y_0.im + 0.5 * y_1.im;
+            let v1_im = -1.0 / 3.0 * y_neg1.im - 0.5 * y_0.im + y_1.im - 1.0 / 6.0 * y_2.im;
+            let v0_im = y_0.im;
+
+            let re = ((v3_re * mu + v2_re) * mu + v1_re) * mu + v0_re;
+            let im = ((v3_im * mu + v2_im) * mu + v1_im) * mu + v0_im;
+            
+            surv[i] = Complex::new(re, im);
+        }
+
+        let refined = refine_delay_farrow(&surv, &reference, 5);
+        println!("test_refine_delay_farrow diagnostics: refined={}", refined);
+        assert!((refined - 5.25).abs() < 0.05, "Refined delay {} should be close to 5.25", refined);
+    }
 
     #[test]
     fn test_correlate_slices_equivalence() {

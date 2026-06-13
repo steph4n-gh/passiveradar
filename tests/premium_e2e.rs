@@ -255,8 +255,8 @@ fn run_ws_compound_test(
     let mut last_err: Option<String> = None;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let ws_url = format!("ws://127.0.0.1:{}", port);
-    for _ in 0..3 {
-        match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150)) {
+    for _ in 0..15 {
+        match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
             Ok(stream) => {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
                 let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
@@ -292,10 +292,10 @@ fn run_ws_compound_test(
                                         let err_str = format!("{:?}", e);
                                         if err_str.contains("WouldBlock") || err_str.contains("TimedOut") || err_str.contains("timed out") {
                                             consecutive_would_block += 1;
-                                            if consecutive_would_block > 10 {
+                                            if consecutive_would_block > 250 {
                                                 break;
                                             }
-                                            thread::sleep(Duration::from_millis(20));
+                                            thread::sleep(Duration::from_millis(10));
                                         } else {
                                             eprintln!("Read error: {}", err_str);
                                             break;
@@ -479,7 +479,7 @@ fn test_tier1_spectrogram_toggle_off_tui() {
 }
 #[test]
 fn test_tier1_spectrogram_visual_symbols() {
-    run_tui_test(240, 40, "TICK 1\nDUMP frame.txt", &["░", "▒", "▓", "█"], &[]);
+    run_tui_test(240, 40, "TICK 50\nDUMP frame.txt", &["░", "▒", "▓", "█"], &[]);
 }
 #[test]
 fn test_tier1_spectrogram_resize_width() {

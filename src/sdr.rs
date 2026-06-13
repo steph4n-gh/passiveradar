@@ -336,8 +336,8 @@ impl SdrSource for SimulationSdrSource {
             self.aircraft.clear();
         }
 
-        // Occasionally spawn a meteor in the simulation (e.g. 0.2% chance per block read)
-        if self.meteor.is_none() && self.rng.gen_bool(0.002) {
+        // Occasionally spawn a meteor in the simulation (e.g. 0.03% chance per block read)
+        if self.meteor.is_none() && self.rng.gen_bool(0.0003) {
             let duration = self.rng.gen_range(0.3..1.2);
             let initial_doppler =
                 self.rng.gen_range(400.0..1800.0) * if self.rng.gen_bool(0.5) { 1.0 } else { -1.0 };

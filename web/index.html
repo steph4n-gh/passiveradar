@@ -30,11 +30,11 @@
 
         <!-- Main Workspace -->
         <main class="hud-main">
-            <!-- Column 1: RADAR SCANNER, 3D ELEVATION PROFILE -->
-            <div class="hud-column">
+            <!-- Left Area: 2D Radar Scope and 3D Trajectory Elevation Side-by-Side (Full Height) -->
+            <div class="radar-workspace">
                 <section class="panel-radar glass-panel">
                     <div class="panel-header" style="display: flex; justify-content: space-between; align-items: center;">
-                        <span>RADAR SCANNER (70km ENU Range)</span>
+                        <span>PASSIVE RADAR PPI SWEEP - SECTOR A</span>
                         <button class="hud-btn zoom-btn" data-target="panel-radar" style="width: auto; padding: 2px 8px; font-size: 10px; margin: 0; line-height: 1;">FULLSCREEN</button>
                     </div>
                     <div class="canvas-container">
@@ -43,164 +43,207 @@
                 </section>
                 <section class="panel-elevation glass-panel">
                     <div class="panel-header" style="display: flex; justify-content: space-between; align-items: center;">
-                        <span>3D ELEVATION PROFILE</span>
+                        <span>3D ENU TRAJECTORY ANALYSIS</span>
                         <button class="hud-btn zoom-btn" data-target="panel-elevation" style="width: auto; padding: 2px 8px; font-size: 10px; margin: 0; line-height: 1;">FULLSCREEN</button>
                     </div>
                     <div class="canvas-container">
                         <canvas id="elevation-profile"></canvas>
                     </div>
                 </section>
-                <section class="panel-aligner glass-panel">
-                    <div class="panel-header">ANTENNA ALIGNMENT SCOPE</div>
-                    <div class="canvas-container">
-                        <canvas id="antenna-aligner"></canvas>
-                    </div>
-                </section>
             </div>
 
-            <!-- Column 2: ACTIVE EKF TELEMETRY, JEM SPECTRUM ANALYZER -->
-            <div class="hud-column">
-                <section class="panel-telemetry glass-panel">
-                    <div class="panel-header">ACTIVE EKF TELEMETRY</div>
-                    <div class="table-container">
-                        <table id="telemetry-table">
-                            <thead>
-                                <tr>
-                                    <th>ID</th>
-                                    <th>STATE</th>
-                                    <th>CLASSIFICATION</th>
-                                    <th>ALTITUDE</th>
-                                    <th>SPEED</th>
-                                    <th>TOWERS</th>
-                                </tr>
-                            </thead>
-                            <tbody id="telemetry-rows">
-                                <tr>
-                                    <td colspan="6" class="no-data">NO TARGETS ACQUIRED</td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
-                </section>
-                <section class="panel-fft-spectrogram glass-panel">
-                    <div class="panel-header">SURVEILLANCE FFT SPECTROGRAM</div>
-                    <div class="canvas-container">
-                        <canvas id="fft-spectrogram"></canvas>
-                    </div>
-                </section>
-                <section class="panel-iq-constellation glass-panel">
-                    <div class="panel-header">I/Q CONSTELLATION SCOPE</div>
-                    <div class="canvas-container">
-                        <canvas id="iq-constellation"></canvas>
-                    </div>
-                </section>
-                <section class="panel-jem glass-panel">
-                    <div class="panel-header" style="display: flex; justify-content: space-between; align-items: center;">
-                        <span>JEM SPECTRUM ANALYZER</span>
-                        <button id="jem-toggle-btn" class="hud-btn" style="width: auto; padding: 2px 8px; font-size: 10px; margin: 0;">SWITCH TO SPECTROGRAM</button>
-                    </div>
-                    <div class="canvas-container">
-                        <canvas id="jem-spectrum"></canvas>
-                    </div>
-                </section>
-            </div>
-
-            <!-- Column 3: TWO-WAY CONTROL PANEL, RANGE-DOPPLER WATERFALL, TRANSIENT METEOR LOGS -->
-            <div class="hud-column">
-                <section class="panel-controls glass-panel">
-                    <div class="panel-header">TWO-WAY CONTROL PANEL</div>
-                    <div class="control-container">
-                        <div class="control-row">
-                            <label for="dsp-threshold">DSP THRESHOLD:</label>
-                            <input type="range" id="dsp-threshold" min="1.0" max="20.0" step="0.1" value="5.8">
-                            <span id="dsp-threshold-val" class="control-val">5.8 dB</span>
-                        </div>
-                        <div class="control-row">
-                            <label for="sdr-gain">SDR GAIN:</label>
-                            <input type="range" id="sdr-gain" min="0" max="50" step="1" value="32">
-                            <span id="sdr-gain-val" class="control-val">32 dB</span>
-                        </div>
-                        <div class="control-row">
-                            <label for="sdr-offset">FREQ OFFSET:</label>
-                            <input type="number" id="sdr-offset" value="75">
-                            <span class="control-val" style="min-width: 25px; text-align: left; margin-left: 4px;">Hz</span>
-                        </div>
-                        <div class="control-row">
-                            <label for="sdr-dc-block">DC BLOCK:</label>
-                            <input type="checkbox" id="sdr-dc-block" checked>
-                        </div>
-                        <div class="control-row">
-                            <label for="unconfirmed-toggle">SHOW UNCONFIRMED:</label>
-                            <input type="checkbox" id="unconfirmed-toggle">
-                        </div>
-                        <div class="control-row">
-                            <label for="crt-toggle">CRT OVERLAY:</label>
-                            <input type="checkbox" id="crt-toggle">
-                        </div>
-                        <div class="control-row">
-                            <label for="glow-toggle">GREEN VECTOR GLOW:</label>
-                            <input type="checkbox" id="glow-toggle">
-                        </div>
-                        <div class="control-row">
-                            <label for="antenna-heading">ANTENNA HEADING:</label>
-                            <input type="range" id="antenna-heading" min="0" max="360" step="1" value="0">
-                            <span id="antenna-heading-val" class="control-val">0°</span>
-                        </div>
-                        <div class="control-row">
-                            <button id="ellipse-toggle-btn" class="hud-btn">TOGGLE ELLIPSE MODE</button>
-                        </div>
-                    </div>
-                </section>
-                <section class="panel-records glass-panel">
-                    <div class="panel-header">TACTICAL RECORDS / HIGH SCORES</div>
-                    <div class="records-container" style="padding: 10px; font-family: 'Share Tech Mono', monospace; font-size: 12px; line-height: 1.6;">
+            <!-- Right Area: Sidebar containing tabbed view of secondary panels -->
+            <div class="hud-sidebar glass-panel">
+                <section class="panel-summary glass-panel" style="margin: 10px 12px 0 12px; flex: 0; min-height: fit-content;">
+                    <div class="panel-header">AIRSPACE SURVEILLANCE SUMMARY</div>
+                    <div class="summary-container" style="padding: 10px; font-family: 'Share Tech Mono', monospace; font-size: 12px; line-height: 1.6; background: rgba(0, 5, 15, 0.4);">
                         <div style="display: flex; justify-content: space-between; border-bottom: 1px dashed rgba(0, 229, 255, 0.2); padding-bottom: 4px; margin-bottom: 6px;">
-                            <span>FASTEST PLANE:</span>
-                            <span id="record-fastest-plane" style="color: var(--accent-cyan); font-weight: bold;">N/A</span>
+                            <span>AIRSPACE STATUS:</span>
+                            <span id="sum-density" style="color: var(--accent-green); font-weight: bold;">CLEAR</span>
                         </div>
                         <div style="display: flex; justify-content: space-between; border-bottom: 1px dashed rgba(0, 229, 255, 0.2); padding-bottom: 4px; margin-bottom: 6px;">
-                            <span>HIGHEST DRONE:</span>
-                            <span id="record-highest-drone" style="color: var(--accent-cyan); font-weight: bold;">N/A</span>
-                        </div>
-                        <div style="display: flex; justify-content: space-between; border-bottom: 1px dashed rgba(0, 229, 255, 0.2); padding-bottom: 4px; margin-bottom: 6px;">
-                            <span>CLOSEST TARGET:</span>
-                            <span id="record-closest-target" style="color: var(--accent-cyan); font-weight: bold;">N/A</span>
-                        </div>
-                        <div style="display: flex; justify-content: space-between; border-bottom: 1px dashed rgba(0, 229, 255, 0.2); padding-bottom: 4px; margin-bottom: 6px;">
-                            <span>MAX SIMULTANEOUS TRACKS:</span>
-                            <span id="record-max-tracks" style="color: var(--accent-cyan); font-weight: bold;">0</span>
+                            <span>TOTAL ACTIVE TRACKS:</span>
+                            <span id="sum-total-tracks" style="color: var(--accent-cyan); font-weight: bold;">0</span>
                         </div>
                         <div style="display: flex; justify-content: space-between; padding-bottom: 4px;">
-                            <span>MAX CLUTTER CANCELLATION:</span>
-                            <span id="record-max-cancellation" style="color: var(--accent-cyan); font-weight: bold;">0.0 dB</span>
+                            <span>CLASSIFICATIONS:</span>
+                            <span id="sum-breakdown" style="color: var(--accent-cyan);">PLANES: 0 | DRONES: 0 | OTHER: 0</span>
                         </div>
                     </div>
                 </section>
-                <section class="panel-waterfall glass-panel">
-                    <div class="panel-header">DOPPLER RANGE-DOPPLER WATERFALL</div>
-                    <div class="canvas-container">
-                        <canvas id="waterfall-scope"></canvas>
-                    </div>
-                </section>
-                <section class="panel-events glass-panel">
-                    <div class="panel-header">TRANSIENT METEOR LOGS</div>
-                    <div class="events-log" id="events-log">
-                        <div class="log-entry system-msg">Awaiting WebSocket telemetry stream on ws://127.0.0.1:8085...</div>
-                    </div>
-                </section>
-                <section class="panel-terminal glass-panel">
-                    <div class="panel-header">TACTICAL HACKER TERMINAL</div>
-                    <div class="terminal-container">
-                        <div class="terminal-output" id="terminal-output">
-                            <div class="terminal-line system-msg">=== TACTICAL HACKER CONSOLE READY ===</div>
-                            <div class="terminal-line system-msg">Type 'help' for command list.</div>
+
+                <div class="sidebar-tabs">
+                    <button class="tab-btn active" data-tab="tab-telemetry">TELEMETRY</button>
+                    <button class="tab-btn" data-tab="tab-dsp">RF & DSP</button>
+                    <button class="tab-btn" data-tab="tab-ops">TACTICAL</button>
+                </div>
+
+                <!-- Tab 1: Telemetry & Controls -->
+                <div class="tab-content active" id="tab-telemetry">
+                    <section class="panel-telemetry glass-panel">
+                        <div class="panel-header">ACTIVE EKF TELEMETRY</div>
+                        <div class="table-container">
+                            <table id="telemetry-table">
+                                <thead>
+                                    <tr>
+                                        <th>ID</th>
+                                        <th>STATE</th>
+                                        <th>CLASSIFICATION</th>
+                                        <th>ALTITUDE</th>
+                                        <th>SPEED</th>
+                                        <th>TOWERS</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="telemetry-rows">
+                                    <tr>
+                                        <td colspan="6" class="no-data">NO TARGETS ACQUIRED</td>
+                                    </tr>
+                                </tbody>
+                            </table>
                         </div>
-                        <div class="terminal-input-row">
-                            <span class="terminal-prompt">passiveradar_hacker&gt;</span>
-                            <input type="text" id="terminal-input" autocomplete="off" spellcheck="false" placeholder="Enter hacker command...">
+                    </section>
+
+                    <section class="panel-controls glass-panel">
+                        <div class="panel-header">TWO-WAY CONTROL PANEL</div>
+                        <div class="control-container">
+                            <div class="control-row">
+                                <label for="dsp-threshold">DSP THRESHOLD:</label>
+                                <input type="range" id="dsp-threshold" min="1.0" max="20.0" step="0.1" value="5.8">
+                                <span id="dsp-threshold-val" class="control-val">5.8 dB</span>
+                            </div>
+                            <div class="control-row">
+                                <label for="sdr-gain">SDR GAIN:</label>
+                                <input type="range" id="sdr-gain" min="0" max="50" step="1" value="32">
+                                <span id="sdr-gain-val" class="control-val">32 dB</span>
+                            </div>
+                            <div class="control-row">
+                                <label for="sdr-offset">FREQ OFFSET:</label>
+                                <input type="number" id="sdr-offset" value="75">
+                                <span class="control-val" style="min-width: 25px; text-align: left; margin-left: 4px;">Hz</span>
+                            </div>
+                            <div class="control-row">
+                                <label for="sdr-dc-block">DC BLOCK:</label>
+                                <input type="checkbox" id="sdr-dc-block" checked>
+                            </div>
+                            <div class="control-row">
+                                <label for="unconfirmed-toggle">SHOW UNCONFIRMED:</label>
+                                <input type="checkbox" id="unconfirmed-toggle">
+                            </div>
+                            <div class="control-row">
+                                <label for="crt-toggle">CRT OVERLAY:</label>
+                                <input type="checkbox" id="crt-toggle">
+                            </div>
+                            <div class="control-row">
+                                <label for="glow-toggle">GREEN VECTOR GLOW:</label>
+                                <input type="checkbox" id="glow-toggle">
+                            </div>
+                            <div class="control-row">
+                                <label for="shake-toggle">SCREEN SHAKE:</label>
+                                <input type="checkbox" id="shake-toggle">
+                            </div>
+                            <div class="control-row">
+                                <label for="antenna-heading">ANTENNA HEADING:</label>
+                                <input type="range" id="antenna-heading" min="0" max="360" step="1" value="0">
+                                <span id="antenna-heading-val" class="control-val">0°</span>
+                            </div>
+                            <div class="control-row">
+                                <button id="ellipse-toggle-btn" class="hud-btn">TOGGLE ELLIPSE MODE</button>
+                            </div>
                         </div>
-                    </div>
-                </section>
+                    </section>
+
+                    <section class="panel-records glass-panel">
+                        <div class="panel-header">TACTICAL RECORDS / HIGH SCORES</div>
+                        <div class="records-container" style="padding: 10px; font-family: 'Share Tech Mono', monospace; font-size: 12px; line-height: 1.6;">
+                            <div style="display: flex; justify-content: space-between; border-bottom: 1px dashed rgba(0, 229, 255, 0.2); padding-bottom: 4px; margin-bottom: 6px;">
+                                <span>FASTEST PLANE:</span>
+                                <span id="record-fastest-plane" style="color: var(--accent-cyan); font-weight: bold;">N/A</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; border-bottom: 1px dashed rgba(0, 229, 255, 0.2); padding-bottom: 4px; margin-bottom: 6px;">
+                                <span>HIGHEST DRONE:</span>
+                                <span id="record-highest-drone" style="color: var(--accent-cyan); font-weight: bold;">N/A</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; border-bottom: 1px dashed rgba(0, 229, 255, 0.2); padding-bottom: 4px; margin-bottom: 6px;">
+                                <span>CLOSEST TARGET:</span>
+                                <span id="record-closest-target" style="color: var(--accent-cyan); font-weight: bold;">N/A</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; border-bottom: 1px dashed rgba(0, 229, 255, 0.2); padding-bottom: 4px; margin-bottom: 6px;">
+                                <span>MAX SIMULTANEOUS TRACKS:</span>
+                                <span id="record-max-tracks" style="color: var(--accent-cyan); font-weight: bold;">0</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; padding-bottom: 4px;">
+                                <span>MAX CLUTTER CANCELLATION:</span>
+                                <span id="record-max-cancellation" style="color: var(--accent-cyan); font-weight: bold;">0.0 dB</span>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <!-- Tab 2: RF Signals & DSP scopes -->
+                <div class="tab-content" id="tab-dsp">
+                    <section class="panel-fft-spectrogram glass-panel">
+                        <div class="panel-header">SURVEILLANCE FFT SPECTROGRAM</div>
+                        <div class="canvas-container">
+                            <canvas id="fft-spectrogram"></canvas>
+                        </div>
+                    </section>
+                    <section class="panel-iq-constellation glass-panel">
+                        <div class="panel-header">I/Q CONSTELLATION SCOPE</div>
+                        <div class="canvas-container">
+                            <canvas id="iq-constellation"></canvas>
+                        </div>
+                    </section>
+                    <section class="panel-waterfall glass-panel">
+                        <div class="panel-header">DOPPLER RANGE-DOPPLER WATERFALL</div>
+                        <div class="canvas-container">
+                            <canvas id="waterfall-scope"></canvas>
+                        </div>
+                    </section>
+                    <section class="panel-aligner glass-panel">
+                        <div class="panel-header">ANTENNA ALIGNMENT SCOPE</div>
+                        <div class="canvas-container">
+                            <canvas id="antenna-aligner"></canvas>
+                        </div>
+                    </section>
+                    <section class="panel-multipath glass-panel">
+                        <div class="panel-header">MULTIPATH PROFILE (CHANNEL IMPULSE RESPONSE)</div>
+                        <div class="canvas-container">
+                            <canvas id="multipath-scope"></canvas>
+                        </div>
+                    </section>
+                </div>
+
+                <!-- Tab 3: Tactical / Operations -->
+                <div class="tab-content" id="tab-ops">
+                    <section class="panel-jem glass-panel">
+                        <div class="panel-header" style="display: flex; justify-content: space-between; align-items: center;">
+                            <span>JEM SPECTRUM ANALYZER</span>
+                            <button id="jem-toggle-btn" class="hud-btn" style="width: auto; padding: 2px 8px; font-size: 10px; margin: 0;">SWITCH TO SPECTROGRAM</button>
+                        </div>
+                        <div class="canvas-container">
+                            <canvas id="jem-spectrum"></canvas>
+                        </div>
+                    </section>
+                    <section class="panel-events glass-panel">
+                        <div class="panel-header">TRANSIENT METEOR LOGS</div>
+                        <div class="events-log" id="events-log">
+                            <div class="log-entry system-msg">Awaiting WebSocket telemetry stream on ws://127.0.0.1:8085...</div>
+                        </div>
+                    </section>
+                    <section class="panel-terminal glass-panel">
+                        <div class="panel-header">TACTICAL HACKER TERMINAL</div>
+                        <div class="terminal-container">
+                            <div class="terminal-output" id="terminal-output">
+                                <div class="terminal-line system-msg">=== TACTICAL HACKER CONSOLE READY ===</div>
+                                <div class="terminal-line system-msg">Type 'help' for command list.</div>
+                            </div>
+                            <div class="terminal-input-row">
+                                <span class="terminal-prompt">passiveradar_hacker&gt;</span>
+                                <input type="text" id="terminal-input" autocomplete="off" spellcheck="false" placeholder="Enter hacker command...">
+                            </div>
+                        </div>
+                    </section>
+                </div>
             </div>
         </main>
     </div>

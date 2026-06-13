@@ -259,7 +259,7 @@ impl EcaCanceler {
         // We use tau to inject a tiny bit of "virtual noise" scaled by the block size.
         // This prevents the linear predictor from achieving "perfect cancellation" of the
         // constant-modulus phase signal, preserving the target echoes!
-        let tau = 1e-3 * n as f32; 
+        let tau = 1e-3 * (r[0][0].re / taps as f32 + 1e-6); 
         for j in 0..taps {
             r[j][j] += Complex::new(tau, 0.0);
         }

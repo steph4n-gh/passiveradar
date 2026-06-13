@@ -46,6 +46,8 @@ const iqConstellationCtx = iqConstellationCanvas ? iqConstellationCanvas.getCont
 // Antenna Alignment & JEM Spectrogram Globals
 const alignerCanvas = document.getElementById("antenna-aligner");
 const alignerCtx = alignerCanvas ? alignerCanvas.getContext("2d") : null;
+const multipathCanvas = document.getElementById("multipath-scope");
+const multipathCtx = multipathCanvas ? multipathCanvas.getContext("2d") : null;
 
 let antennaHeading = 0;
 let jemViewMode = "FFT"; // "FFT" or "SPECTROGRAM"
@@ -141,13 +143,18 @@ function handleTelemetry(data) {
     
     // Process new transients to print log alerts
     const newTransients = data.transients || [];
-    if (newTransients.length > transients.length) {
-        for (let i = transients.length; i < newTransients.length; i++) {
-            const e = newTransients[i];
-            addLog(`METEOR TRAIL DETECTED: Type=${e.classification}, Doppler=${e.frequency_hz.toFixed(1)} Hz, SNR=${e.snr_db.toFixed(1)} dB`, "meteor-msg");
+    for (let i = newTransients.length - 1; i >= 0; i--) {
+        const e = newTransients[i];
+        const key = `${e.timestamp}_${e.frequency_hz}`;
+        const alreadyLogged = transients.some(t => `${t.timestamp}_${t.frequency_hz}` === key);
+        if (!alreadyLogged) {
+            let logMsg = `METEOR TRAIL DETECTED: Type=${e.classification}, Doppler=${e.frequency_hz.toFixed(1)} Hz, SNR=${e.snr_db.toFixed(1)} dB`;
+            if (e.tec !== undefined && e.tec !== null) {
+                logMsg += `, TEC=${e.tec.toFixed(3)} TECU`;
+            }
+            addLog(logMsg, "meteor-msg");
             
             // Speak meteor alert
-            const key = `${e.timestamp}_${e.frequency_hz}`;
             if (!announcedMeteors.has(key)) {
                 announcedMeteors.add(key);
                 if (announcedMeteors.size > 100) {
@@ -157,13 +164,15 @@ function handleTelemetry(data) {
                 speakVoiceAlert("Meteor trail detected");
             }
             
-            // Trigger screen shake
-            const hudOverlay = document.querySelector(".hud-overlay");
-            if (hudOverlay) {
-                hudOverlay.classList.add("shake-active");
-                hudOverlay.addEventListener("animationend", () => {
-                    hudOverlay.classList.remove("shake-active");
-                }, { once: true });
+            // Trigger screen shake only if enabled
+            if (data.screen_shake) {
+                const hudOverlay = document.querySelector(".hud-overlay");
+                if (hudOverlay) {
+                    hudOverlay.classList.add("shake-active");
+                    hudOverlay.addEventListener("animationend", () => {
+                        hudOverlay.classList.remove("shake-active");
+                    }, { once: true });
+                }
             }
         }
     }
@@ -264,8 +273,51 @@ function handleTelemetry(data) {
 
     // Update Text elements
     clippingEl.innerText = `${(clippingRate * 100).toFixed(1)}%`;
-    cancellationEl.innerText = `${cancellationRatio.toFixed(1)} dB`;
+    cancellationEl.innerText = `${Math.max(0.0, cancellationRatio).toFixed(1)} dB`;
     ellipsesEl.innerText = ellipseMode.toUpperCase();
+
+    // Update Airspace summary
+    let planes = 0;
+    let drones = 0;
+    let other = 0;
+    targets.forEach(t => {
+        const classStr = (t.classification || "").toLowerCase();
+        const callStr = (t.callsign || "").toLowerCase();
+        if (classStr.includes("drone") || classStr.includes("uav") || callStr.includes("drn")) {
+            drones++;
+        } else if (classStr.includes("plane") || classStr.includes("b78") || classStr.includes("commercial") || callStr.includes("aal")) {
+            planes++;
+        } else {
+            other++;
+        }
+    });
+
+    const sumDensity = document.getElementById("sum-density");
+    if (sumDensity) {
+        if (targets.length === 0) {
+            sumDensity.innerText = "CLEAR";
+            sumDensity.style.color = "var(--accent-green)";
+        } else if (targets.length <= 2) {
+            sumDensity.innerText = "LOW DENSITY";
+            sumDensity.style.color = "var(--accent-green)";
+        } else if (targets.length <= 4) {
+            sumDensity.innerText = "MODERATE";
+            sumDensity.style.color = "var(--accent-yellow)";
+        } else {
+            sumDensity.innerText = "HIGH DENSITY";
+            sumDensity.style.color = "#ff1744";
+        }
+    }
+
+    const sumTotalTracks = document.getElementById("sum-total-tracks");
+    if (sumTotalTracks) {
+        sumTotalTracks.innerText = targets.length;
+    }
+
+    const sumBreakdown = document.getElementById("sum-breakdown");
+    if (sumBreakdown) {
+        sumBreakdown.innerHTML = `PLANES: <span style="color:var(--accent-cyan); font-weight:bold">${planes}</span> | DRONES: <span style="color:var(--accent-yellow); font-weight:bold">${drones}</span> | OTHER: <span style="color:var(--accent-orange); font-weight:bold">${other}</span>`;
+    }
 
     // Update live status indicators
     const sdrStatusEl = document.getElementById("sdr-status");
@@ -275,13 +327,13 @@ function handleTelemetry(data) {
     }
 
     const sdrFreqEl = document.getElementById("sdr-frequency");
-    if (sdrFreqEl && data.sdr_frequency !== undefined) {
-        sdrFreqEl.innerText = `${(data.sdr_frequency / 1e6).toFixed(3)} MHz`;
+    if (sdrFreqEl && data.center_freq !== undefined) {
+        sdrFreqEl.innerText = `${(data.center_freq / 1e6).toFixed(3)} MHz`;
     }
 
     const sdrRateEl = document.getElementById("sdr-sample-rate");
-    if (sdrRateEl && data.sdr_sample_rate !== undefined) {
-        sdrRateEl.innerText = `${(data.sdr_sample_rate / 1e6).toFixed(3)} MSPS`;
+    if (sdrRateEl && data.sample_rate !== undefined) {
+        sdrRateEl.innerText = `${(data.sample_rate / 1e6).toFixed(3)} MSPS`;
     }
 
     const sdrOverflowEl = document.getElementById("sdr-overflow");
@@ -328,6 +380,11 @@ function handleTelemetry(data) {
         unconfirmedToggle.checked = data.show_unconfirmed;
     }
 
+    const shakeToggle = document.getElementById("shake-toggle");
+    if (data.screen_shake !== undefined && shakeToggle && document.activeElement !== shakeToggle) {
+        shakeToggle.checked = data.screen_shake;
+    }
+
     // Render components
     updateTelemetryTable();
     drawWaterfallRow();
@@ -337,6 +394,9 @@ function handleTelemetry(data) {
     }
     if (data.constellation_points) {
         drawIqConstellation(data.constellation_points);
+    }
+    if (data.multipath_profile) {
+        drawMultipathProfile(data.multipath_profile, data.multipath_peak_refined);
     }
 
     // Update Tactical Records/High Scores
@@ -461,6 +521,11 @@ function resizeCanvases() {
         alignerCanvas.width = aParent.clientWidth;
         alignerCanvas.height = aParent.clientHeight;
     }
+    if (multipathCanvas) {
+        const mParent = multipathCanvas.parentElement;
+        multipathCanvas.width = mParent.clientWidth;
+        multipathCanvas.height = mParent.clientHeight;
+    }
 }
 window.addEventListener("resize", resizeCanvases);
 
@@ -557,6 +622,142 @@ function drawIqConstellation(points) {
         iqConstellationCtx.fill();
     });
 }
+
+function drawMultipathProfile(profile, refinedPeak) {
+    if (!multipathCanvas || !multipathCtx) return;
+    const w = multipathCanvas.width;
+    const h = multipathCanvas.height;
+    if (w === 0 || h === 0) return;
+
+    // Clear
+    multipathCtx.fillStyle = "rgba(3, 9, 20, 0.45)";
+    multipathCtx.fillRect(0, 0, w, h);
+
+    const paddingLeft = 40;
+    const paddingRight = 15;
+    const paddingTop = 20;
+    const paddingBottom = 25;
+
+    const graphWidth = w - paddingLeft - paddingRight;
+    const graphHeight = h - paddingTop - paddingBottom;
+
+    if (graphWidth <= 0 || graphHeight <= 0) return;
+
+    // Draw grid
+    multipathCtx.strokeStyle = "rgba(0, 229, 255, 0.08)";
+    multipathCtx.lineWidth = 1;
+    
+    // Y grid (4 levels)
+    for (let i = 1; i <= 4; i++) {
+        const y = paddingTop + graphHeight * (1 - i / 4);
+        multipathCtx.beginPath();
+        multipathCtx.moveTo(paddingLeft, y);
+        multipathCtx.lineTo(w - paddingRight, y);
+        multipathCtx.stroke();
+    }
+
+    // X grid (every 10 bins)
+    const numBins = profile.length;
+    for (let i = 0; i < numBins; i += 10) {
+        const x = paddingLeft + (i / (numBins - 1)) * graphWidth;
+        multipathCtx.beginPath();
+        multipathCtx.moveTo(x, paddingTop);
+        multipathCtx.lineTo(x, h - paddingBottom);
+        multipathCtx.stroke();
+        
+        const distKm = i * 1.171;
+        multipathCtx.fillStyle = "rgba(0, 229, 255, 0.6)";
+        multipathCtx.font = "8px Courier New";
+        multipathCtx.textAlign = "center";
+        multipathCtx.fillText(`${distKm.toFixed(0)}k`, x, h - 12);
+    }
+
+    // Find max value and index
+    let maxIdx = 0;
+    let maxVal = 1e-6;
+    for (let i = 0; i < numBins; i++) {
+        if (profile[i] > maxVal) {
+            maxVal = profile[i];
+            maxIdx = i;
+        }
+    }
+
+    // Plot line
+    multipathCtx.beginPath();
+    for (let i = 0; i < numBins; i++) {
+        const x = paddingLeft + (i / (numBins - 1)) * graphWidth;
+        const normVal = profile[i] / maxVal;
+        const y = paddingTop + graphHeight * (1 - normVal);
+        if (i === 0) {
+            multipathCtx.moveTo(x, y);
+        } else {
+            multipathCtx.lineTo(x, y);
+        }
+    }
+    multipathCtx.strokeStyle = "rgba(0, 229, 255, 0.85)";
+    multipathCtx.lineWidth = 1.5;
+    
+    // Glowing line
+    multipathCtx.shadowColor = "rgba(0, 229, 255, 0.5)";
+    multipathCtx.shadowBlur = 4;
+    multipathCtx.stroke();
+    multipathCtx.shadowBlur = 0; // reset
+
+    // Fill area under gradient
+    const gradient = multipathCtx.createLinearGradient(0, paddingTop, 0, h - paddingBottom);
+    gradient.addColorStop(0, "rgba(0, 229, 255, 0.2)");
+    gradient.addColorStop(1, "rgba(0, 229, 255, 0.0)");
+    
+    multipathCtx.beginPath();
+    multipathCtx.moveTo(paddingLeft, h - paddingBottom);
+    for (let i = 0; i < numBins; i++) {
+        const x = paddingLeft + (i / (numBins - 1)) * graphWidth;
+        const normVal = profile[i] / maxVal;
+        const y = paddingTop + graphHeight * (1 - normVal);
+        multipathCtx.lineTo(x, y);
+    }
+    multipathCtx.lineTo(w - paddingRight, h - paddingBottom);
+    multipathCtx.closePath();
+    multipathCtx.fillStyle = gradient;
+    multipathCtx.fill();
+
+    // Peak marker callout
+    if (maxVal > 1e-5) {
+        const peakIdx = (refinedPeak !== undefined && refinedPeak !== null) ? refinedPeak : maxIdx;
+        const maxPx = paddingLeft + (peakIdx / (numBins - 1)) * graphWidth;
+        const maxPy = paddingTop + graphHeight * (1 - 1.0);
+        
+        multipathCtx.fillStyle = "rgba(255, 59, 48, 0.85)"; // coral/red glow
+        multipathCtx.beginPath();
+        multipathCtx.arc(maxPx, maxPy, 3.5, 0, Math.PI * 2);
+        multipathCtx.fill();
+
+        multipathCtx.fillStyle = "#ffffff";
+        multipathCtx.font = "bold 8px Courier New";
+        multipathCtx.textAlign = peakIdx > numBins / 2 ? "right" : "left";
+        const offsetSign = peakIdx > numBins / 2 ? -6 : 6;
+        const maxDistKm = peakIdx * 1.171;
+        multipathCtx.fillText(`${maxDistKm.toFixed(3)} km`, maxPx + offsetSign, maxPy + 10);
+    }
+
+    // Axis
+    multipathCtx.strokeStyle = "rgba(0, 229, 255, 0.3)";
+    multipathCtx.lineWidth = 1;
+    multipathCtx.beginPath();
+    multipathCtx.moveTo(paddingLeft, paddingTop);
+    multipathCtx.lineTo(paddingLeft, h - paddingBottom);
+    multipathCtx.lineTo(w - paddingRight, h - paddingBottom);
+    multipathCtx.stroke();
+
+    // Y Axis labels
+    multipathCtx.fillStyle = "rgba(0, 229, 255, 0.6)";
+    multipathCtx.font = "8px Courier New";
+    multipathCtx.textAlign = "right";
+    multipathCtx.fillText("MAX", paddingLeft - 5, paddingTop + 4);
+    multipathCtx.fillText("0.5", paddingLeft - 5, paddingTop + graphHeight / 2 + 3);
+    multipathCtx.fillText("0.0", paddingLeft - 5, h - paddingBottom + 2);
+}
+
 
 // Radar PPI Paint Loop
 function drawRadarScope() {
@@ -1441,6 +1642,16 @@ if (unconfirmedToggleListener) {
     });
 }
 
+const shakeToggleListener = document.getElementById("shake-toggle");
+if (shakeToggleListener) {
+    shakeToggleListener.addEventListener("change", (e) => {
+        const val = e.target.checked;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ command: "set_screen_shake", value: val }));
+        }
+    });
+}
+
 if (ellipseToggleBtn) {
     ellipseToggleBtn.addEventListener("click", () => {
         if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1972,3 +2183,23 @@ drawRadarScope();
 draw3DElevation();
 drawJEMSpectrum();
 drawAntennaAligner();
+
+// Tab navigation logic
+document.querySelectorAll(".tab-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+        document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+        document.querySelectorAll(".tab-content").forEach(c => c.classList.remove("active"));
+        
+        btn.classList.add("active");
+        const tabId = btn.getAttribute("data-tab");
+        const content = document.getElementById(tabId);
+        if (content) {
+            content.classList.add("active");
+        }
+        
+        // Trigger canvas resize to fit new tab containers
+        if (typeof resizeCanvases === "function") {
+            resizeCanvases();
+        }
+    });
+});

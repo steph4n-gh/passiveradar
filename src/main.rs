@@ -376,6 +376,9 @@ fn handle_key_code(
         KeyCode::Char('r') | KeyCode::Char('R') => {
             dashboard.show_records = !dashboard.show_records;
         }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            dashboard.show_multipath = !dashboard.show_multipath;
+        }
         KeyCode::Char('u') | KeyCode::Char('U') => {
             dashboard.show_unconfirmed = !dashboard.show_unconfirmed;
         }
@@ -626,6 +629,18 @@ fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard) -> serde_json
                     return serde_json::json!({
                         "show_unconfirmed": d,
                         "sync_status": format!("Show Unconfirmed: {}", if d { "ON" } else { "OFF" })
+                    });
+                }
+            }
+            serde_json::json!({"error": "Invalid arguments"})
+        }
+        "set_screen_shake" => {
+            if let Some(val) = raw_val.get("value") {
+                if let Some(d) = val.as_bool() {
+                    dashboard.screen_shake = d;
+                    return serde_json::json!({
+                        "screen_shake": d,
+                        "sync_status": format!("Screen Shake: {}", if d { "ON" } else { "OFF" })
                     });
                 }
             }
@@ -1196,7 +1211,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     std::thread::spawn(move || {
                         if let Ok(mut ws) = tungstenite::accept(stream) {
                             let _ = ws.get_ref().set_nonblocking(true);
-                            let (send_tx, send_rx) = std::sync::mpsc::channel::<String>();
+                            let (send_tx, send_rx) = std::sync::mpsc::sync_channel::<String>(16);
                             if let Ok(mut clients) = active_clients_inner.lock() {
                                 clients.push(send_tx);
                             }
@@ -1236,7 +1251,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     Ok(tungstenite::Message::Text(text)) => {
                                         let (resp_tx, resp_rx) = std::sync::mpsc::channel::<String>();
                                         if ws_cmd_tx_inner.send((text.to_string(), resp_tx)).is_ok() {
-                                            if let Ok(resp_text) = resp_rx.recv_timeout(Duration::from_millis(500)) {
+                                            if let Ok(resp_text) = resp_rx.recv_timeout(Duration::from_millis(5000)) {
                                                 if !send_msg!(tungstenite::Message::Text(resp_text)) {
                                                     break 'client_loop;
                                                 }
@@ -1440,7 +1455,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut primary_ref_buf: VecDeque<Complex<f32>> = VecDeque::new();
     let mut primary_surv_buf: VecDeque<Complex<f32>> = VecDeque::new();
-    let caf_engine = crate::dsp::caf::CafEngine::new();
+    let mut caf_engine = crate::dsp::caf::CafEngine::new();
     let mut caf_frame_counter: u32 = 0;
     let mut last_telemetry_time = Instant::now();
 
@@ -1636,7 +1651,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let block_cancel_db = 10.0 * (p_in / p_out.max(1e-10)).log10();
                 
                 dashboard.carrier_rms = 0.9 * dashboard.carrier_rms + 0.1 * block_carrier_rms;
-                dashboard.cancellation_ratio_db = 0.9 * dashboard.cancellation_ratio_db + 0.1 * block_cancel_db;
+                dashboard.cancellation_ratio_db = (0.9 * dashboard.cancellation_ratio_db + 0.1 * block_cancel_db).max(0.0);
 
                 primary_ref_buf.extend(channels[0].dc_blocked_buf.iter());
                 primary_surv_buf.extend(channels[0].cancelled_buf.iter());
@@ -1662,6 +1677,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                         max_delay,
                     );
                     dashboard.update_caf(caf_res);
+
+                    let max_cir_delay = 64;
+                    if ref_slice.len() >= 512 + max_cir_delay && surv_slice.len() >= 512 + max_cir_delay {
+                        let cir_res = crate::dsp::caf::compute_cir(surv_slice, ref_slice, max_cir_delay);
+                        dashboard.update_multipath(cir_res.clone());
+                        let max_idx = cir_res.iter().enumerate()
+                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(0);
+                        let refined = crate::dsp::caf::refine_delay_farrow(surv_slice, ref_slice, max_idx);
+                        dashboard.update_multipath_peak(refined);
+                    }
                 }
 
                 // Pre-collect active targets EKF states to avoid thread-borrowing issues in par_iter_mut
@@ -2008,7 +2035,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "timestamp": tr.timestamp,
                         "frequency_hz": tr.frequency_hz,
                         "snr_db": tr.snr_db,
-                        "classification": tr.classification
+                        "classification": tr.classification,
+                        "tec": tr.tec
                     })
                 })
                 .collect();
@@ -2022,6 +2050,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "gain": dashboard.gain,
                 "dc_block": dashboard.dc_block,
                 "show_unconfirmed": dashboard.show_unconfirmed,
+                "screen_shake": dashboard.screen_shake,
                 "surveillance_fft": surveillance_fft,
                 "constellation_points": constellation_points,
                 "targets": serialized_targets,
@@ -2039,11 +2068,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "sdr_dc_block": dashboard.dc_alpha,
                 "overflow_alarm": dashboard.overflow_alarm,
                 "tactical_records": dashboard.tactical_records,
+                "multipath_profile": dashboard.multipath_profile,
+                "multipath_peak_refined": dashboard.multipath_peak_refined,
             });
             let telemetry_str = to_ws_json_string(&telemetry);
             if let Ok(mut clients) = active_clients.lock() {
                 clients.retain(|client_tx| {
-                    client_tx.send(telemetry_str.clone()).is_ok()
+                    match client_tx.try_send(telemetry_str.clone()) {
+                        Ok(_) => true,
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => true,
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+                    }
                 });
             }
         }

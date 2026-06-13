@@ -1,120 +1,143 @@
 # Passive Radar (Forward-Scatter) DSP Pipeline
 
-A high-performance, real-time software-defined radio (SDR) passive radar system written in Rust. This system exploits existing ambient RF illuminators (like FM radio towers) to detect and track aircraft via forward-scatter and bistatic reflections.
+A high-performance, real-time software-defined radio (SDR) passive radar system written in Rust. This system exploits existing ambient RF "illuminators of opportunity" (like commercial FM radio towers) to detect and track aircraft via forward-scatter and bistatic reflections. 
 
-> [!NOTE]
-> **Research & Experimental Notice**: This project is experimental in nature. The hardware pipeline is designed to work with simple indoor setups—specifically a vertical metal whip antenna mounted on a baking sheet (acting as an empirical ground plane) and connected to a HackRF One SDR receiver.
+It is designed with a DIY "doing more with less" ethos: with just a simple telescoping whip antenna, a metal kitchen baking sheet as a ground plane, and a budget SDR (like a HackRF or RTL-SDR), you can track aircraft flying overhead in real time!
 
 ![Terminal UI Dashboard Screenshot](screenshot.png)
 
-## Features
+---
 
-- **Real-Time DSP Pipeline**: Ingests IQ samples from SDR hardware (or high-fidelity simulation) at rates up to 2.4+ MSPS.
-- **Hardware-Accelerated Math**:
-  - **SIMD Decimation**: Auto-vectorized FIR filtering using AVX2/FMA (x86_64) or Neon (AArch64/Raspberry Pi) for massive downsampling throughput.
-  - **GPU-Offloaded FFTs**: Utilizes WebGPU (`wgsl-fft`) to push heavy Cross-Ambiguity Function (CAF) matrix calculations to the GPU.
-  - **Multithreaded CAF**: Distributes delay-bin processing across all CPU cores using `rayon`.
-- **Bistatic EKF Tracking**: A custom Extended Kalman Filter bank dynamically associates detections and tracks targets in 3D ENU space.
-- **Terminal UI Dashboard**: A highly decoupled, frame-limited Ratatui dashboard featuring:
-  - 2D Trajectory Map (30 FPS)
-  - Color-coded Range-Doppler Waterfall (10 FPS)
-  - Target Tracking Bank & JEM (Jet Engine Modulation) Analytics
-  - System Diagnostics & CLI Event Logs
+## Quick-Start Guides: Three Audiences
 
-## Prerequisites
+*   [Hobbyists & Beginners](#1-hobbyists--beginners-diy-guide) — Conceptual explanation, physical hardware setup, and basic usage.
+*   [Developers & Intermediate](#2-developers--intermediate-guide) — Compilation, detailed Rust CLI parameters, and the Web Companion HUD.
+*   [RF & Math Experts](#3-rf--math-experts-guide) — High-level mathematical overview of the DSP, Adelic Optimization, and Čech Cohomology algorithms, with links to full derivations.
 
-- **Rust**: Latest stable toolchain (`rustup`).
-- **SDR Hardware**: Any SoapySDR-compatible hardware (e.g., RTL-SDR, HackRF) if running in live mode.
-- **GPU Drivers**: Vulkan/Metal/DX12 drivers for GPU FFT offloading (optional but recommended).
+---
 
-## Building
+## 1. Hobbyists & Beginners: DIY Guide
 
-```bash
-# Build the highly optimized release binary
-cargo build --release
+Passive radar works like a classic radar system but without a transmitter of its own. Instead, it relies on others' transmitters.
+
+```
+                  [Aircraft (Scatterer)]
+                       /          \
+                      /            \ (Scattered Path)
+                     /              \
+                    /                v
+[FM Radio Tower (Tx)] ------------> [Your Antenna (Rx)]
+                      (Direct Path)
 ```
 
-To compile completely without GPU support (e.g., for minimal edge devices):
+### Key Concepts
+*   **Direct Path Signal**: The signal traveling straight from the FM radio tower to your receiver. The system uses this to know exactly what the tower is transmitting at any moment.
+*   **Scattered Path Signal**: The signal that travels from the tower, hits a passing aircraft, and bounces back down to your antenna.
+*   **Cross-Ambiguity Function (CAF)**: By comparing the difference in arrival times (bistatic range delay) and the frequency shift (Doppler shift) between the direct path and scattered path, the system detects moving aircraft.
+
+### DIY Hardware Setup
+Setting up a passive radar receiver is easy and cost-effective:
+1.  **Antenna**: Grab a basic metal telescoping whip antenna.
+2.  **Ground Plane**: Place the antenna magnetic base in the middle of a metal kitchen baking sheet (steel or aluminum). The baking sheet acts as a ground plane mirror, converting your quarter-wave whip antenna into a virtual half-wave dipole, greatly improving signal reception.
+3.  **Tuning**: Extend the antenna to about **76 cm (30 inches)**, which is the quarter-wavelength for the middle of the FM radio band ($\sim 98 \text{ MHz}$).
+4.  **Placement**: Position your setup near a window with a clear view of the sky, away from power lines and computers.
+5.  **SDR Connection**: Plug the antenna coaxial cable into your SDR receiver (HackRF One, RTL-SDR, etc.) and connect the SDR to your computer.
+
+For detailed hardware positioning and optimization instructions, see [docs/setup.md](docs/setup.md).
+
+### Quick-Start Execution
+If you do not have SDR hardware, the system runs a high-fidelity aircraft flight simulation by default:
+1.  Install Rust on your computer (`https://rustup.rs`).
+2.  Clone the repository and run:
+    ```bash
+    cargo run --release
+    ```
+3.  Observe the Terminal UI dashboard!
+
+---
+
+## 2. Developers & Intermediate Guide
+
+This software is built in Rust for speed, safety, and parallel processing. It features a SIMD-accelerated decimation engine, GPU-accelerated FFTs, and a highly responsive Terminal UI.
+
+### Compiling
+Build the optimized release binary:
+```bash
+cargo build --release
+```
+To compile without GPU WebGPU support (ideal for headless servers, edge machines, or Raspberry Pi):
 ```bash
 cargo build --release --no-default-features
 ```
 
-## Usage
-
-Start the system using `cargo run`:
-
+### Running the CLI
+Start the system using `cargo run --release -- [FLAGS]`. For example:
 ```bash
-# Run in simulation mode (default)
-cargo run --bin passiveradar --release
+# Run in live hardware mode tuned to 98.1 MHz
+cargo run --release -- --mode sdr --freq 98.1
 
-# Run with actual SDR hardware on a specific FM tower frequency
-cargo run --bin passiveradar --release -- --mode sdr --freq 97.1
-
-# Run with SDR, custom sample rate, and specific gain settings
-cargo run --bin passiveradar --release -- --mode sdr --rate 2.4 --lna 32 --vga 30
-
-# Run in CPU-only mode (dynamically disables GPU FFT offloading)
-cargo run --bin passiveradar --release -- --disable-gpu
+# Run in CPU-only mode with custom gains and custom web listener port
+cargo run --release -- --mode sdr --freq 98.1 --disable-gpu --lna 32.0 --vga 24.0 --web-port 9000
 ```
 
-### CLI Arguments
+### CLI Flags Reference
+Below is the complete list of command-line arguments supported by `src/main.rs`:
 
-- `-m, --mode <MODE>`: Ingestion mode. `sim` (default) or `sdr`.
-- `-f, --freq <FREQ>`: Target FM radio frequency in MHz (auto-tunes if omitted).
-- `-r, --rate <RATE>`: SDR input sample rate in MSPS (default: 2.048).
-- `--lna <GAIN>`: LNA gain in dB (default: 32.0).
-- `--vga <GAIN>`: VGA gain in dB (default: 30.0).
-- `--port <PORT>`: Custom WebSocket listener port for streaming telemetry (default: 8085).
-- `--web-port <PORT>`: Custom HTTP Web HUD listener port serving frontend files (default: 8080).
-- `--host <HOST>`: Custom WebSocket listener host address (default: "127.0.0.1").
-- `--heading <HEADING>`: Compass alignment rotation heading in degrees (default: 0.0).
-- `--lat <LAT>`: Override default receiver latitude.
-- `--lon <LON>`: Override default receiver longitude.
-- `--disable-gpu`: Forces the DSP engine to fallback to CPU `rustfft` computation.
-- `--compat`: Enables compatibility mode for older terminals (ASCII lines).
+| Flag / Option | Argument Type | Default Value | Description |
+| :--- | :--- | :--- | :--- |
+| `-m, --mode` | `sim` or `sdr` | `"sim"` | Ingestion mode: `sim` for simulated flights, `sdr` for physical hardware. |
+| `-f, --freq` | `f64` (Optional) | `None` | Target FM radio frequency in MHz (auto-tunes to optimal tower if omitted). |
+| `-r, --rate` | `f64` | `2.048` | SDR input sample rate in MSPS. |
+| `--lna` | `f64` (Optional) | `32.0` | Optional SDR LNA gain in dB. |
+| `--vga` | `f64` (Optional) | `30.0` | Optional SDR VGA gain in dB. |
+| `--compat` | `bool` | `false` | Enable compatibility mode (ASCII borders, simpler canvas symbols) for terminals without full Unicode support. |
+| `--test-script` | `String` (Optional) | `None` | Path to a test script text file for E2E testing. |
+| `--test-out` | `String` (Optional) | `None` | Directory path where test frame dumps are written. |
+| `--width` | `u16` (Optional) | `None` | Override terminal width for testing. |
+| `--height` | `u16` (Optional) | `None` | Override terminal height for testing. |
+| `--disable-gpu` | `bool` | `false` | Disable GPU-accelerated FFTs (fallback to CPU). |
+| `--heading` | `f64` | `0.0` | Alignment compass heading in degrees (allows negative values). |
+| `--no-towers` | `bool` | `false` | Disable tower loading (run without signal transmitters). |
+| `--no-signal` | `bool` | `false` | Run with an empty/no-signal constellation. |
+| `--tower-at-origin` | `bool` | `false` | Overrides active tower positions to receiver origin (0,0,0). |
+| `--many-towers` | `bool` | `false` | Mock 50 dummy active towers for TUI overlap limit testing. |
+| `--mock-no-audio` | `bool` | `false` | Mock audio hardware failure. |
+| `--max-targets` | `bool` | `false` | Mock 100+ active targets for audio hum clipping testing. |
+| `--mock-target-termination` | `bool` | `false` | Force target termination in simulation for testing. |
+| `--port` | `u16` (Optional) | `None (falls back to 8085)` | Custom WebSocket listener port for streaming telemetry. |
+| `--web-port` | `u16` | `8080` | Custom Web HUD companion HTTP listener port. |
+| `--host` | `String` | `"127.0.0.1"` | Custom WebSocket listener host address. |
+| `--lat` | `f64` (Optional) | `None` | Override receiver latitude (allows negative values). |
+| `--lon` | `f64` (Optional) | `None` | Override receiver longitude (allows negative values). |
 
-## Web Companion HUD
+### Web HUD Companion
+The system hosts a concurrent web server that broadcasts real-time telemetry and waterfall data directly to your web browser:
+1. Start the radar stack: `cargo run --release`.
+2. Open a browser and navigate to `http://127.0.0.1:8080` (or your custom `--web-port`).
+3. The interactive HUD features:
+   * **Plan Position Indicator (PPI) Scope**: Real-time aircraft tracks, history trails, and bracketed lock overlays.
+   * **Range-Doppler Waterfall**: Scrolling spectrogram visualizing target reflection strengths.
+   * **Micro-Doppler JEM (Jet Engine Modulation)**: 3D target altitude tracks and blade-strike micro-Doppler signatures.
+   * **Interactive Soundscape**: real-time synthesized audio representing target proximity and speed (Web Audio API).
 
-The system hosts an integrated, concurrent web server that broadcasts real-time telemetry and waterfall data directly to a browser:
-1. Start the radar stack using `cargo run`.
-2. Open your browser and navigate to `http://localhost:8080`.
-3. The cybernetic HUD provides:
-   - **Plan Position Indicator (PPI) Scope**: Track trails, vector heading line, and locked bracket target overlays.
-   - **Range-Doppler Waterfall**: Scrolling plasma spectrograph indicating raw echo strengths.
-   - **Interactive Audio Engine**: Real-time synthesized Doppler beeps and ambient radar soundscapes (using Web Audio API).
-   - **3D Elevation & JEM Profiles**: Displays 3D target altitude traces and micro-Doppler spectral signatures.
-   - **Retro Hacker Shell**: Controls clutter jamming, radar frequency scanning, and threat spoofing scenarios.
+---
 
-### D.C. Metro Area Optimal FM Clusters
+## 3. RF & Math Experts Guide
 
-When running in the D.C., Bethesda, or Potomac areas, the dense FM radio spectrum allows tracking multiple towers concurrently within a single SDR bandwidth. 
+The Passive Radar codebase utilizes advanced digital signal processing and topological data analysis methods to solve the low SNR bistatic tracking problem.
 
-If running without the `-f` flag, the auto-tuning engine will select these clusters automatically. To override and target a specific cluster:
+### Algorithm Summaries
 
-*   **90 MHz Lower Cluster (5 Towers)**: Tune to `-f 90.2` (with `--rate 6` or higher) or `-f 89.3` (with `--rate 2.048`).
-    *   *Coverage*: `88.5 MHz` (WAMU), `89.3 MHz` (WPFW), `90.1 MHz` (WCSP), `90.9 MHz` (WETA), and `91.9 MHz` (WGTS).
-*   **95 MHz Middle Cluster (4 Towers)**: Tune to `-f 95.1` (with `--rate 6` or higher) or `-f 94.7` (with `--rate 2.048`).
-    *   *Coverage*: `93.9 MHz` (WKYS), `94.7 MHz` (WIAD), `95.5 MHz` (WPGC), and `96.3 MHz` (WHUR).
+*   **Adelic Langevin Optimization**: Fits aircraft 3D trajectories $[x, y, z, v_x, v_y, v_z]^T$ using stochastic gradient descent in the Adelic Continuous Ring space. It maps coordinate variables into $p$-adic integers using the Monna map and leverages p-adic distance and Vladimirov fractional derivatives to execute "Adelic Jumps" (branch tunneling) that hop over local minima in the cost landscape.
+*   **Čech Cohomology Filtering**: Suppresses ghost target intersections. In a dense transmitter network, intersecting range-Doppler bistatic ellipses can generate false target detections. The tracking bank computes a Čech complex cycle obstruction:
+    $$
+    E = \sum_{j} \min_{k} \left| f_{D,j} - f_{peak,j,k} \right|
+    $$
+    representing the cumulative Doppler error across towers. Detections exceeding $300.0 \text{ Hz}$ in topological discrepancy are pruned.
+*   **Fractional Delay Filtering**: Achieves sub-sample delay resolution using the Fourier Shift Theorem in the frequency domain. By applying a linear phase shift of $e^{j 2\pi f \tau}$ directly to the spectrum, we interpolate signal correlation at fractional sample delay $\tau$.
+*   **Filtered Backprojection Tomography**: Performs ISAR and orbital tomographic reconstructions. Slices are filtered in the frequency domain using a Ram-Lak (ramp) filter $H(f) = |f|$ before being backprojected and linearly interpolated onto a spatial grid.
+*   **Zero-Allocation Real-time Loop**: Minimizes garbage collection and memory allocator lock contention. Strategies include decimation buffer swapping via `std::mem::take`, main-thread sequential pre-allocation of multithreaded Rayon matrices, and struct-level reuse of scratch vectors in the FFT and wavelet engines.
 
-## Terminal Controls
+For detailed mathematical derivations and equations, see [docs/math.md](docs/math.md).
 
-- **Up/Down Arrows**: Select different targets in the tracking bank to inspect their EKF states and Jet Engine Modulation spectra.
-- **ESC**: Deselect target.
-- **L**: Toggle System Logs panel.
-- **T**: Toggle Active Towers panel.
-- **W**: Toggle Waterfall panel.
-- **R**: Toggle Tactical Records panel.
-- **U**: Toggle showing Suspect (unconfirmed) tracks.
-
-## Architecture
-
-The system is decoupled into isolated threads to prevent UI rendering from blocking the strict DSP deadlines:
-1. **SDR Ingest & Recycler**: Continuously pulls raw IQ blocks from hardware using a zero-allocation buffer pool.
-2. **DSP Pipeline**:
-   - Digital Down Conversion (DDC) and complex rotating phasor downsampling.
-   - SIMD FIR Decimation.
-   - NLMS Clutter Cancellation (Direct path / multipath rejection).
-   - GPU-accelerated or multithreaded Zero-Allocation Cross-Ambiguity Function (CAF).
-3. **Tracking & EKF**: Extracts peaks from the CAF matrix, filters ghost/mirror tracks via Čech obstruction checks, and updates the EKF state.
-4. **TUI & Web HUD Stream**: Feeds terminal rendering widgets and broadcasts telemetry JSONs over WebSockets.
-
+For step-by-step physical optimization, see [docs/setup.md](docs/setup.md).
