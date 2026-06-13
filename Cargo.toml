@@ -10,7 +10,7 @@ soapysdr = "0.4.0"
 ratatui = "0.26.1"
 crossterm = "0.27.0"
 serde = { version = "1.0.200", features = ["derive"] }
-serde_json = "1.0.120"
+serde_json = { version = "1.0.120", features = ["preserve_order"] }
 chrono = { version = "0.4.38", features = ["serde"] }
 rand = "0.8.5"
 rand_distr = "0.4.3"

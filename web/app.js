@@ -22,6 +22,19 @@ let selectedTargetId = null;
 
 // DOM Elements
 const statusEl = document.getElementById("sys-status");
+// Phase 3 & 4 Controls & Displays
+const cicModeSelect = document.getElementById("cic-mode-select");
+const stareModeToggle = document.getElementById("stare-mode-toggle");
+const stareXEl = document.getElementById("stare-x");
+const stareYEl = document.getElementById("stare-y");
+const stareZEl = document.getElementById("stare-z");
+const ghostMicToggle = document.getElementById("ghost-mic-toggle");
+const ghostMicGain = document.getElementById("ghost-mic-gain");
+const ghostMicGainVal = document.getElementById("ghost-mic-gain-val");
+const cepstrumCanvas = document.getElementById("cepstrum-scope");
+const cepstrumCtx = cepstrumCanvas ? cepstrumCanvas.getContext("2d") : null;
+const respirationEl = document.getElementById("telemetry-respiration");
+const payloadEl = document.getElementById("telemetry-payload");
 const clippingEl = document.getElementById("sys-clipping");
 const cancellationEl = document.getElementById("sys-cancellation");
 const ellipsesEl = document.getElementById("sys-ellipses");
@@ -90,6 +103,7 @@ function addLog(text, type = "system-msg") {
 function connect() {
     addLog(`Establishing connection to Rust server on ${wsUrl}...`, "system-msg");
     ws = new WebSocket(wsUrl);
+    ws.binaryType = "arraybuffer";
 
     ws.onopen = () => {
         statusEl.innerText = "CONNECTED";
@@ -102,6 +116,28 @@ function connect() {
     };
 
     ws.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+            const int16View = new Int16Array(event.data);
+            const floatData = new Float32Array(int16View.length);
+            for (let i = 0; i < int16View.length; i++) {
+                floatData[i] = int16View[i] / 32768.0;
+            }
+            playAudioChunk(floatData);
+            return;
+        }
+
+        if (typeof Blob !== "undefined" && event.data instanceof Blob) {
+            event.data.arrayBuffer().then(buf => {
+                const int16View = new Int16Array(buf);
+                const floatData = new Float32Array(int16View.length);
+                for (let i = 0; i < int16View.length; i++) {
+                    floatData[i] = int16View[i] / 32768.0;
+                }
+                playAudioChunk(floatData);
+            });
+            return;
+        }
+
         try {
             const data = JSON.parse(event.data);
             if (data.targets === undefined && data.waterfall_row === undefined) {
@@ -386,6 +422,36 @@ function handleTelemetry(data) {
     }
 
     // Render components
+    const selTarget = targets.find(t => t.id === selectedTargetId);
+    if (selTarget) {
+        if (cicModeSelect && document.activeElement !== cicModeSelect) {
+            cicModeSelect.value = selTarget.cic_mode || "Seismic";
+        }
+        if (stareModeToggle && document.activeElement !== stareModeToggle) {
+            stareModeToggle.checked = !!selTarget.stare_mode_active;
+        }
+        if (stareXEl && document.activeElement !== stareXEl) {
+            stareXEl.value = (selTarget.pos_enu && selTarget.pos_enu[0] !== undefined) ? selTarget.pos_enu[0].toFixed(1) : 0;
+        }
+        if (stareYEl && document.activeElement !== stareYEl) {
+            stareYEl.value = (selTarget.pos_enu && selTarget.pos_enu[1] !== undefined) ? selTarget.pos_enu[1].toFixed(1) : 0;
+        }
+        if (stareZEl && document.activeElement !== stareZEl) {
+            stareZEl.value = (selTarget.pos_enu && selTarget.pos_enu[2] !== undefined) ? selTarget.pos_enu[2].toFixed(1) : 0;
+        }
+        if (respirationEl) {
+            respirationEl.innerText = (selTarget.respiration_rate !== undefined && selTarget.respiration_rate !== null)
+                ? `${selTarget.respiration_rate.toFixed(2)} Hz`
+                : "N/A";
+        }
+        if (payloadEl) {
+            payloadEl.innerText = selTarget.payload_class || "N/A";
+        }
+    } else {
+        if (respirationEl) respirationEl.innerText = "N/A";
+        if (payloadEl) payloadEl.innerText = "N/A";
+    }
+
     updateTelemetryTable();
     drawWaterfallRow();
 
@@ -525,6 +591,11 @@ function resizeCanvases() {
         const mParent = multipathCanvas.parentElement;
         multipathCanvas.width = mParent.clientWidth;
         multipathCanvas.height = mParent.clientHeight;
+    }
+    if (cepstrumCanvas) {
+        const cParent = cepstrumCanvas.parentElement;
+        cepstrumCanvas.width = cParent.clientWidth;
+        cepstrumCanvas.height = cParent.clientHeight;
     }
 }
 window.addEventListener("resize", resizeCanvases);
@@ -1946,6 +2017,32 @@ function resumeAudio() {
 window.addEventListener("click", resumeAudio);
 window.addEventListener("keydown", resumeAudio);
 
+let nextPlayTime = 0;
+
+function playAudioChunk(float32Array) {
+    if (!audioCtx) return;
+    if (audioCtx.state === "suspended") return;
+    const sampleRate = 8000; // 8 kHz for Ghost Mic Acoustic PCM
+    try {
+        const buffer = audioCtx.createBuffer(1, float32Array.length, sampleRate);
+        const channelData = buffer.getChannelData(0);
+        channelData.set(float32Array);
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(masterCompressor || audioCtx.destination);
+
+        const now = audioCtx.currentTime;
+        if (nextPlayTime < now || nextPlayTime - now > 0.5) {
+            nextPlayTime = now;
+        }
+        source.start(nextPlayTime);
+        nextPlayTime += buffer.duration;
+    } catch (e) {
+        console.error("Error playing audio chunk:", e);
+    }
+}
+
 function playDopplerBeep(freq) {
     if (!audioCtx || audioCtx.state === "suspended") return;
     try {
@@ -2183,6 +2280,189 @@ drawRadarScope();
 draw3DElevation();
 drawJEMSpectrum();
 drawAntennaAligner();
+
+// Phase 3 & 4: Cepstrum Scope draw loop
+function drawCepstrumScope() {
+    requestAnimationFrame(drawCepstrumScope);
+
+    if (!cepstrumCanvas || !cepstrumCtx) return;
+    const w = cepstrumCanvas.width;
+    const h = cepstrumCanvas.height;
+    if (w === 0 || h === 0) return;
+
+    cepstrumCtx.fillStyle = "rgba(3, 9, 20, 0.45)";
+    cepstrumCtx.fillRect(0, 0, w, h);
+
+    if (selectedTargetId === null) {
+        cepstrumCtx.fillStyle = "rgba(178, 235, 242, 0.4)";
+        cepstrumCtx.font = "12px Share Tech Mono";
+        cepstrumCtx.textAlign = "center";
+        cepstrumCtx.textBaseline = "middle";
+        cepstrumCtx.fillText("SELECT A TARGET TO VIEW CEPSTRUM & PHASE", w / 2, h / 2);
+        return;
+    }
+
+    const t = targets.find(target => target.id === selectedTargetId);
+    if (!t) {
+        cepstrumCtx.fillStyle = "rgba(178, 235, 242, 0.4)";
+        cepstrumCtx.font = "12px Share Tech Mono";
+        cepstrumCtx.textAlign = "center";
+        cepstrumCtx.textBaseline = "middle";
+        cepstrumCtx.fillText("TARGET NOT FOUND", w / 2, h / 2);
+        return;
+    }
+
+    const cep = t.cepstrum || [];
+    const ph = t.unwrapped_phase || [];
+
+    if (cep.length === 0 && ph.length === 0) {
+        cepstrumCtx.fillStyle = "rgba(178, 235, 242, 0.4)";
+        cepstrumCtx.font = "12px Share Tech Mono";
+        cepstrumCtx.textAlign = "center";
+        cepstrumCtx.textBaseline = "middle";
+        cepstrumCtx.fillText("NO CEPSTRUM/PHASE DATA", w / 2, h / 2);
+        return;
+    }
+
+    const padding = 20;
+    const drawWidth = w - 2 * padding;
+    const drawHeight = h - 2 * padding;
+
+    // Draw grid lines
+    cepstrumCtx.strokeStyle = "rgba(0, 229, 255, 0.05)";
+    cepstrumCtx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) {
+        // Horizontal grid
+        const y = padding + (i / 4) * drawHeight;
+        cepstrumCtx.beginPath();
+        cepstrumCtx.moveTo(padding, y);
+        cepstrumCtx.lineTo(w - padding, y);
+        cepstrumCtx.stroke();
+
+        // Vertical grid
+        const x = padding + (i / 4) * drawWidth;
+        cepstrumCtx.beginPath();
+        cepstrumCtx.moveTo(x, padding);
+        cepstrumCtx.lineTo(x, h - padding);
+        cepstrumCtx.stroke();
+    }
+
+    function drawDataset(data, color, label, isPhase) {
+        if (data.length < 2) return;
+        
+        let minVal = data[0];
+        let maxVal = data[0];
+        for (let i = 1; i < data.length; i++) {
+            if (data[i] < minVal) minVal = data[i];
+            if (data[i] > maxVal) maxVal = data[i];
+        }
+
+        const valRange = (maxVal - minVal) || 1.0;
+
+        cepstrumCtx.strokeStyle = color;
+        cepstrumCtx.lineWidth = 1.5;
+        cepstrumCtx.beginPath();
+
+        for (let i = 0; i < data.length; i++) {
+            const x = padding + (i / (data.length - 1)) * drawWidth;
+            const normVal = (data[i] - minVal) / valRange;
+            const y = h - padding - normVal * drawHeight;
+            if (i === 0) {
+                cepstrumCtx.moveTo(x, y);
+            } else {
+                cepstrumCtx.lineTo(x, y);
+            }
+        }
+        cepstrumCtx.stroke();
+
+        cepstrumCtx.fillStyle = color;
+        cepstrumCtx.font = "9px Share Tech Mono";
+        cepstrumCtx.textAlign = isPhase ? "left" : "right";
+        const labelY = padding + (isPhase ? 10 : 22);
+        const labelX = isPhase ? padding + 10 : w - padding - 10;
+        cepstrumCtx.fillText(`${label}: [${minVal.toFixed(1)}, ${maxVal.toFixed(1)}]`, labelX, labelY);
+    }
+
+    drawDataset(ph, "rgba(0, 230, 118, 0.85)", "PHASE (unwrap)", true);
+    drawDataset(cep, "rgba(0, 229, 255, 0.85)", "CEPSTRUM", false);
+}
+
+drawCepstrumScope();
+
+// Phase 3 & 4 Event Handlers
+if (cicModeSelect) {
+    cicModeSelect.addEventListener("change", (e) => {
+        const selectValue = e.target.value;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                command: "set_cic_mode",
+                target_id: selectedTargetId,
+                mode: selectValue
+            }));
+        }
+    });
+}
+
+function sendStareModeCommand() {
+    if (selectedTargetId === null) return;
+    const checkboxState = stareModeToggle ? stareModeToggle.checked : false;
+    const x = parseFloat(stareXEl ? stareXEl.value : 0) || 0.0;
+    const y = parseFloat(stareYEl ? stareYEl.value : 0) || 0.0;
+    const z = parseFloat(stareZEl ? stareZEl.value : 0) || 0.0;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            command: "SetStareMode",
+            target_id: selectedTargetId,
+            coords: [x, y, z],
+            enabled: checkboxState
+        }));
+    }
+}
+
+if (stareModeToggle) {
+    stareModeToggle.addEventListener("change", sendStareModeCommand);
+}
+if (stareXEl) stareXEl.addEventListener("input", sendStareModeCommand);
+if (stareYEl) stareYEl.addEventListener("input", sendStareModeCommand);
+if (stareZEl) stareZEl.addEventListener("input", sendStareModeCommand);
+
+if (ghostMicToggle) {
+    ghostMicToggle.addEventListener("change", (e) => {
+        const checkboxState = e.target.checked;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                command: "SetOmniMode",
+                mode: "GhostMic",
+                enabled: checkboxState
+            }));
+            ws.send(JSON.stringify({
+                command: "StartAudioStreaming"
+            }));
+            if (selectedTargetId !== null) {
+                ws.send(JSON.stringify({
+                    command: "toggle_ghost_mic",
+                    target_id: selectedTargetId,
+                    enabled: checkboxState
+                }));
+            }
+        }
+    });
+}
+
+if (ghostMicGain) {
+    ghostMicGain.addEventListener("input", (e) => {
+        const sliderValue = parseFloat(e.target.value);
+        if (ghostMicGainVal) {
+            ghostMicGainVal.innerText = sliderValue.toFixed(1);
+        }
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                command: "SetGhostMicGain",
+                gain: sliderValue
+            }));
+        }
+    });
+}
 
 // Tab navigation logic
 document.querySelectorAll(".tab-btn").forEach(btn => {

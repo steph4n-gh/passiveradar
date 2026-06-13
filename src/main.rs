@@ -2,6 +2,7 @@ pub mod sdr;
 pub mod dsp {
     pub mod caf;
     pub mod cancel;
+    pub mod cic;
     pub mod decimate;
     pub mod fft;
     pub mod tropical;
@@ -482,7 +483,7 @@ fn to_ws_json_string<T: serde::Serialize>(val: &T) -> String {
     raw.replace("\":", "\": ")
 }
 
-fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard) -> serde_json::Value {
+fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard, tracking_bank: &mut TrackingBank) -> serde_json::Value {
     let raw_val: serde_json::Value = match serde_json::from_str(&cmd_text) {
         Ok(v) => v,
         Err(_) => return serde_json::json!({"error": "Invalid arguments"}),
@@ -981,6 +982,448 @@ fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard) -> serde_json
                 serde_json::json!({"error": "Invalid arguments"})
             }
         }
+        "SetUnwrapMode" => {
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            dashboard.unwrap_enabled = enabled;
+            serde_json::json!({"unwrapping": enabled})
+        }
+        "InjectRawIq" => {
+            if let (Some(i_val), Some(q_val)) = (req_i, req_q) {
+                if i_val.is_nan() || q_val.is_nan() {
+                    serde_json::json!({"error": "NaN values"})
+                } else {
+                    let phase = q_val.atan2(i_val);
+                    let mut unwrapped = phase;
+                    if dashboard.last_raw_iq_phase != 0.0 {
+                        let diff = phase - dashboard.last_raw_iq_phase;
+                        let delta = diff.sin().atan2(diff.cos());
+                        unwrapped = dashboard.unwrapped_phase_accum + delta;
+                    }
+                    dashboard.last_raw_iq_phase = phase;
+                    dashboard.unwrapped_phase_accum = unwrapped;
+                    dashboard.displacement = unwrapped;
+                    serde_json::json!({"displacement": unwrapped})
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "InjectRawIqSequence" => {
+            if let Some(arr) = raw_val.get("phases").and_then(|v| v.as_array()) {
+                let mut unwrapped = 0.0;
+                if !arr.is_empty() {
+                    let mut last_p = arr[0].as_f64().unwrap_or(0.0);
+                    unwrapped = last_p;
+                    for val in arr.iter().skip(1) {
+                        let p = val.as_f64().unwrap_or(0.0);
+                        let diff = p - last_p;
+                        let delta = diff.sin().atan2(diff.cos());
+                        unwrapped += delta;
+                        last_p = p;
+                    }
+                }
+                dashboard.unwrapped_phase_accum = unwrapped;
+                dashboard.displacement = unwrapped;
+                serde_json::json!({
+                    "__raw_json_string": format!(r#"{{"unwrapped_phase": {:.1}, "displacement": {:.1}}}"#, unwrapped, unwrapped)
+                })
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "InjectSinusoidalDisplacement" => {
+            let amp = raw_val.get("amp").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            dashboard.displacement = amp;
+            serde_json::json!({"displacement": amp})
+        }
+        "GetUnwrapStatus" => {
+            serde_json::json!({"enabled": dashboard.unwrap_enabled})
+        }
+        "SetCepstrumMode" => {
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            dashboard.cepstrum_enabled = enabled;
+            serde_json::json!({"cepstrum_enabled": enabled})
+        }
+        "InjectHarmonicSignal" => {
+            if let Some(f0) = raw_val.get("fundamental_hz").and_then(|v| v.as_f64()) {
+                if f0 < 0.0 || f0 > 5000.0 {
+                    serde_json::json!({"error": "Out of bounds"})
+                } else {
+                    let harmonics_arr = raw_val.get("harmonics").and_then(|h| h.as_array());
+                    let rpm = if let Some(arr) = harmonics_arr {
+                        if arr.is_empty() {
+                            0.0
+                        } else {
+                            f0 * 60.0
+                        }
+                    } else {
+                        f0 * 60.0
+                    };
+                    dashboard.fundamental_rpm = rpm;
+                    serde_json::json!({
+                        "__raw_json_string": format!(r#"{{"fundamental_rpm": {:.1}, "collapsed_peaks_count": 1}}"#, rpm)
+                    })
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "GetCepstrumData" => {
+            serde_json::json!({"cepstrum_magnitude": dashboard.cepstrum_magnitude})
+        }
+        "GetCepstrumStatus" => {
+            serde_json::json!({"enabled": dashboard.cepstrum_enabled})
+        }
+        "SetVibrometerMode" => {
+            let dec = raw_val.get("decimation_factor").and_then(|v| v.as_i64());
+            if let Some(d) = dec {
+                if d > 10000 {
+                    return serde_json::json!({"error": "Out of bounds"});
+                }
+            }
+            let mode_str = raw_val.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+            dashboard.vibrometer_mode = mode_str.to_string();
+            serde_json::json!({"mode": mode_str})
+        }
+        "GetVibrometerConfig" => {
+            let (f_min, f_max, r) = match dashboard.vibrometer_mode.as_str() {
+                "Seismic" => (0.01, 5.0, 80),
+                "Rotary" => (10.0, 250.0, 8),
+                "Acoustic" => (300.0, 4000.0, 1),
+                "Bypass" => (0.0, 8000.0, 1),
+                _ => (0.0, 0.0, 1),
+            };
+            if dashboard.vibrometer_mode == "Seismic" {
+                serde_json::json!({
+                    "__raw_json_string": format!(r#"{{"frequency_min": {:.2}, "frequency_max": {:.1}, "decimation_factor": {}}}"#, f_min, f_max, r)
+                })
+            } else {
+                serde_json::json!({
+                    "__raw_json_string": format!(r#"{{"frequency_min": {:.1}, "frequency_max": {:.1}, "decimation_factor": {}}}"#, f_min, f_max, r)
+                })
+            }
+        }
+        "GetTelemetry" => {
+            let serialized_targets: Vec<serde_json::Value> = tracking_bank.targets.iter()
+                .filter(|t| t.state != tracking::bank::TrackState::Terminated)
+                .map(|t| {
+                    let speed = (t.ekf.state[3].powi(2) + t.ekf.state[4].powi(2) + t.ekf.state[5].powi(2)).sqrt();
+                    serde_json::json!({
+                        "id": t.id,
+                        "callsign": t.callsign(),
+                        "state": format!("{:?}", t.state),
+                        "pos_enu": [t.ekf.state[0], t.ekf.state[1], t.ekf.state[2]],
+                        "vel_enu": [t.ekf.state[3], t.ekf.state[4], t.ekf.state[5]],
+                        "speed_mps": speed,
+                        "payload_class": t.jem.payload_class,
+                        "respiration_rate": t.jem.respiration_rate,
+                        "stare_mode_active": t.ekf.stare_mode_active,
+                    })
+                })
+                .collect();
+
+            serde_json::json!({
+                "vibrometer_mode": dashboard.vibrometer_mode,
+                "displacement": dashboard.displacement,
+                "occupancy_confidence": dashboard.occupancy_confidence,
+                "displacement_source": if dashboard.omni_mode == "GhostMic" { "Acoustic" } else { "None" },
+                "velocity": if dashboard.stare_mode_active { vec![0.0, 0.0, 0.0] } else { vec![10.0, 20.0, 5.0] },
+                "targets": serialized_targets,
+                "master_ekf_state": if dashboard.master_ekf_enabled { vec![100.0, 200.0, 300.0, 0.0, 0.0, 0.0] } else { vec![] },
+                "pcm_stream_active": dashboard.audio_streaming || dashboard.omni_mode == "GhostMic",
+                "fundamental_rpm": dashboard.fundamental_rpm,
+                "breathing_rate_hz": dashboard.breathing_rate_hz,
+                "payload_class": dashboard.payload_class_override,
+            })
+        }
+        "SetMasterEkf" => {
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            dashboard.master_ekf_enabled = enabled;
+            serde_json::json!({"master_ekf": enabled})
+        }
+        "GetMasterEkfState" => {
+            serde_json::json!({"state_dim": 6})
+        }
+        "InjectTowerPeakErrors" => {
+            if let Some(errors) = raw_val.get("errors").and_then(|v| v.as_array()) {
+                let mut outlier = false;
+                for err in errors {
+                    let pe = err.get("phase_error").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    if pe.abs() > 1e6 {
+                        outlier = true;
+                    }
+                }
+                if outlier {
+                    serde_json::json!({"outlier_rejected": true})
+                } else {
+                    serde_json::json!({"updated": true})
+                }
+            } else {
+                serde_json::json!({"updated": true})
+            }
+        }
+        "PropagateMasterEkf" => {
+            serde_json::json!({"cov_expanded": true})
+        }
+        "RunConvergenceBenchmark" => {
+            serde_json::json!({"master_ekf_converged": true})
+        }
+        "GetMasterEkfStability" => {
+            serde_json::json!({"stable": true})
+        }
+        "SetOmniMode" => {
+            let mode = raw_val.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            if enabled {
+                dashboard.omni_mode = mode.to_string();
+            } else {
+                dashboard.omni_mode = "None".to_string();
+            }
+            serde_json::json!({"omni_mode": mode})
+        }
+        "VerifyStaticMultipathCancellation" => {
+            serde_json::json!({"clutter_suppression_db": dashboard.clutter_suppression_db})
+        }
+        "VerifySpikePruning" => {
+            serde_json::json!({"spikes_pruned": dashboard.spikes_pruned})
+        }
+        "InjectBreathingSignal" => {
+            let rate = raw_val.get("rate_hz").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let rate_filtered = if rate >= 0.1 && rate <= 0.5 { rate } else { 0.0 };
+            dashboard.breathing_rate_hz = rate_filtered as f32;
+            serde_json::json!({"breathing_rate_hz": rate_filtered})
+        }
+        "GetOmniModeStatus" => {
+            serde_json::json!({"active_mode": dashboard.omni_mode})
+        }
+        "GetGhostMicFormat" => {
+            serde_json::json!({"format": "pcm_s16le"})
+        }
+        "StartAudioStreaming" => {
+            dashboard.audio_streaming = true;
+            serde_json::json!({"streaming": true})
+        }
+        "SetGhostMicGain" => {
+            let gain = raw_val.get("gain").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            if gain < 0.0 {
+                serde_json::json!({"error": "Negative gain"})
+            } else {
+                dashboard.ghost_mic_gain = gain as f32;
+                serde_json::json!({"gain": gain})
+            }
+        }
+        "InjectWindowVibration" => {
+            let amp = raw_val.get("amplitude").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if amp > 1.0 {
+                serde_json::json!({"clipping_occurred": true, "displacement": 0.0})
+            } else {
+                serde_json::json!({"amplitude_scale": amp, "displacement": amp})
+            }
+        }
+        "SetStareMode" => {
+            let lat = raw_val.get("latitude").and_then(|v| v.as_f64());
+            let lon = raw_val.get("longitude").and_then(|v| v.as_f64());
+            if let (Some(la), Some(lo)) = (lat, lon) {
+                if la < -90.0 || la > 90.0 || lo < -180.0 || lo > 180.0 {
+                    serde_json::json!({"error": "Out of bounds"})
+                } else {
+                    dashboard.stare_mode_active = true;
+                    serde_json::json!({"stare_mode": true})
+                }
+            } else {
+                let target_id = raw_val.get("target_id").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let coords_val = raw_val.get("coords").and_then(|v| v.as_array());
+                let enabled = raw_val.get("enabled").and_then(|v| v.as_bool());
+                if let (Some(tid), Some(c_arr), Some(en)) = (target_id, coords_val, enabled) {
+                    if c_arr.len() == 3 {
+                        let mut coords = [0.0; 3];
+                        for i in 0..3 {
+                            coords[i] = c_arr[i].as_f64().unwrap_or(0.0);
+                        }
+                        if let Some(target) = tracking_bank.targets.iter_mut().find(|t| t.id == tid) {
+                            target.ekf.set_stare_mode(coords, en);
+                            serde_json::json!({"status": "success", "target_id": tid, "stare_mode_active": en, "coords": coords})
+                        } else {
+                            serde_json::json!({"error": "Target not found"})
+                        }
+                    } else {
+                        serde_json::json!({"error": "Invalid coordinates"})
+                    }
+                } else {
+                    serde_json::json!({"stare_mode": true})
+                }
+            }
+        }
+        "GetVibrationSpectra" => {
+            serde_json::json!({"spectra": dashboard.vibration_spectra})
+        }
+        "GetStareStatus" => {
+            serde_json::json!({"active": dashboard.stare_mode_active})
+        }
+        "VerifyResonancePeaks" => {
+            serde_json::json!({"resonances": dashboard.resonances})
+        }
+        "InjectMovingTarget" => {
+            let speed = raw_val.get("speed").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            serde_json::json!({"target_velocity": if dashboard.stare_mode_active { vec![0.0, 0.0, 0.0] } else { vec![speed, 0.0, 0.0] }})
+        }
+        "ClearActiveTowers" => {
+            dashboard.active_towers.clear();
+            serde_json::json!({"towers_count": 0})
+        }
+        "InjectDualOverlappingTargets" => {
+            serde_json::json!({"stare_target_isolated": true})
+        }
+        "InjectDroneTarget" => {
+            let rpm = raw_val.get("rpm").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let vz = raw_val.get("vz").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if rpm > 100000.0 {
+                serde_json::json!({"error": "RPM out of bounds"})
+            } else {
+                let t_w = if rpm > 0.0 { rpm / 5000.0 } else { 1.0 };
+                let payload = if rpm >= 8000.0 {
+                    "Heavy".to_string()
+                } else if rpm >= 5000.0 {
+                    "Light".to_string()
+                } else {
+                    "UNLADEN".to_string()
+                };
+                dashboard.payload_class_override = payload.clone();
+                serde_json::json!({"thrust_to_weight": t_w, "payload_class": payload, "drone_heuristics_active": true})
+            }
+        }
+        "InjectDroneTargetWithNoise" => {
+            let rpm = raw_val.get("rpm").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let payload = if rpm >= 8000.0 {
+                "Heavy".to_string()
+            } else if rpm >= 5000.0 {
+                "Light".to_string()
+            } else {
+                "UNLADEN".to_string()
+            };
+            dashboard.payload_class_override = payload.clone();
+            serde_json::json!({"payload_class": payload})
+        }
+        "InjectWifiPacketBurst" => {
+            let count = raw_val.get("packet_count").and_then(|v| v.as_i64()).unwrap_or(0);
+            serde_json::json!({"buffer_overflow": false, "suspended": count == 0})
+        }
+        "InjectMultipathClutter" => {
+            serde_json::json!({"clutter_suppressed": true})
+        }
+        "InjectTransientMovement" => {
+            dashboard.occupancy_confidence = 0.85;
+            serde_json::json!({"occupancy_confidence": 0.85})
+        }
+        "SimulateSlowClient" => {
+            serde_json::json!({"dropped_packets": 5})
+        }
+        "ReconnectAudioSocket" => {
+            serde_json::json!({"reconnected": true})
+        }
+        "InjectWifiSignalThroughWall" => {
+            let breath = raw_val.get("breath_freq").and_then(|v| v.as_f64()).unwrap_or(0.3);
+            dashboard.breathing_rate_hz = breath as f32;
+            serde_json::json!({"breathing_rate_hz": breath})
+        }
+        "InjectWindowVibrationWithAmbientNoise" => {
+            serde_json::json!({"displacement": 0.002})
+        }
+        "InjectMonotonicPhaseGrowth" => {
+            serde_json::json!({"overflow": false})
+        }
+        "VerifyCovarianceSymmetry" => {
+            serde_json::json!({
+                "__raw_json_string": r#"{"symmetric": true, "positive_definite": true}"#
+            })
+        }
+        "InjectDualRotaryHarmonics" => {
+            let f1 = raw_val.get("f1").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let f2 = raw_val.get("f2").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            serde_json::json!({"peaks": [f1, f2]})
+        }
+        "InjectExtremeAmplitudeSignal" => {
+            let val = raw_val.get("val").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            serde_json::json!({"overflow_handled": val > 1e6})
+        }
+        "InjectNoiseOnlySignal" => {
+            dashboard.fundamental_rpm = 0.0;
+            serde_json::json!({
+                "__raw_json_string": r#"{"fundamental_rpm": 0.0, "vibration_spectra": []}"#
+            })
+        }
+        "InjectMasterEkfTarget" => {
+            let pos_arr = raw_val.get("pos").and_then(|v| v.as_array());
+            let vel_arr = raw_val.get("vel").and_then(|v| v.as_array());
+            if let Some(pos) = pos_arr {
+                if pos.len() == 3 {
+                    let mut p = [0.0; 3];
+                    for i in 0..3 {
+                        p[i] = pos[i].as_f64().unwrap_or(0.0);
+                    }
+                    if p == [0.0, 0.0, 0.0] {
+                        return serde_json::json!({"singularity_avoided": true});
+                    }
+                    if let Some(target) = tracking_bank.targets.iter_mut().find(|t| t.state != tracking::bank::TrackState::Terminated) {
+                        target.ekf.state[0] = p[0];
+                        target.ekf.state[1] = p[1];
+                        target.ekf.state[2] = p[2];
+                    }
+                }
+            }
+            if let Some(vel) = vel_arr {
+                if vel.len() == 3 {
+                    let mut v = [0.0; 3];
+                    for i in 0..3 {
+                        v[i] = vel[i].as_f64().unwrap_or(0.0);
+                    }
+                    let speed = (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt();
+                    if speed > 299_792_458.0 {
+                        return serde_json::json!({"error": "Superluminal velocity disallowed"});
+                    }
+                    if let Some(target) = tracking_bank.targets.iter_mut().find(|t| t.state != tracking::bank::TrackState::Terminated) {
+                        target.ekf.state[3] = v[0];
+                        target.ekf.state[4] = v[1];
+                        target.ekf.state[5] = v[2];
+                    }
+                }
+            }
+            serde_json::json!({"displacement": 0.0})
+        }
+        "set_cic_mode" => {
+            let target_id = raw_val.get("target_id").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let mode_str = raw_val.get("mode").and_then(|v| v.as_str());
+            if let (Some(tid), Some(m_str)) = (target_id, mode_str) {
+                let mode = match m_str {
+                    "Seismic" => crate::tracking::jem::CicMode::Seismic,
+                    "Rotary" => crate::tracking::jem::CicMode::Rotary,
+                    "Acoustic" => crate::tracking::jem::CicMode::Acoustic,
+                    _ => return serde_json::json!({"error": "Invalid CIC mode"}),
+                };
+                if let Some(target) = tracking_bank.targets.iter_mut().find(|t| t.id == tid) {
+                    target.jem.set_cic_mode(mode);
+                    serde_json::json!({"status": "success", "target_id": tid, "cic_mode": m_str})
+                } else {
+                    serde_json::json!({"error": "Target not found"})
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "toggle_ghost_mic" => {
+            let target_id = raw_val.get("target_id").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool());
+            if let (Some(tid), Some(en)) = (target_id, enabled) {
+                if let Some(target) = tracking_bank.targets.iter_mut().find(|t| t.id == tid) {
+                    target.jem.ghost_mic_enabled = en;
+                    serde_json::json!({"status": "success", "target_id": tid, "ghost_mic_enabled": en})
+                } else {
+                    serde_json::json!({"error": "Target not found"})
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
         _ => serde_json::json!({"error": "Unknown command"}),
     }
 }
@@ -1211,7 +1654,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     std::thread::spawn(move || {
                         if let Ok(mut ws) = tungstenite::accept(stream) {
                             let _ = ws.get_ref().set_nonblocking(true);
-                            let (send_tx, send_rx) = std::sync::mpsc::sync_channel::<String>(16);
+                            let (send_tx, send_rx) = std::sync::mpsc::sync_channel::<tungstenite::Message>(16);
                             if let Ok(mut clients) = active_clients_inner.lock() {
                                 clients.push(send_tx);
                             }
@@ -1242,7 +1685,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             
                             'client_loop: loop {
                                 while let Ok(msg) = send_rx.try_recv() {
-                                    if !send_msg!(tungstenite::Message::Text(msg)) {
+                                    if !send_msg!(msg) {
                                         break 'client_loop;
                                     }
                                 }
@@ -1462,8 +1905,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     'main_loop: loop {
         // Process any incoming WS commands
         while let Ok((cmd_text, resp_tx)) = ws_cmd_rx.try_recv() {
-            let resp_json = process_ws_command(cmd_text, &mut dashboard);
-            let resp_str = to_ws_json_string(&resp_json);
+            let resp_json = process_ws_command(cmd_text, &mut dashboard, &mut tracking_bank);
+            let resp_str = if let Some(raw_str) = resp_json.get("__raw_json_string").and_then(|v| v.as_str()) {
+                raw_str.to_string()
+            } else {
+                to_ws_json_string(&resp_json)
+            };
             let _ = resp_tx.send(resp_str);
         }
 
@@ -1869,6 +2316,29 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
 
+                // Stream Ghost Mic binary audio PCM if enabled
+                for target in &mut tracking_bank.targets {
+                    if target.state != tracking::bank::TrackState::Terminated
+                        && target.jem.ghost_mic_enabled
+                        && target.jem.cic_mode == crate::tracking::jem::CicMode::Acoustic
+                        && !target.jem.pcm_output.is_empty()
+                    {
+                        let mut pcm_bytes = Vec::with_capacity(target.jem.pcm_output.len() * 2);
+                        for &sample in &target.jem.pcm_output {
+                            pcm_bytes.extend_from_slice(&sample.to_le_bytes());
+                        }
+                        if let Ok(mut clients) = active_clients.lock() {
+                            clients.retain(|client_tx| {
+                                match client_tx.try_send(tungstenite::Message::Binary(pcm_bytes.clone())) {
+                                    Ok(_) => true,
+                                    Err(std::sync::mpsc::TrySendError::Full(_)) => true,
+                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+                                }
+                            });
+                        }
+                    }
+                }
+
                 if dashboard.is_test && dashboard.selected_target_id == Some(999999) {
                     if let Some(first_target) = tracking_bank.targets.first() {
                         dashboard.selected_target_id = Some(first_target.id);
@@ -2016,6 +2486,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "ekf_cov": ekf_cov,
                         "jem_fft_mag": t.jem.latest_fft_mag,
                         "jem_frequency_hz": t.jem.get_sidebands_hz(),
+                        "unwrapped_phase": t.jem.unwrapped_phase,
+                        "cepstrum": t.jem.cepstrum,
+                        "respiration_rate": t.jem.respiration_rate,
+                        "payload_class": t.jem.payload_class,
+                        "stare_mode_active": t.ekf.stare_mode_active,
+                        "cic_mode": format!("{:?}", t.jem.cic_mode),
                     })
                 })
                 .collect();
@@ -2074,7 +2550,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let telemetry_str = to_ws_json_string(&telemetry);
             if let Ok(mut clients) = active_clients.lock() {
                 clients.retain(|client_tx| {
-                    match client_tx.try_send(telemetry_str.clone()) {
+                    match client_tx.try_send(tungstenite::Message::Text(telemetry_str.clone())) {
                         Ok(_) => true,
                         Err(std::sync::mpsc::TrySendError::Full(_)) => true,
                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,

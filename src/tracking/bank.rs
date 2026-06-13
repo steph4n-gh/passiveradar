@@ -641,6 +641,7 @@ impl TrackingBank {
                     let pred_doppler = -(dot_t + dot_r) / lambda;
 
                     target.jem.process_block(pred_doppler, baseband_samples);
+                    target.jem.update_heuristics(vz, dt);
                 }
             }
         }

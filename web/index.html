@@ -147,6 +147,35 @@
                                 <span id="antenna-heading-val" class="control-val">0°</span>
                             </div>
                             <div class="control-row">
+                                <label for="cic-mode-select">CIC MODE:</label>
+                                <select id="cic-mode-select" style="background: rgba(0,5,15,0.6); border: 1px solid var(--border-color); color: var(--text-color); font-family: inherit; font-size: 11px; padding: 2px 4px; outline: none; border-radius: 3px;">
+                                    <option value="Seismic">Seismic Mode</option>
+                                    <option value="Rotary">Rotary Mode</option>
+                                    <option value="Acoustic">Acoustic Mode</option>
+                                </select>
+                            </div>
+                            <div class="control-row">
+                                <label for="stare-mode-toggle">STARE MODE:</label>
+                                <input type="checkbox" id="stare-mode-toggle">
+                            </div>
+                            <div class="control-row">
+                                <label>STARE COORDS (X/Y/Z):</label>
+                                <div style="display: flex; gap: 4px; align-items: center;">
+                                    <input type="number" id="stare-x" value="0.0" step="0.1" style="width: 55px; background: rgba(0,5,15,0.6); border: 1px solid var(--border-color); color: var(--text-color); font-family: inherit; font-size: 11px; padding: 2px 4px; text-align: center; border-radius: 3px;">
+                                    <input type="number" id="stare-y" value="0.0" step="0.1" style="width: 55px; background: rgba(0,5,15,0.6); border: 1px solid var(--border-color); color: var(--text-color); font-family: inherit; font-size: 11px; padding: 2px 4px; text-align: center; border-radius: 3px;">
+                                    <input type="number" id="stare-z" value="0.0" step="0.1" style="width: 55px; background: rgba(0,5,15,0.6); border: 1px solid var(--border-color); color: var(--text-color); font-family: inherit; font-size: 11px; padding: 2px 4px; text-align: center; border-radius: 3px;">
+                                </div>
+                            </div>
+                            <div class="control-row">
+                                <label for="ghost-mic-toggle">GHOST MIC:</label>
+                                <input type="checkbox" id="ghost-mic-toggle">
+                            </div>
+                            <div class="control-row">
+                                <label for="ghost-mic-gain">GHOST MIC GAIN:</label>
+                                <input type="range" id="ghost-mic-gain" min="0.1" max="10.0" step="0.1" value="1.0">
+                                <span id="ghost-mic-gain-val" class="control-val">1.0</span>
+                            </div>
+                            <div class="control-row">
                                 <button id="ellipse-toggle-btn" class="hud-btn">TOGGLE ELLIPSE MODE</button>
                             </div>
                         </div>
@@ -222,6 +251,16 @@
                         </div>
                         <div class="canvas-container">
                             <canvas id="jem-spectrum"></canvas>
+                        </div>
+                    </section>
+                    <section class="panel-cepstrum glass-panel">
+                        <div class="panel-header">CEPSTRUM &amp; PHASE ANALYSIS</div>
+                        <div class="panel-status-bar" style="display: flex; justify-content: space-between; padding: 6px 10px; font-family: 'Share Tech Mono', monospace; font-size: 11px; background: rgba(0, 5, 15, 0.4); border-bottom: 1px solid rgba(0, 229, 255, 0.1);">
+                            <div>RESPIRATION: <span id="telemetry-respiration" style="color: var(--accent-green); font-weight: bold;">N/A</span></div>
+                            <div>PAYLOAD: <span id="telemetry-payload" style="color: var(--accent-cyan); font-weight: bold;">N/A</span></div>
+                        </div>
+                        <div class="canvas-container">
+                            <canvas id="cepstrum-scope"></canvas>
                         </div>
                     </section>
                     <section class="panel-events glass-panel">

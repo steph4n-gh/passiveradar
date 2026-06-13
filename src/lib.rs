@@ -3,6 +3,7 @@ pub mod sdr;
 pub mod dsp {
     pub mod caf;
     pub mod cancel;
+    pub mod cic;
     pub mod decimate;
     pub mod fft;
     pub mod tropical;
