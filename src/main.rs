@@ -418,10 +418,11 @@ fn handle_key_code(
     }
 }
 
-fn start_web_server(host: &str, port: u16) {
+fn start_web_server(host: &str, port: u16, ws_host: &str, ws_port: u16) {
     use std::io::{Read, Write};
     use std::fs;
     let host = host.to_string();
+    let ws_host = ws_host.to_string();
     std::thread::spawn(move || {
         let addr = format!("{}:{}", host, port);
         if let Ok(listener) = std::net::TcpListener::bind(&addr) {
@@ -441,6 +442,22 @@ fn start_web_server(host: &str, port: u16) {
                                 path = &path[..pos];
                             }
                             let path = path.trim_start_matches('/');
+                            
+                            // Serve dynamic config if requested
+                            if path == "config" || path == "config.json" {
+                                let body = format!(
+                                    r#"{{"ws_host": "{}", "ws_port": {}}}"#,
+                                    ws_host, ws_port
+                                );
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(response.as_bytes());
+                                continue;
+                            }
+
                             let safe_path = std::path::Path::new("web").join(path);
                             let mut served = false;
                             if safe_path.exists() {
@@ -1642,7 +1659,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Web HUD Static Files Server
     let web_port = args.web_port;
     let web_host = args.host.clone();
-    start_web_server(&web_host, web_port);
+    start_web_server(&web_host, web_port, &ws_host, ws_port);
     
     std::thread::spawn(move || {
         let addr = format!("{}:{}", ws_host, ws_port);

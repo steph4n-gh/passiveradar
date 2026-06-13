@@ -1,11 +1,37 @@
 // Tactical Radar Companion Script
 // Parse dynamic host/port from URL query params (useful for custom ports or remote HUD hosts)
 const urlParams = new URLSearchParams(window.location.search);
-const wsHost = urlParams.get("host") || window.location.hostname || "127.0.0.1";
-const wsPort = urlParams.get("port") || "8085";
-const wsUrl = `ws://${wsHost}:${wsPort}`;
+let wsHost = urlParams.get("host") || window.location.hostname || "127.0.0.1";
+if (wsHost === "localhost" || wsHost === "[::1]") {
+    wsHost = "127.0.0.1";
+}
+let wsPort = urlParams.get("port") || "8085";
+let wsUrl = `ws://${wsHost}:${wsPort}`;
 let ws = null;
 let reconnectTimer = null;
+
+async function initConnection() {
+    try {
+        const response = await fetch("/config");
+        if (response.ok) {
+            const config = await response.json();
+            let resolvedHost = config.ws_host || "127.0.0.1";
+            if (resolvedHost === "localhost" || resolvedHost === "[::1]" || resolvedHost === "0.0.0.0") {
+                resolvedHost = window.location.hostname || "127.0.0.1";
+                if (resolvedHost === "localhost" || resolvedHost === "[::1]") {
+                    resolvedHost = "127.0.0.1";
+                }
+            }
+            const resolvedPort = config.ws_port || "8085";
+            const finalHost = urlParams.get("host") || resolvedHost;
+            const finalPort = urlParams.get("port") || resolvedPort;
+            wsUrl = `ws://${finalHost}:${finalPort}`;
+        }
+    } catch (e) {
+        console.log("Could not fetch /config, using default connection settings", e);
+    }
+    connect();
+}
 
 // TUI states mirrored
 let systemStatus = "OFFLINE";
@@ -1930,7 +1956,7 @@ function drawAntennaAligner() {
 
 // Initialization
 resizeCanvases();
-connect();
+initConnection();
 
 // Global states
 let centerFreq = 90.9e6;
