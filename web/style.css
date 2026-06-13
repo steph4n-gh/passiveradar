@@ -190,7 +190,11 @@ body {
     flex-direction: column;
 }
 
-.panel-telemetry { flex: 1.2; }
+.panel-telemetry {
+    flex: 1.2;
+    min-height: 240px;
+    max-height: 320px;
+}
 .panel-controls { flex: 0; min-height: fit-content; }
 .panel-records { flex: 0; min-height: fit-content; }
 
