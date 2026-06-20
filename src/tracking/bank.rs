@@ -125,32 +125,34 @@ pub fn compute_measurement_jacobian(
     let r_t = (dx * dx + dy * dy + dz * dz).sqrt().max(1.0);
     let r_r = (x * x + y * y + z * z).sqrt().max(1.0);
 
-    let dot_t = (vx * dx + vy * dy + vz * dz) / r_t;
-    let dot_r = (vx * x + vy * y + vz * z) / r_r;
+    let r_t_sq = r_t * r_t;
+    let r_t_cubed = r_t_sq * r_t;
+    let r_r_sq = r_r * r_r;
+    let r_r_cubed = r_r_sq * r_r;
+
+    let r_t_inv3 = 1.0 / r_t_cubed;
+    let r_r_inv3 = 1.0 / r_r_cubed;
+    let r_t_inv = r_t_sq * r_t_inv3;
+    let r_r_inv = r_r_sq * r_r_inv3;
+
+    let dot_t = (vx * dx + vy * dy + vz * dz) * r_t_inv;
+    let dot_r = (vx * x + vy * y + vz * z) * r_r_inv;
     let range_rate_pred = dot_t + dot_r;
 
     let lambda = crate::sdr::C / fc;
     let z_pred = -range_rate_pred / lambda;
 
-    let dr_dvx = dx / r_t + x / r_r;
-    let dr_dvy = dy / r_t + y / r_r;
-    let dr_dvz = dz / r_t + z / r_r;
+    let dr_dvx = dx * r_t_inv + x * r_r_inv;
+    let dr_dvy = dy * r_t_inv + y * r_r_inv;
+    let dr_dvz = dz * r_t_inv + z * r_r_inv;
 
-    let d_t_x = vx * (r_t.powi(2) - dx * dx) / r_t.powi(3)
-        - vy * (dx * dy) / r_t.powi(3)
-        - vz * (dx * dz) / r_t.powi(3);
-    let d_t_y = -vx * (dx * dy) / r_t.powi(3) + vy * (r_t.powi(2) - dy * dy) / r_t.powi(3)
-        - vz * (dy * dz) / r_t.powi(3);
-    let d_t_z = -vx * (dx * dz) / r_t.powi(3) - vy * (dy * dz) / r_t.powi(3)
-        + vz * (r_t.powi(2) - dz * dz) / r_t.powi(3);
+    let d_t_x = (vx * (r_t_sq - dx * dx) - vy * (dx * dy) - vz * (dx * dz)) * r_t_inv3;
+    let d_t_y = (-vx * (dx * dy) + vy * (r_t_sq - dy * dy) - vz * (dy * dz)) * r_t_inv3;
+    let d_t_z = (-vx * (dx * dz) - vy * (dy * dz) + vz * (r_t_sq - dz * dz)) * r_t_inv3;
 
-    let d_r_x = vx * (r_r.powi(2) - x * x) / r_r.powi(3)
-        - vy * (x * y) / r_r.powi(3)
-        - vz * (x * z) / r_r.powi(3);
-    let d_r_y = -vx * (x * y) / r_r.powi(3) + vy * (r_r.powi(2) - y * y) / r_r.powi(3)
-        - vz * (y * z) / r_r.powi(3);
-    let d_r_z = -vx * (x * z) / r_r.powi(3) - vy * (y * z) / r_r.powi(3)
-        + vz * (r_r.powi(2) - z * z) / r_r.powi(3);
+    let d_r_x = (vx * (r_r_sq - x * x) - vy * (x * y) - vz * (x * z)) * r_r_inv3;
+    let d_r_y = (-vx * (x * y) + vy * (r_r_sq - y * y) - vz * (y * z)) * r_r_inv3;
+    let d_r_z = (-vx * (x * z) - vy * (y * z) + vz * (r_r_sq - z * z)) * r_r_inv3;
 
     let dr_dx = d_t_x + d_r_x;
     let dr_dy = d_t_y + d_r_y;

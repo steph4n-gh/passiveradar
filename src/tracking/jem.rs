@@ -69,30 +69,42 @@ impl JemAnalyzer {
         }
         self.phase = next_phase;
 
-        // 2. Simple FIR Low-Pass Filter (cutoff 150 Hz) and decimate by 8
-        let taps = [
-            0.0076, 0.0177, 0.0384, 0.0681, 0.1018, 0.1312, 0.1486, 0.1486, 0.1312, 0.1018, 0.0681,
-            0.0384, 0.0177, 0.0076,
-        ];
-
         self.fir_history.extend_from_slice(&mixed);
 
         let mut decimated = Vec::new();
         let mut next_compute_idx = 0;
         // Compute filter every 8 samples
         for i in (0..self.fir_history.len()).step_by(8) {
-            if i + taps.len() <= self.fir_history.len() {
-                let mut acc = Complex::new(0.0, 0.0);
-                for (j, &tap) in taps.iter().enumerate() {
-                    acc += self.fir_history[i + j] * tap;
-                }
+            if i + 14 <= self.fir_history.len() {
+                let acc = self.fir_history[i] * 0.0076
+                    + self.fir_history[i + 1] * 0.0177
+                    + self.fir_history[i + 2] * 0.0384
+                    + self.fir_history[i + 3] * 0.0681
+                    + self.fir_history[i + 4] * 0.1018
+                    + self.fir_history[i + 5] * 0.1312
+                    + self.fir_history[i + 6] * 0.1486
+                    + self.fir_history[i + 7] * 0.1486
+                    + self.fir_history[i + 8] * 0.1312
+                    + self.fir_history[i + 9] * 0.1018
+                    + self.fir_history[i + 10] * 0.0681
+                    + self.fir_history[i + 11] * 0.0384
+                    + self.fir_history[i + 12] * 0.0177
+                    + self.fir_history[i + 13] * 0.0076;
                 decimated.push(acc);
                 next_compute_idx = i + 8;
             }
         }
 
         if next_compute_idx > 0 {
-            self.fir_history.drain(0..next_compute_idx);
+            let remaining = self.fir_history.len() - next_compute_idx;
+            unsafe {
+                std::ptr::copy(
+                    self.fir_history.as_ptr().add(next_compute_idx),
+                    self.fir_history.as_mut_ptr(),
+                    remaining,
+                );
+            }
+            self.fir_history.truncate(remaining);
         }
 
         self.buffer.extend_from_slice(&decimated);
@@ -115,9 +127,12 @@ impl JemAnalyzer {
 
             // Compute magnitude and shift center DC to fft_size/2
             let mut mag = vec![0.0f32; self.fft_size];
-            for i in 0..self.fft_size {
-                let shift_idx = (i + self.fft_size / 2) % self.fft_size;
-                mag[shift_idx] = fft_input[i].norm();
+            let half = self.fft_size / 2;
+            for i in 0..half {
+                mag[i + half] = fft_input[i].norm();
+            }
+            for i in half..self.fft_size {
+                mag[i - half] = fft_input[i].norm();
             }
             self.latest_fft_mag = mag.clone();
             self.history.push_back(mag.clone());
