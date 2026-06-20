@@ -317,12 +317,40 @@ mod tests {
             assert!(surr_ref[i].norm() > 900.0, "Failed to capture surrogate reference");
         }
     }
+
+    #[test]
+    fn test_eca_batched_canceler_correctness() {
+        let mut canceler = EcaBatchedCanceler::new(32, 10);
+        let mut input = vec![Complex::new(0.0, 0.0); 256];
+        
+        for i in 0..256 {
+            input[i] = Complex::new((i as f32).cos(), (i as f32).sin()) * 100.0;
+        }
+        
+        for i in 0..256 {
+            input[i] += Complex::new((i as f32 * 0.15).cos(), (i as f32 * 0.15).sin()) * 2.0;
+        }
+
+        let mut output = Vec::new();
+        canceler.process_block(&input, &mut output);
+
+        assert_eq!(output.len(), 256);
+        
+        let mut sum_target = 0.0;
+        for i in 100..256 {
+            sum_target += output[i].norm();
+        }
+        let avg_target = sum_target / 156.0;
+        assert!(avg_target < 10.0, "Static clutter not suppressed, avg output norm: {}", avg_target);
+        assert!(avg_target > 0.2, "Moving target signal cancelled out, avg output norm: {}", avg_target);
+    }
 }
 
 pub struct EcaBatchedCanceler {
     num_taps: usize,
     history: Vec<Complex<f32>>,
     pub max_cg_iterations: usize,
+    gpu_state: Option<crate::dsp::gpu::GpuEcaState>,
 }
 
 impl EcaBatchedCanceler {
@@ -331,17 +359,40 @@ impl EcaBatchedCanceler {
             num_taps,
             history: vec![Complex::new(0.0, 0.0); num_taps],
             max_cg_iterations,
+            gpu_state: None,
         }
     }
 
     pub fn process_block(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
         let n_samples = input.len();
         output.clear();
-        output.resize(n_samples, Complex::new(0.0, 0.0));
         
         if n_samples == 0 {
             return;
         }
+
+        // Try GPU path
+        if let Some(pipeline) = crate::dsp::gpu::get_gpu_eca_pipeline() {
+            let state = self.gpu_state.get_or_insert_with(|| {
+                crate::dsp::gpu::GpuEcaState::new(pipeline, n_samples, self.num_taps)
+            });
+            let gpu_out = state.process_eca(pipeline, input, &self.history, self.max_cg_iterations);
+            *output = gpu_out;
+
+            if n_samples >= self.num_taps {
+                for i in 0..self.num_taps {
+                    self.history[i] = input[n_samples - self.num_taps + i];
+                }
+            } else {
+                self.history.rotate_left(n_samples);
+                for i in 0..n_samples {
+                    self.history[self.num_taps - n_samples + i] = input[i];
+                }
+            }
+            return;
+        }
+
+        output.resize(n_samples, Complex::new(0.0, 0.0));
 
         let mut w = vec![Complex::new(0.0, 0.0); self.num_taps];
         let mut r = input.to_vec(); 

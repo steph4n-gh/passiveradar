@@ -1088,3 +1088,410 @@ impl GpuIsarState {
         image
     }
 }
+
+static GPU_ECA_PIPELINE: OnceLock<Option<GpuEcaPipeline>> = OnceLock::new();
+
+pub fn get_gpu_eca_pipeline() -> Option<&'static GpuEcaPipeline> {
+    GPU_ECA_PIPELINE.get_or_init(|| {
+        let ctx = get_gpu_context()?;
+        pollster::block_on(GpuEcaPipeline::new(ctx.device.clone(), ctx.queue.clone())).ok()
+    }).as_ref()
+}
+
+pub struct GpuEcaPipeline {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub pipeline: wgpu::ComputePipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl GpuEcaPipeline {
+    pub async fn new(device: wgpu::Device, queue: wgpu::Queue) -> Result<Self, String> {
+        let shader_source = include_str!("shaders/eca.wgsl");
+        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ECA Shader Module"),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ECA Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ECA Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("ECA Compute Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader_module,
+            entry_point: Some("eca_cancel"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        Ok(Self {
+            device,
+            queue,
+            pipeline,
+            bind_group_layout,
+        })
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ShaderEcaParams {
+    pub num_taps: u32,
+    pub max_iterations: u32,
+    pub n_samples: u32,
+    pub pad: u32,
+}
+
+pub struct GpuEcaState {
+    pub params_buffer: wgpu::Buffer,
+    pub input_buffer: wgpu::Buffer,
+    pub history_buffer: wgpu::Buffer,
+    pub output_buffer: wgpu::Buffer,
+    pub r_buffer: wgpu::Buffer,
+    pub q_buffer: wgpu::Buffer,
+    pub w_buffer: wgpu::Buffer,
+    pub p_buffer: wgpu::Buffer,
+    pub s_new_buffer: wgpu::Buffer,
+    pub staging_buffer: wgpu::Buffer,
+    pub bind_group: wgpu::BindGroup,
+
+    pub n_samples: usize,
+    pub num_taps: usize,
+}
+
+impl GpuEcaState {
+    pub fn new(
+        pipeline: &GpuEcaPipeline,
+        n_samples: usize,
+        num_taps: usize,
+    ) -> Self {
+        let device = &pipeline.device;
+
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ECA Params Buffer"),
+            size: std::mem::size_of::<ShaderEcaParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let size_complex = std::mem::size_of::<[f32; 2]>() as u64;
+
+        let input_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ECA Input Buffer"),
+            size: n_samples as u64 * size_complex,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let history_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ECA History Buffer"),
+            size: num_taps as u64 * size_complex,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ECA Output Buffer"),
+            size: n_samples as u64 * size_complex,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let r_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ECA Residual Buffer"),
+            size: n_samples as u64 * size_complex,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let q_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ECA Search Direction Buffer"),
+            size: n_samples as u64 * size_complex,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let w_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ECA Weights Buffer"),
+            size: num_taps as u64 * size_complex,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let p_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ECA Conjugate Gradient P Buffer"),
+            size: num_taps as u64 * size_complex,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let s_new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ECA Gradient S_New Buffer"),
+            size: num_taps as u64 * size_complex,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ECA Staging Buffer"),
+            size: n_samples as u64 * size_complex,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ECA Bind Group"),
+            layout: &pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: input_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: history_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: output_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: r_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: q_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: w_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: p_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: s_new_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        Self {
+            params_buffer,
+            input_buffer,
+            history_buffer,
+            output_buffer,
+            r_buffer,
+            q_buffer,
+            w_buffer,
+            p_buffer,
+            s_new_buffer,
+            staging_buffer,
+            bind_group,
+            n_samples,
+            num_taps,
+        }
+    }
+
+    pub fn process_eca(
+        &mut self,
+        pipeline: &GpuEcaPipeline,
+        input: &[Complex<f32>],
+        history: &[Complex<f32>],
+        max_iterations: usize,
+    ) -> Vec<Complex<f32>> {
+        let n_samples = input.len();
+        let num_taps = history.len();
+
+        if n_samples == 0 {
+            return vec![];
+        }
+
+        if n_samples != self.n_samples || num_taps != self.num_taps {
+            *self = GpuEcaState::new(pipeline, n_samples, num_taps);
+        }
+
+        let shader_params = ShaderEcaParams {
+            num_taps: num_taps as u32,
+            max_iterations: max_iterations as u32,
+            n_samples: n_samples as u32,
+            pad: 0,
+        };
+
+        pipeline.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::bytes_of(&shader_params),
+        );
+
+        let input_flat: &[f32] = unsafe {
+            std::slice::from_raw_parts(input.as_ptr() as *const f32, input.len() * 2)
+        };
+        pipeline.queue.write_buffer(
+            &self.input_buffer,
+            0,
+            bytemuck::cast_slice(input_flat),
+        );
+
+        let history_flat: &[f32] = unsafe {
+            std::slice::from_raw_parts(history.as_ptr() as *const f32, history.len() * 2)
+        };
+        pipeline.queue.write_buffer(
+            &self.history_buffer,
+            0,
+            bytemuck::cast_slice(history_flat),
+        );
+
+        let mut encoder = pipeline.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ECA Command Encoder"),
+        });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ECA Compute Pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&pipeline.pipeline);
+            compute_pass.set_bind_group(0, &self.bind_group, &[]);
+            compute_pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        let size_complex = std::mem::size_of::<[f32; 2]>() as u64;
+        encoder.copy_buffer_to_buffer(
+            &self.output_buffer,
+            0,
+            &self.staging_buffer,
+            0,
+            n_samples as u64 * size_complex,
+        );
+
+        pipeline.queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = self.staging_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = pipeline.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().unwrap().unwrap();
+
+        let data = buffer_slice.get_mapped_range();
+        let flat_output: &[f32] = bytemuck::cast_slice(&data);
+        
+        let mut output = Vec::with_capacity(n_samples);
+        for i in 0..n_samples {
+            output.push(Complex::new(flat_output[i * 2], flat_output[i * 2 + 1]));
+        }
+
+        drop(data);
+        self.staging_buffer.unmap();
+
+        output
+    }
+}
