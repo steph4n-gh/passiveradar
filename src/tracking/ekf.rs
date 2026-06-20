@@ -180,23 +180,11 @@ impl BistaticEkf {
             self.state[i] += k[i] * innovation;
         }
 
-        // 6. Update covariance: P = (I - K * H) * P
-        let mut i_kh = [[0.0f64; 6]; 6];
-        for r in 0..6 {
-            for c in 0..6 {
-                let identity = if r == c { 1.0 } else { 0.0 };
-                i_kh[r][c] = identity - k[r] * h[c];
-            }
-        }
-
+        // 6. Update covariance: P = P - K * (H * P)
         let mut next_cov = [[0.0f64; 6]; 6];
         for r in 0..6 {
             for c in 0..6 {
-                let mut val = 0.0;
-                for i in 0..6 {
-                    val += i_kh[r][i] * self.cov[i][c];
-                }
-                next_cov[r][c] = val;
+                next_cov[r][c] = self.cov[r][c] - k[r] * h_p[c];
             }
         }
         self.cov = next_cov;
