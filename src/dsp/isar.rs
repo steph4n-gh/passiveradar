@@ -79,6 +79,9 @@ pub fn clean_ambiguity_map(
     let sigma_row = 2.0f32;
     let sigma_col = 2.0f32;
 
+    // Pre-allocated column-wise PSF buffer to prevent reallocation inside the loop
+    let mut psf_col = vec![0.0f32; n_cols];
+
     for _ in 0..iterations {
         // 1. Locate absolute peak
         let mut max_val = 0.0f32;
@@ -104,15 +107,19 @@ pub fn clean_ambiguity_map(
         let peak_val = map[peak_r][peak_c];
         clean_components.push((peak_r, peak_c, peak_val));
 
-        // 2. Subtract ideal 2D Gaussian point-spread function
+        // 2. Precompute 1D column Gaussian factor using dimensional separability
+        for c in 0..n_cols {
+            let dc = (c as f32 - peak_c as f32).powi(2);
+            psf_col[c] = (-dc / (2.0 * sigma_col.powi(2))).exp();
+        }
+
+        // 3. Subtract ideal 2D Gaussian point-spread function
         for r in 0..n_rows {
             let dr = (r as f32 - peak_r as f32).powi(2);
+            let psf_row = (-dr / (2.0 * sigma_row.powi(2))).exp();
+            let term = loop_gain * peak_val * psf_row;
             for c in 0..n_cols {
-                let dc = (c as f32 - peak_c as f32).powi(2);
-
-                // Ideal 2D Gaussian ambiguity lobe
-                let psf = (-dr / (2.0 * sigma_row.powi(2)) - dc / (2.0 * sigma_col.powi(2))).exp();
-                map[r][c] -= loop_gain * peak_val * psf;
+                map[r][c] -= term * psf_col[c];
             }
         }
     }
@@ -171,6 +178,15 @@ pub fn backproject_tomography(
     }
 
     // 2. Filtered Back-Projection
+    // Precompute projection angles sin/cos lookup tables to avoid heavy transcendent computation inside the nested loops
+    let mut cos_angles = Vec::with_capacity(n_angles);
+    let mut sin_angles = Vec::with_capacity(n_angles);
+    for &theta in angles_rad {
+        let (sin, cos) = theta.sin_cos();
+        cos_angles.push(cos);
+        sin_angles.push(sin);
+    }
+
     let mut image = vec![vec![0.0f32; grid_size]; grid_size];
     let half_grid = (grid_size as f32) / 2.0;
     let half_bins = (n_bins as f32) / 2.0;
@@ -184,9 +200,10 @@ pub fn backproject_tomography(
             let mut pixel_val = 0.0f32;
 
             for angle_idx in 0..n_angles {
-                let theta = angles_rad[angle_idx];
-                // Project spatial point (x, y) onto the angle direction
-                let rho = x * theta.cos() + y * theta.sin();
+                let cos_t = cos_angles[angle_idx];
+                let sin_t = sin_angles[angle_idx];
+                // Project spatial point (x, y) onto the angle direction using precomputed lookups
+                let rho = x * cos_t + y * sin_t;
 
                 // Map rho in [-1.0, 1.0] back to bin index in [0, n_bins-1]
                 let bin = rho * half_bins + half_bins;
