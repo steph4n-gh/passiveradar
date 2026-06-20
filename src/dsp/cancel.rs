@@ -50,7 +50,6 @@ pub struct NlmsCanceler {
     signal_history: Vec<Complex<f32>>,
     sig_index: usize,
     power: f32,
-    counter: usize,
 }
 
 impl NlmsCanceler {
@@ -68,7 +67,6 @@ impl NlmsCanceler {
             signal_history: vec![Complex::new(0.0, 0.0); delay + 1],
             sig_index: 0,
             power: 0.0,
-            counter: 0,
         }
     }
 
@@ -82,35 +80,25 @@ impl NlmsCanceler {
         // 2. Store the current sample in signal history for future delays
         self.signal_history[self.sig_index] = sample;
 
-        let old_ref = self.ref_history[self.ref_index];
         self.ref_history[self.ref_index] = ref_val;
 
-        // 3. Sliding window power update to avoid expensive O(N) loop
-        let new_power = self.power - old_ref.norm_sqr() + ref_val.norm_sqr();
-        self.power = new_power.max(0.0);
-
-        // Periodically exact recomputation of power to prevent numerical drift
-        self.counter += 1;
-        if self.counter >= 1024 {
-            self.counter = 0;
-            let mut exact_power = 0.0;
-            for i in 0..self.num_taps {
-                exact_power += self.ref_history[i].norm_sqr();
-            }
-            self.power = exact_power;
+        // 3. Exact recomputation of power to prevent numerical drift
+        let mut exact_power = 0.0;
+        for i in 0..self.num_taps {
+            exact_power += self.ref_history[i].norm_sqr();
         }
+        self.power = exact_power;
 
-        // 4. Compute filter output (estimated clutter using delayed samples)
+        // 4. Compute filter output (estimated clutter using delayed samples): y(n) = w^H * x_delayed(n)
         let mut y = Complex::new(0.0, 0.0);
-        let ref_idx = self.ref_index;
-        let num_taps = self.num_taps;
-        
-        // Contiguous Split Loops (enables auto-vectorization)
-        for i in 0..=ref_idx {
-            y += self.ref_history[ref_idx - i] * self.weights[i].conj();
-        }
-        for i in (ref_idx + 1)..num_taps {
-            y += self.ref_history[num_taps + ref_idx - i] * self.weights[i].conj();
+        let mut r_idx = self.ref_index;
+        for i in 0..self.num_taps {
+            y += self.ref_history[r_idx] * self.weights[i].conj();
+            if r_idx == 0 {
+                r_idx = self.num_taps - 1;
+            } else {
+                r_idx -= 1;
+            }
         }
 
         // 5. The target to cancel is the current sample (d(n) = x(n))
@@ -119,14 +107,14 @@ impl NlmsCanceler {
         // 6. Update weights: w(n+1) = w(n) + mu * e^*(n) * x_delayed(n) / (power + eps)
         let normalization = self.mu / (self.power + self.eps);
         let error_conj = error.conj();
-        let term = error_conj * normalization;
-        
-        // Contiguous Split Loops (enables auto-vectorization)
-        for i in 0..=ref_idx {
-            self.weights[i] += self.ref_history[ref_idx - i] * term;
-        }
-        for i in (ref_idx + 1)..num_taps {
-            self.weights[i] += self.ref_history[num_taps + ref_idx - i] * term;
+        let mut r_idx_w = self.ref_index;
+        for i in 0..self.num_taps {
+            self.weights[i] += self.ref_history[r_idx_w] * error_conj * normalization;
+            if r_idx_w == 0 {
+                r_idx_w = self.num_taps - 1;
+            } else {
+                r_idx_w -= 1;
+            }
         }
 
         // 7. Advance indices
@@ -271,7 +259,7 @@ impl EcaCanceler {
         // We use tau to inject a tiny bit of "virtual noise" scaled by the block size.
         // This prevents the linear predictor from achieving "perfect cancellation" of the
         // constant-modulus phase signal, preserving the target echoes!
-        let tau = 1e-3 * n as f32; 
+        let tau = 1e-3 * (r[0][0].re / taps as f32 + 1e-6); 
         for j in 0..taps {
             r[j][j] += Complex::new(tau, 0.0);
         }
@@ -293,12 +281,13 @@ impl EcaCanceler {
         }
 
         // Update history
-        for i in 0..6 {
-            self.history[i] = if n > 5 - i {
-                input[n - 1 - (5 - i)]
-            } else {
-                self.history[self.history.len() - (5 - i) + n]
-            };
+        if n >= 6 {
+            self.history.copy_from_slice(&input[n - 6..n]);
+        } else {
+            for i in 0..(6 - n) {
+                self.history[i] = self.history[i + n];
+            }
+            self.history[6 - n..6].copy_from_slice(input);
         }
     }
 }
@@ -326,6 +315,131 @@ mod tests {
         for i in 10..100 {
             assert!(clean_surv[i].norm() < 0.1, "Failed to cancel direct path, got {}", clean_surv[i]);
             assert!(surr_ref[i].norm() > 900.0, "Failed to capture surrogate reference");
+        }
+    }
+}
+
+pub struct EcaBatchedCanceler {
+    num_taps: usize,
+    history: Vec<Complex<f32>>,
+    pub max_cg_iterations: usize,
+}
+
+impl EcaBatchedCanceler {
+    pub fn new(num_taps: usize, max_cg_iterations: usize) -> Self {
+        Self {
+            num_taps,
+            history: vec![Complex::new(0.0, 0.0); num_taps],
+            max_cg_iterations,
+        }
+    }
+
+    pub fn process_block(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
+        let n_samples = input.len();
+        output.clear();
+        output.resize(n_samples, Complex::new(0.0, 0.0));
+        
+        if n_samples == 0 {
+            return;
+        }
+
+        let mut w = vec![Complex::new(0.0, 0.0); self.num_taps];
+        let mut r = input.to_vec(); 
+        let mut p = vec![Complex::new(0.0, 0.0); self.num_taps];
+        self.apply_xh(&r, input, &mut p);
+        
+        let mut s_cg = p.clone(); 
+        
+        let mut norms_sq = 0.0;
+        for v in &s_cg { norms_sq += v.norm_sqr(); }
+
+        for _ in 0..self.max_cg_iterations {
+            if norms_sq < 1e-10 { break; }
+            
+            let mut q = vec![Complex::new(0.0, 0.0); n_samples];
+            self.apply_x(&p, input, &mut q);
+            
+            let mut normq_sq = 0.0;
+            for v in &q { normq_sq += v.norm_sqr(); }
+            
+            if normq_sq < 1e-15 { break; }
+            
+            let alpha = norms_sq / normq_sq;
+            
+            for i in 0..self.num_taps {
+                w[i] = w[i] + p[i] * alpha;
+            }
+            
+            for i in 0..n_samples {
+                r[i] = r[i] - q[i] * alpha;
+            }
+            
+            let mut s_new = vec![Complex::new(0.0, 0.0); self.num_taps];
+            self.apply_xh(&r, input, &mut s_new);
+            
+            let mut norms_new_sq = 0.0;
+            for v in &s_new { norms_new_sq += v.norm_sqr(); }
+            
+            let beta = norms_new_sq / norms_sq;
+            
+            for i in 0..self.num_taps {
+                p[i] = s_new[i] + p[i] * beta;
+            }
+            
+            norms_sq = norms_new_sq;
+        }
+        
+        for i in 0..n_samples {
+            output[i] = r[i];
+        }
+
+        if n_samples >= self.num_taps {
+            for i in 0..self.num_taps {
+                self.history[i] = input[n_samples - self.num_taps + i];
+            }
+        } else {
+            self.history.rotate_left(n_samples);
+            for i in 0..n_samples {
+                self.history[self.num_taps - n_samples + i] = input[i];
+            }
+        }
+    }
+    
+    fn apply_x(&self, p: &[Complex<f32>], input: &[Complex<f32>], q: &mut [Complex<f32>]) {
+        let n = input.len();
+        let k_taps = p.len();
+        
+        for i in 0..n {
+            let mut sum = Complex::new(0.0, 0.0);
+            for k in 0..k_taps {
+                let delay = k + 1;
+                let val = if i >= delay {
+                    input[i - delay]
+                } else {
+                    self.history[self.num_taps - delay + i]
+                };
+                sum += val * p[k];
+            }
+            q[i] = sum;
+        }
+    }
+
+    fn apply_xh(&self, r: &[Complex<f32>], input: &[Complex<f32>], s: &mut [Complex<f32>]) {
+        let n = input.len();
+        let k_taps = s.len();
+        
+        for k in 0..k_taps {
+            let mut sum = Complex::new(0.0, 0.0);
+            let delay = k + 1;
+            for i in 0..n {
+                let val = if i >= delay {
+                    input[i - delay]
+                } else {
+                    self.history[self.num_taps - delay + i]
+                };
+                sum += val.conj() * r[i];
+            }
+            s[k] = sum;
         }
     }
 }

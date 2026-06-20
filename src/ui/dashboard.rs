@@ -83,6 +83,7 @@ pub struct Dashboard {
     pub logs: Vec<String>,
     pub sdr_alive: bool,
     pub clipping_rate: f32,
+    pub hardware_clipping_rate: f32,
     pub carrier_rms: f32,
     pub cancellation_ratio_db: f32,
     pub visible_panels: VisiblePanes,
@@ -125,10 +126,13 @@ pub struct Dashboard {
     pub ellipse_mode: EllipseMode,
     pub dsp_threshold: f32,
     pub gain: f64,
+    pub software_agc: bool,
+    pub last_agc_update: std::time::Instant,
     pub dc_block: bool,
     pub show_constellation: bool,
     pub show_aligner: bool,
     pub show_hacker: bool,
+    pub one_bit_mode: bool,
     pub crt_mode: bool,
     pub screen_shake: bool,
     pub doppler_scale_pm: bool,
@@ -161,6 +165,39 @@ pub struct Dashboard {
     pub show_records: bool,
     pub tactical_records: TacticalRecords,
     pub show_unconfirmed: bool,
+    pub show_multipath: bool,
+    pub multipath_profile: Vec<f32>,
+    pub multipath_peak_refined: f32,
+    pub unwrap_enabled: bool,
+    pub cepstrum_enabled: bool,
+    pub master_ekf_enabled: bool,
+    pub omni_mode: String,
+    pub vibrometer_mode: String,
+    pub stare_mode_active: bool,
+    pub stare_coords: [f64; 3],
+    pub ghost_mic_gain: f32,
+    pub audio_streaming: bool,
+    pub displacement: f64,
+    pub last_raw_iq_phase: f64,
+    pub unwrapped_phase_accum: f64,
+    pub occupancy_confidence: f32,
+    pub breathing_rate_hz: f32,
+    pub fundamental_rpm: f64,
+    pub collapsed_peaks_count: usize,
+    pub cepstrum_magnitude: Vec<f32>,
+    pub vibration_spectra: Vec<f32>,
+    pub peaks: Vec<f64>,
+    pub clutter_suppression_db: f64,
+    pub spikes_pruned: usize,
+    pub dropped_packets: usize,
+    pub clipping_occurred: bool,
+    pub amplitude_scale: f64,
+    pub resonances: Vec<f32>,
+    pub drone_heuristics_active: bool,
+    pub thrust_to_weight: f64,
+    pub payload_class_override: String,
+    pub tracking_mode: crate::tracking::ekf::TrackingMode,
+    pub is_hopping: bool,
 }
 
 impl Dashboard {
@@ -173,7 +210,7 @@ impl Dashboard {
             center_freq,
             sample_rate,
             ddc_offset,
-            sdr_type,
+            sdr_type: sdr_type.clone(),
             tower_name: "Scanning...".to_string(),
             tower_pos: [0.0, 0.0, 0.0],
             active_towers: Vec::new(),
@@ -181,6 +218,7 @@ impl Dashboard {
             logs: Vec::new(),
             sdr_alive: true,
             clipping_rate: 0.0,
+            hardware_clipping_rate: 0.0,
             carrier_rms: 0.0,
             cancellation_ratio_db: 0.0,
             visible_panels: VisiblePanes {
@@ -219,11 +257,14 @@ impl Dashboard {
             heading_deg,
             ellipse_mode: EllipseMode::None,
             dsp_threshold: 5.8,
-            gain: 6.0,
-            dc_block: false,
+            gain: if sdr_type == "sdr" { 62.0 } else { 6.0 },
+            software_agc: true,
+            last_agc_update: std::time::Instant::now(),
+            dc_block: true,
             show_constellation: true,
             show_aligner: true,
             show_hacker: false,
+            one_bit_mode: true,
             crt_mode: false,
             screen_shake: false,
             doppler_scale_pm: false,
@@ -256,6 +297,39 @@ impl Dashboard {
             show_records: false,
             tactical_records: TacticalRecords::new(),
             show_unconfirmed: false,
+            show_multipath: true,
+            multipath_profile: vec![0.0; 64],
+            multipath_peak_refined: 0.0f32,
+            unwrap_enabled: false,
+            cepstrum_enabled: false,
+            master_ekf_enabled: false,
+            omni_mode: "None".to_string(),
+            vibrometer_mode: "Bypass".to_string(),
+            stare_mode_active: false,
+            stare_coords: [0.0; 3],
+            ghost_mic_gain: 1.0,
+            audio_streaming: false,
+            displacement: 0.0,
+            last_raw_iq_phase: 0.0,
+            unwrapped_phase_accum: 0.0,
+            occupancy_confidence: 0.0,
+            breathing_rate_hz: 0.0,
+            fundamental_rpm: 0.0,
+            collapsed_peaks_count: 0,
+            cepstrum_magnitude: vec![0.0; 256],
+            vibration_spectra: vec![0.0; 256],
+            peaks: Vec::new(),
+            clutter_suppression_db: 55.0,
+            spikes_pruned: 0,
+            dropped_packets: 0,
+            clipping_occurred: false,
+            amplitude_scale: 1.0,
+            resonances: vec![0.0; 5],
+            drone_heuristics_active: false,
+            thrust_to_weight: 0.8,
+            payload_class_override: "Auto".to_string(),
+            tracking_mode: crate::tracking::ekf::TrackingMode::Airspace,
+            is_hopping: false,
         }
     }
 
@@ -304,6 +378,24 @@ impl Dashboard {
         self.data_version = self.data_version.wrapping_add(1);
         self.caf_matrix = caf;
     }
+
+    pub fn update_multipath(&mut self, raw_cir: Vec<f32>) {
+        self.data_version = self.data_version.wrapping_add(1);
+        if self.multipath_profile.len() != raw_cir.len() {
+            self.multipath_profile = raw_cir;
+        } else {
+            let alpha = 0.1f32;
+            for i in 0..self.multipath_profile.len() {
+                self.multipath_profile[i] = (1.0 - alpha) * self.multipath_profile[i] + alpha * raw_cir[i];
+            }
+        }
+    }
+
+    pub fn update_multipath_peak(&mut self, peak: f32) {
+        self.data_version = self.data_version.wrapping_add(1);
+        self.multipath_peak_refined = peak;
+    }
+
 
     fn wrap_text(&self, text: &str, max_width: usize) -> Vec<String> {
         if max_width == 0 {
@@ -720,7 +812,7 @@ impl Dashboard {
         let show_map = self.visible_panels.towers && area.height >= 20;
         let show_logs = self.visible_panels.logs && area.height >= 30;
 
-        let show_right_col = area.height >= 10 && area.width >= collapse_threshold && (self.show_aligner || self.show_constellation || self.show_hacker || self.show_records);
+        let show_right_col = area.height >= 10 && area.width >= collapse_threshold && (self.show_aligner || self.show_constellation || self.show_hacker || self.show_records || self.show_multipath);
 
         let mut constraints = Vec::new();
         constraints.push(Constraint::Percentage(34)); // Left column
@@ -765,6 +857,7 @@ impl Dashboard {
 
         // Split Left area vertically based on active panels
         let mut left_constraints = Vec::new();
+        left_constraints.push(Constraint::Length(4)); // Airspace Summary panel height
         if show_map && show_logs {
             left_constraints.push(Constraint::Percentage(35)); // Targets
             left_constraints.push(Constraint::Percentage(40)); // Map
@@ -785,6 +878,9 @@ impl Dashboard {
             .split(left_area);
 
         let mut current_idx = 0;
+        self.render_airspace_summary(frame, left_layout[current_idx], targets, transients);
+        current_idx += 1;
+
         self.render_targets_table(frame, left_layout[current_idx], targets);
         current_idx += 1;
 
@@ -815,7 +911,7 @@ impl Dashboard {
             }
         }
 
-        // Render Column 3 (Aligner, Constellation, Hacker, Records)
+        // Render Column 3 (Aligner, Constellation, Hacker, Records, Multipath)
         if let Some(area) = right_area {
             let mut right_constraints = Vec::new();
             if self.show_aligner {
@@ -830,16 +926,17 @@ impl Dashboard {
             if self.show_records {
                 right_constraints.push(Constraint::Percentage(100));
             }
+            if self.show_multipath {
+                right_constraints.push(Constraint::Percentage(100));
+            }
 
             let num_right_panes = right_constraints.len();
-            let right_constraints = if num_right_panes == 1 {
-                vec![Constraint::Percentage(100)]
-            } else if num_right_panes == 2 {
-                vec![Constraint::Percentage(50), Constraint::Percentage(50)]
-            } else if num_right_panes == 3 {
-                vec![Constraint::Percentage(33), Constraint::Percentage(33), Constraint::Percentage(34)]
-            } else {
-                vec![Constraint::Percentage(25), Constraint::Percentage(25), Constraint::Percentage(25), Constraint::Percentage(25)]
+            let right_constraints = match num_right_panes {
+                1 => vec![Constraint::Percentage(100)],
+                2 => vec![Constraint::Percentage(50), Constraint::Percentage(50)],
+                3 => vec![Constraint::Percentage(33), Constraint::Percentage(33), Constraint::Percentage(34)],
+                4 => vec![Constraint::Percentage(25), Constraint::Percentage(25), Constraint::Percentage(25), Constraint::Percentage(25)],
+                _ => vec![Constraint::Percentage(20); num_right_panes],
             };
 
             let right_layout = Layout::default()
@@ -862,6 +959,10 @@ impl Dashboard {
             }
             if self.show_records {
                 self.render_records_panel(frame, right_layout[pane_idx]);
+                pane_idx += 1;
+            }
+            if self.show_multipath {
+                self.render_multipath_panel(frame, right_layout[pane_idx]);
             }
         }
         self.render_footer(frame, main_chunks[2]);
@@ -1004,7 +1105,35 @@ impl Dashboard {
             ));
         }
 
+        if self.one_bit_mode {
+            status_spans.push(Span::raw(" | "));
+            status_spans.push(Span::styled(
+                " 1-BIT MODE ",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Black)
+                    .bg(Color::Cyan),
+            ));
+        }
 
+        status_spans.push(Span::raw(" | MODE: "));
+        let mode_str = match self.tracking_mode {
+            crate::tracking::ekf::TrackingMode::Airspace => "AIRSPACE",
+            crate::tracking::ekf::TrackingMode::GroundCar => "GROUND (CAR)",
+            crate::tracking::ekf::TrackingMode::GroundTrain => "GROUND (TRAIN)",
+        };
+        status_spans.push(Span::styled(
+            mode_str,
+            Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+        ));
+
+        if self.is_hopping {
+            status_spans.push(Span::raw(" "));
+            status_spans.push(Span::styled(
+                "[HOPPING]",
+                Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD).bg(Color::DarkGray),
+            ));
+        }
 
         if !self.sdr_alive {
             status_spans.push(Span::raw(" | "));
@@ -1101,9 +1230,9 @@ impl Dashboard {
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let spans = vec![
             Span::styled(" KEYBINDS: ", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
-            Span::raw("[q] Quit | [w] W-fall: "),
+            Span::raw("[q] Quit | [w] Wfl: "),
             Span::styled(if self.visible_panels.waterfall { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
-            Span::raw(" | [f] W-Mode: "),
+            Span::raw(" | [f] Mode: "),
             Span::styled(
                 match self.waterfall_mode {
                     WaterfallMode::DopplerTime => "Time",
@@ -1113,26 +1242,30 @@ impl Dashboard {
             ),
             Span::raw(" | [t] Map: "),
             Span::styled(if self.visible_panels.towers { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
-            Span::raw(" | [l] Logs: "),
+            Span::raw(" | [l] Log: "),
             Span::styled(if self.visible_panels.logs { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
-            Span::raw(" | [e] Ellip: "),
+            Span::raw(" | [e] Elp: "),
             Span::styled(format!("{:?}", self.ellipse_mode), Style::default().fg(Color::Cyan)),
             Span::raw(" | [d] DC Block: "),
             Span::styled(if self.dc_block { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
             Span::raw(" | [x] CRT: "),
             Span::styled(if self.crt_mode { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
-            Span::raw(" | [c] Const: "),
+            Span::raw(" | [c] Cst: "),
             Span::styled(if self.show_constellation { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
-            Span::raw(" | [a] Align: "),
+            Span::raw(" | [a] Aln: "),
             Span::styled(if self.show_aligner { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
-            Span::raw(" | [h] Hack: "),
+            Span::raw(" | [h] Hck: "),
             Span::styled(if self.show_hacker { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
-            Span::raw(" | [r] Recs: "),
+            Span::raw(" | [r] Rec: "),
             Span::styled(if self.show_records { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
-            Span::raw(" | [u] Unconf: "),
+            Span::raw(" | [p] Prf: "),
+            Span::styled(if self.show_multipath { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
+            Span::raw(" | [u] Unc: "),
             Span::styled(if self.show_unconfirmed { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
             Span::raw(" | [[/]] Gain: "),
-            Span::styled(format!("{:.1}", self.gain), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{:.1} dB", self.gain), Style::default().fg(Color::Cyan)),
+            Span::raw(" | [g] AGC: "),
+            Span::styled(if self.software_agc { "ON" } else { "OFF" }, Style::default().fg(Color::Cyan)),
         ];
 
 
@@ -2117,7 +2250,7 @@ impl Dashboard {
         let header_style = Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD);
-        let headers = Row::new(vec!["Time", "Type", "Doppler Shift (Hz)", "Est. SNR (dB)"])
+        let headers = Row::new(vec!["Time", "Type", "Doppler Shift (Hz)", "Est. SNR (dB)", "TEC (TECU)"])
             .style(header_style);
 
         let now = std::time::Instant::now();
@@ -2128,19 +2261,21 @@ impl Dashboard {
             let mut rows = Vec::new();
             for event in transients {
                 use ratatui::widgets::Cell;
-            rows.push(
-                Row::new(vec![
-                    Cell::from(event.timestamp.clone()),
-                    Cell::from(event.classification.clone()).style(
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Cell::from(format!("{:+.1}", event.frequency_hz)),
-                    Cell::from(format!("{:.1}", event.snr_db)),
-                ])
-                .style(Style::default().fg(Color::White)),
-            );
+                let tec_str = event.tec.map_or("---".to_string(), |t| format!("{:.3}", t));
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(event.timestamp.clone()),
+                        Cell::from(event.classification.clone()).style(
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Cell::from(format!("{:+.1}", event.frequency_hz)),
+                        Cell::from(format!("{:.1}", event.snr_db)),
+                        Cell::from(tec_str),
+                    ])
+                    .style(Style::default().fg(Color::White)),
+                );
             }
             self.cached_transients_rows = rows;
             self.last_transients_update = Some(std::time::Instant::now());
@@ -2151,15 +2286,54 @@ impl Dashboard {
             self.cached_transients_rows.clone(),
             [
                 Constraint::Length(10),
-                Constraint::Length(32),
-                Constraint::Length(20),
-                Constraint::Length(15),
+                Constraint::Length(30),
+                Constraint::Length(18),
+                Constraint::Length(12),
+                Constraint::Length(12),
             ],
         )
         .header(headers)
         .block(self.create_block(" Transient Atmospheric & Meteor Events ", Color::Yellow));
 
         frame.render_widget(table, area);
+    }
+
+    fn render_multipath_panel(&self, frame: &mut Frame, area: Rect) {
+        let block = self.create_block(" Multipath Profile (CIR) ", Color::Cyan);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let chart_height = (inner.height as usize).saturating_sub(2).max(1);
+        let chart_width = (inner.width as usize).saturating_sub(2).max(1);
+
+        let chart_lines = self.render_ascii_bar_chart(&self.multipath_profile, chart_width, chart_height);
+
+        let mut lines = Vec::new();
+        for line_str in chart_lines {
+            lines.push(Line::from(Span::styled(line_str, Style::default().fg(Color::Cyan))));
+        }
+
+        let max_val = self.multipath_profile.iter().copied().fold(0.0f32, |a, b| a.max(b));
+        let max_idx = self.multipath_profile.iter().enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let max_dist = self.multipath_peak_refined * 1.171;
+        lines.push(Line::from(vec![
+            Span::raw(" Peak: "),
+            Span::styled(format!("{:.3} km", max_dist), Style::default().fg(Color::Yellow)),
+            Span::raw(" (bin "),
+            Span::styled(format!("{:.2}", self.multipath_peak_refined), Style::default().fg(Color::Yellow)),
+            Span::raw(", amp "),
+            Span::styled(format!("{:.1}", max_val), Style::default().fg(Color::Yellow)),
+            Span::raw(")"),
+        ]));
+
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn render_aligner_panel(&self, frame: &mut Frame, area: Rect) {
@@ -2372,6 +2546,81 @@ impl Dashboard {
         ]));
 
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_airspace_summary(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        targets: &[TrackedTarget],
+        transients: &[crate::tracking::bank::TransientEvent],
+    ) {
+        let active_count = targets.iter()
+            .filter(|t| t.state != crate::tracking::bank::TrackState::Terminated)
+            .count();
+
+        let mut planes = 0;
+        let mut drones = 0;
+        let mut vehicles = 0;
+        let mut unknown = 0;
+
+        for t in targets.iter().filter(|t| t.state != crate::tracking::bank::TrackState::Terminated) {
+            let class = t.classification.to_lowercase();
+            let call = t.callsign().to_lowercase();
+            if class.contains("drone") || class.contains("uav") || call.contains("drn") {
+                drones += 1;
+            } else if class.contains("vehicle") || class.contains("ground") || call.contains("veh") {
+                vehicles += 1;
+            } else if class.contains("plane") || class.contains("b78") || class.contains("com") || class.contains("aal") || call.contains("aal") {
+                planes += 1;
+            } else {
+                unknown += 1;
+            }
+        }
+
+        let density = if active_count == 0 {
+            ("CLEAR", Color::Green)
+        } else if active_count <= 2 {
+            ("LOW", Color::Green)
+        } else if active_count <= 4 {
+            ("MODERATE", Color::Yellow)
+        } else {
+            ("HIGH DENSITY", Color::Red)
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                " Airspace Surveillance Summary ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+
+        let lines = vec![
+            Line::from(vec![
+                Span::raw("Airspace: "),
+                Span::styled(density.0, Style::default().fg(density.1).add_modifier(Modifier::BOLD)),
+                Span::raw(" | Active Tracks: "),
+                Span::styled(active_count.to_string(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw(" | Illuminators: "),
+                Span::styled(self.active_towers.len().to_string(), Style::default().fg(Color::Green)),
+            ]),
+            Line::from(vec![
+                Span::raw("Planes: "),
+                Span::styled(planes.to_string(), Style::default().fg(Color::Cyan)),
+                Span::raw(" | UAVs/Drones: "),
+                Span::styled(drones.to_string(), Style::default().fg(Color::Yellow)),
+                Span::raw(" | Ground Units: "),
+                Span::styled(vehicles.to_string(), Style::default().fg(Color::Magenta)),
+                Span::raw(" | Meteors: "),
+                Span::styled(transients.len().to_string(), Style::default().fg(Color::LightRed)),
+            ]),
+        ];
+
+        let paragraph = Paragraph::new(lines)
+            .block(block)
+            .style(Style::default().fg(Color::White));
+
+        frame.render_widget(paragraph, area);
     }
 }
 

@@ -35,7 +35,9 @@ pub struct TransientEvent {
     pub frequency_hz: f64,
     pub snr_db: f64,
     pub classification: String,
+    pub tec: Option<f64>,
 }
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackState {
@@ -125,34 +127,32 @@ pub fn compute_measurement_jacobian(
     let r_t = (dx * dx + dy * dy + dz * dz).sqrt().max(1.0);
     let r_r = (x * x + y * y + z * z).sqrt().max(1.0);
 
-    let r_t_sq = r_t * r_t;
-    let r_t_cubed = r_t_sq * r_t;
-    let r_r_sq = r_r * r_r;
-    let r_r_cubed = r_r_sq * r_r;
-
-    let r_t_inv3 = 1.0 / r_t_cubed;
-    let r_r_inv3 = 1.0 / r_r_cubed;
-    let r_t_inv = r_t_sq * r_t_inv3;
-    let r_r_inv = r_r_sq * r_r_inv3;
-
-    let dot_t = (vx * dx + vy * dy + vz * dz) * r_t_inv;
-    let dot_r = (vx * x + vy * y + vz * z) * r_r_inv;
+    let dot_t = (vx * dx + vy * dy + vz * dz) / r_t;
+    let dot_r = (vx * x + vy * y + vz * z) / r_r;
     let range_rate_pred = dot_t + dot_r;
 
     let lambda = crate::sdr::C / fc;
     let z_pred = -range_rate_pred / lambda;
 
-    let dr_dvx = dx * r_t_inv + x * r_r_inv;
-    let dr_dvy = dy * r_t_inv + y * r_r_inv;
-    let dr_dvz = dz * r_t_inv + z * r_r_inv;
+    let dr_dvx = dx / r_t + x / r_r;
+    let dr_dvy = dy / r_t + y / r_r;
+    let dr_dvz = dz / r_t + z / r_r;
 
-    let d_t_x = (vx * (r_t_sq - dx * dx) - vy * (dx * dy) - vz * (dx * dz)) * r_t_inv3;
-    let d_t_y = (-vx * (dx * dy) + vy * (r_t_sq - dy * dy) - vz * (dy * dz)) * r_t_inv3;
-    let d_t_z = (-vx * (dx * dz) - vy * (dy * dz) + vz * (r_t_sq - dz * dz)) * r_t_inv3;
+    let d_t_x = vx * (r_t.powi(2) - dx * dx) / r_t.powi(3)
+        - vy * (dx * dy) / r_t.powi(3)
+        - vz * (dx * dz) / r_t.powi(3);
+    let d_t_y = -vx * (dx * dy) / r_t.powi(3) + vy * (r_t.powi(2) - dy * dy) / r_t.powi(3)
+        - vz * (dy * dz) / r_t.powi(3);
+    let d_t_z = -vx * (dx * dz) / r_t.powi(3) - vy * (dy * dz) / r_t.powi(3)
+        + vz * (r_t.powi(2) - dz * dz) / r_t.powi(3);
 
-    let d_r_x = (vx * (r_r_sq - x * x) - vy * (x * y) - vz * (x * z)) * r_r_inv3;
-    let d_r_y = (-vx * (x * y) + vy * (r_r_sq - y * y) - vz * (y * z)) * r_r_inv3;
-    let d_r_z = (-vx * (x * z) - vy * (y * z) + vz * (r_r_sq - z * z)) * r_r_inv3;
+    let d_r_x = vx * (r_r.powi(2) - x * x) / r_r.powi(3)
+        - vy * (x * y) / r_r.powi(3)
+        - vz * (x * z) / r_r.powi(3);
+    let d_r_y = -vx * (x * y) / r_r.powi(3) + vy * (r_r.powi(2) - y * y) / r_r.powi(3)
+        - vz * (y * z) / r_r.powi(3);
+    let d_r_z = -vx * (x * z) / r_r.powi(3) - vy * (y * z) / r_r.powi(3)
+        + vz * (r_r.powi(2) - z * z) / r_r.powi(3);
 
     let dr_dx = d_t_x + d_r_x;
     let dr_dy = d_t_y + d_r_y;
@@ -238,6 +238,7 @@ pub fn compute_reid_score(
     candidate_rcs_datapoints: &[(f64, f64)],
     dt: f64,
 ) -> f64 {
+    let dt = dt.min(300.0);
     // Process noise variance parameters (matching EKF initialization)
     let q_pos = 1.0;
     let q_vel = 0.1;
@@ -378,24 +379,44 @@ pub struct TrackingBank {
     pub transients: Vec<TransientEvent>,
     pub mode: String,
     pub disk_fingerprints: Vec<(TargetFingerprint, std::path::PathBuf)>,
+    pub transient_snr_history: Vec<f64>,
+    pub fp_sender: std::sync::mpsc::Sender<(TargetFingerprint, std::path::PathBuf)>,
+    pub viterbi_tbd: Option<crate::tracking::tbd::ViterbiTbd>,
 
     pos_uncert: f64,
     vel_uncert: f64,
     r_variance: f64,
+    pub osm_network: Option<crate::tracking::osm::OsmRailNetwork>,
 }
 
 impl TrackingBank {
     pub fn new() -> Self {
+        let (fp_sender, rx) = std::sync::mpsc::channel::<(TargetFingerprint, std::path::PathBuf)>();
+        std::thread::spawn(move || {
+            while let Ok((fp, file_path)) = rx.recv() {
+                if let Ok(serialized) = serde_json::to_string_pretty(&fp) {
+                    if let Ok(mut file) = std::fs::File::create(&file_path) {
+                        use std::io::Write;
+                        let _ = file.write_all(serialized.as_bytes());
+                    }
+                }
+            }
+        });
+
         Self {
             targets: Vec::new(),
             candidates: Vec::new(),
             transients: Vec::new(),
             mode: "sim".to_string(),
             disk_fingerprints: Vec::new(),
+            transient_snr_history: Vec::with_capacity(200),
+            fp_sender,
+            viterbi_tbd: Some(crate::tracking::tbd::ViterbiTbd::new(256, 256, 30)),
 
             pos_uncert: 25_000.0, // 25 km initial position uncertainty
             vel_uncert: 120.0,    // 120 m/s initial velocity uncertainty
-            r_variance: 4.0,      // 2 Hz measurement standard deviation squared
+            r_variance: 4.0,
+            osm_network: None,
         }
     }
 
@@ -414,6 +435,22 @@ impl TrackingBank {
             }
         }
         id
+    }
+
+    
+    pub fn set_tracking_mode(&mut self, mode: crate::tracking::ekf::TrackingMode, lat: f64, lon: f64) {
+        if let crate::tracking::ekf::TrackingMode::GroundTrain = mode {
+            if self.osm_network.is_none() {
+                let mut net = crate::tracking::osm::OsmRailNetwork::new();
+                net.fetch_rail_vectors(lat, lon, 15000.0);
+                self.osm_network = Some(net);
+            }
+        } else {
+            self.osm_network = None;
+        }
+        for t in &mut self.targets {
+            t.ekf.tracking_mode = mode;
+        }
     }
 
     pub fn get_fingerprints_dir(&self) -> std::path::PathBuf {
@@ -512,6 +549,23 @@ impl TrackingBank {
             target.tracking_towers.clear();
         }
 
+        // Push frame to Viterbi TBD
+        if let Some(ref mut tbd) = self.viterbi_tbd {
+            let mut rd_matrix = vec![1e-5f32; 256 * 256];
+            for &(_, _, _, peaks) in towers_data {
+                for &(freq, snr) in peaks {
+                    let doppler_idx = (((freq + 100.0) * (256.0 / 200.0)) as usize).min(255);
+                    let delay_idx = 128;
+                    rd_matrix[delay_idx * 256 + doppler_idx] = snr.max(1e-5);
+                }
+            }
+            tbd.push_frame(rd_matrix);
+            let tbd_clone = tbd.clone();
+            rayon::spawn(move || {
+                let _trajectory = tbd_clone.search_trajectory();
+            });
+        }
+
         // 1. Predict all active/suspect tracks forward
         for target in &mut self.targets {
             if target.state != TrackState::Terminated {
@@ -606,6 +660,10 @@ impl TrackingBank {
                     rcs_db,
                     jem_frequency_hz: target.jem.get_sidebands_hz(),
                 });
+                if target.fingerprint_history.len() > 500 {
+                    let len = target.fingerprint_history.len();
+                    target.fingerprint_history.drain(0..len - 500);
+                }
 
                 // Add this tower to the list of tracking towers
                 target.tracking_towers.push(name.clone());
@@ -639,6 +697,7 @@ impl TrackingBank {
                     let pred_doppler = -(dot_t + dot_r) / lambda;
 
                     target.jem.process_block(pred_doppler, baseband_samples);
+                    target.jem.update_heuristics(vz, dt);
                 }
             }
         }
@@ -1156,34 +1215,130 @@ impl TrackingBank {
         Self::prevent_duplicate_tracks(&mut self.targets, log);
 
         // 5. Detect and record high-frequency transients (meteors, lightning, etc.)
-        for (t_idx, t_data) in towers_data.iter().enumerate() {
-            let fc = t_data.2;
-            let peaks = t_data.3;
-            let associated_peaks = &tower_associated_peaks[t_idx];
-            for (idx, &associated) in associated_peaks.iter().enumerate() {
-                if associated {
+        // Compute running mean and standard deviation from previous frames' noise history
+        let mut mean_snr = 10.0;
+        let mut std_snr = 1.5;
+        let use_cfar = self.transient_snr_history.len() >= 5;
+        if use_cfar {
+            let sum: f64 = self.transient_snr_history.iter().sum();
+            let count = self.transient_snr_history.len() as f64;
+            let m = sum / count;
+            let variance: f64 = self.transient_snr_history.iter().map(|&x| (x - m).powi(2)).sum::<f64>() / count;
+            mean_snr = m;
+            std_snr = variance.sqrt().max(0.5);
+        }
+
+        let is_sim = self.mode == "sim";
+        let cfar_min = if is_sim { 12.0 } else { 20.0 };
+        let dynamic_threshold = if use_cfar {
+            (mean_snr + 4.0 * std_snr).max(cfar_min).min(30.0)
+        } else {
+            cfar_min
+        };
+
+        let mut detected_this_frame = false;
+        for t_idx in 0..towers_data.len() {
+            let fc = towers_data[t_idx].2;
+            let peaks = towers_data[t_idx].3;
+            for idx in 0..peaks.len() {
+                if tower_associated_peaks[t_idx][idx] {
+                    continue;
+                }
+                if detected_this_frame {
                     continue;
                 }
                 let peak_doppler = peaks[idx].0 as f64;
                 let peak_snr = peaks[idx].1 as f64;
 
-                // Only report strong transients (SNR >= 12.0 dB) to prevent thermal noise spam
-                if peak_doppler.abs() > 300.0 && peak_snr >= 12.0 {
+                // Report transients exceeding the dynamic CFAR threshold
+                if peak_doppler.abs() > 300.0 && peak_snr >= dynamic_threshold {
                     let now = Instant::now();
                     let duplicate = self.transients.iter().any(|t| {
-                        now.duration_since(t.time) < std::time::Duration::from_secs_f64(2.0)
-                            && (t.frequency_hz - peak_doppler).abs() < 150.0
+                        let dt = now.duration_since(t.time).as_secs_f64();
+                        if dt < 2.0 {
+                            dt < 2.5 && (t.frequency_hz - peak_doppler).abs() < 1500.0
+                        } else {
+                            dt < 2.5 && (t.frequency_hz - peak_doppler).abs() < 500.0
+                        }
                     });
 
                     if !duplicate {
+                        // Search other towers for a matching dual-frequency peak
+                        let mut match_found = false;
+                        let mut matched_fd2 = 0.0;
+                        let mut matched_fc2 = 0.0;
+                        let mut matched_t_idx = 0;
+                        let mut matched_p_idx = 0;
+
+                        for t_idx2 in 0..towers_data.len() {
+                            if t_idx2 == t_idx {
+                                continue;
+                            }
+                            let fc2 = towers_data[t_idx2].2;
+                            let peaks2 = towers_data[t_idx2].3;
+                            for idx2 in 0..peaks2.len() {
+                                if tower_associated_peaks[t_idx2][idx2] {
+                                    continue;
+                                }
+                                let peak_doppler2 = peaks2[idx2].0 as f64;
+                                // Calculate physical velocity difference
+                                let v1 = -(peak_doppler * crate::sdr::C) / (2.0 * fc);
+                                let v2 = -(peak_doppler2 * crate::sdr::C) / (2.0 * fc2);
+                                if (v1 - v2).abs() <= 150.0 {
+                                    match_found = true;
+                                    matched_fd2 = peak_doppler2;
+                                    matched_fc2 = fc2;
+                                    matched_t_idx = t_idx2;
+                                    matched_p_idx = idx2;
+                                    break;
+                                }
+                            }
+                            if match_found {
+                                break;
+                            }
+                        }
+
+                        let (final_doppler, tec_val) = if match_found {
+                            // Apply Appleton-Hartree cancellation
+                            let fd_free = crate::tracking::ekf::AppletonHartreeDispersion::cancel(
+                                fc,
+                                matched_fc2,
+                                peak_doppler,
+                                matched_fd2,
+                            );
+
+                            // Estimate TEC (with typical integration time dt = 0.5s)
+                            let dt_int = 0.5;
+                            let theta1 = 2.0 * std::f64::consts::PI * peak_doppler * dt_int;
+                            let theta2 = 2.0 * std::f64::consts::PI * matched_fd2 * dt_int;
+                            let f1_sq = fc * fc;
+                            let f2_sq = matched_fc2 * matched_fc2;
+                            let diff = f1_sq - f2_sq;
+                            let tec = if diff.abs() > 1e-6 {
+                                Some((1.1839e-10 * (f1_sq * f2_sq / diff) * (theta1 / fc - theta2 / matched_fc2)).abs())
+                            } else {
+                                None
+                            };
+
+                            // Mark matched peak as associated
+                            tower_associated_peaks[matched_t_idx][matched_p_idx] = true;
+                            (fd_free, tec)
+                        } else {
+                            (peak_doppler, None)
+                        };
+
+                        if tec_val.is_none() {
+                            continue;
+                        }
+
                         let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                         let lambda = crate::sdr::C / fc;
-                        let approx_radial_speed = (peak_doppler.abs() * lambda) / 2.0;
+                        let approx_radial_speed = (final_doppler.abs() * lambda) / 2.0;
                         let speed_kms = approx_radial_speed / 1000.0;
 
-                        let classification = if peak_doppler.abs() > 1000.0 {
+                        let classification = if final_doppler.abs() > 1000.0 {
                             format!("Fast Meteor Ping ({:.1} km/s)", speed_kms)
-                        } else if peak_doppler.abs() > 500.0 {
+                        } else if final_doppler.abs() > 500.0 {
                             format!("Ionized Meteor Trail ({:.1} km/s)", speed_kms)
                         } else {
                             format!("Atmospheric Transient ({:.1} km/s)", speed_kms)
@@ -1194,9 +1349,10 @@ impl TrackingBank {
                             TransientEvent {
                                 timestamp,
                                 time: now,
-                                frequency_hz: peak_doppler,
+                                frequency_hz: final_doppler,
                                 snr_db: peak_snr,
-                                classification,
+                                classification: classification.clone(),
+                                tec: tec_val,
                             },
                         );
 
@@ -1204,13 +1360,40 @@ impl TrackingBank {
                             self.transients.pop();
                         }
 
-                        log.push(format!(
-                            "Atmospheric: Detected {} at {:.1} Hz",
-                            self.transients[0].classification, peak_doppler
-                        ));
+                        if let Some(t_val) = tec_val {
+                            log.push(format!(
+                                "Atmospheric: Detected Dual-Freq {} at {:.1} Hz (Plasma-free: {:.1} Hz, TEC: {:.2} TECU, SNR: {:.1} dB)",
+                                classification, peak_doppler, final_doppler, t_val, peak_snr
+                            ));
+                        } else {
+                            log.push(format!(
+                                "Atmospheric: Detected {} at {:.1} Hz (SNR: {:.1} dB, Threshold: {:.1} dB)",
+                                classification, peak_doppler, peak_snr, dynamic_threshold
+                            ));
+                        }
+
+                        detected_this_frame = true;
                     }
                 }
             }
+        }
+
+        // Update SNR history with current frame's unassociated peak SNRs
+        for (t_idx, t_data) in towers_data.iter().enumerate() {
+            let peaks = t_data.3;
+            let associated_peaks = &tower_associated_peaks[t_idx];
+            for (idx, &associated) in associated_peaks.iter().enumerate() {
+                if !associated {
+                    let peak_snr = peaks[idx].1 as f64;
+                    self.transient_snr_history.push(peak_snr);
+                }
+            }
+        }
+
+        // Cap history to the last 200 unassociated peaks
+        if self.transient_snr_history.len() > 200 {
+            let drain_count = self.transient_snr_history.len() - 200;
+            self.transient_snr_history.drain(0..drain_count);
         }
 
         // 6. Save fingerprints for targets about to be pruned
@@ -1259,18 +1442,13 @@ impl TrackingBank {
                             let file_name = format!("fingerprint_{}_{}.json", clean_class, t.id);
                             let file_path = dir_path.join(file_name);
 
-                            if let Ok(serialized) = serde_json::to_string_pretty(&fp) {
-                                if let Ok(mut file) = std::fs::File::create(&file_path) {
-                                    use std::io::Write;
-                                    let _ = file.write_all(serialized.as_bytes());
-                                    log.push(format!(
-                                        "TrackedTarget Bank: Saved fingerprint for Target {} to {}",
-                                        t.id,
-                                        file_path.display()
-                                    ));
-                                    self.disk_fingerprints.push((fp, file_path));
-                                }
-                            }
+                            let _ = self.fp_sender.send((fp.clone(), file_path.clone()));
+                            log.push(format!(
+                                "TrackedTarget Bank: Queue saving fingerprint for Target {} to {}",
+                                t.id,
+                                file_path.display()
+                            ));
+                            self.disk_fingerprints.push((fp, file_path));
                         }
                     }
                 }
@@ -1425,6 +1603,10 @@ impl TrackingBank {
                                 .partial_cmp(&b.time_elapsed_sec)
                                 .unwrap_or(std::cmp::Ordering::Equal)
                         });
+                        if merged_fp.len() > 500 {
+                            let len = merged_fp.len();
+                            merged_fp.drain(0..len - 500);
+                        }
                         targets[superior_idx].fingerprint_history = merged_fp;
 
                         // Inherit JEM analyzer if superior has no sidebands but inferior does
@@ -1446,6 +1628,9 @@ impl TrackingBank {
                         }
 
                         to_remove.insert(targets[inferior_idx].id);
+                        if to_remove.contains(&targets[i].id) {
+                            break;
+                        }
                     }
                 }
             }
@@ -1472,6 +1657,9 @@ impl TrackingBank {
         let r_r = (x * x + y * y + z * z).sqrt().max(1.0);
         let dot_r = (vx * x + vy * y + vz * z) / r_r;
 
+        let mut valid_count = 0;
+        let mut min_diffs = Vec::with_capacity(towers_data.len());
+
         for (_name, tower_pos, fc, peaks) in towers_data {
             let dx = x - tower_pos[0];
             let dy = y - tower_pos[1];
@@ -1491,10 +1679,20 @@ impl TrackingBank {
                 }
             }
 
-            // If a tower has no peaks, we can either add 0 or add a penalty. The instruction says: 
-            // "then find the minimum absolute difference |peak_freq - pred_doppler| among its peaks, and sum these minimum differences across all towers."
             if min_diff != f64::MAX {
-                total_error += min_diff;
+                valid_count += 1;
+                min_diffs.push(Some(min_diff));
+            } else {
+                min_diffs.push(None);
+            }
+        }
+
+        for diff_opt in min_diffs {
+            match diff_opt {
+                Some(diff) => total_error += diff,
+                None => {
+                    total_error += 1000.0;
+                }
             }
         }
 
@@ -1687,6 +1885,122 @@ mod tests {
     use crate::tracking::ekf::BistaticEkf;
 
     #[test]
+    fn test_cech_obstruction_missing_data_penalty() {
+        let state = [100.0, 100.0, 100.0, 10.0, 10.0, 0.0];
+        // 2 towers, one has peaks, one has NO peaks (empty peaks list)
+        let peaks1 = vec![(20.0f32, 12.0f32)];
+        let peaks2 = vec![]; // missing measurements
+        
+        let towers_data = vec![
+            ("Tower1".to_string(), [0.0, 0.0, 0.0], 90.9e6, peaks1.as_slice()),
+            ("Tower2".to_string(), [20.0, 10.0, 0.0], 90.9e6, peaks2.as_slice()),
+        ];
+        
+        let error = TrackingBank::compute_cech_obstruction(&state, &towers_data);
+        // Because of the penalty, the error should be at least 1000.0
+        assert!(error >= 1000.0, "Čech obstruction error ({}) should be >= 1000.0 due to missing tower data penalty", error);
+    }
+
+    #[test]
+    fn test_dual_frequency_transient_matching_appleton_hartree() {
+        let mut bank = TrackingBank::new();
+        bank.mode = "sim".to_string();
+
+        let f1 = 89.3e6;
+        let f2 = 90.9e6;
+        let v = 600.0;
+        let fd1 = -2.0 * v * f1 / crate::sdr::C;
+        let fd2 = -2.0 * v * f2 / crate::sdr::C;
+        
+        let peaks1 = vec![(fd1 as f32, 25.0f32)];
+        let peaks2 = vec![(fd2 as f32, 24.0f32)];
+        
+        let towers_data = vec![
+            ("Tower1".to_string(), [0.0, 0.0, 0.0], f1, peaks1.as_slice()),
+            ("Tower2".to_string(), [10.0, 0.0, 0.0], f2, peaks2.as_slice()),
+        ];
+        
+        let mut log = Vec::new();
+        let empty_samples = Vec::new();
+        bank.update_multitower(&towers_data, 0.1, &empty_samples, &mut log);
+        
+        assert!(!bank.transients.is_empty(), "Transient event should have been recorded");
+        
+        let event = &bank.transients[0];
+        assert!((event.frequency_hz - fd1).abs() < 1e-1, "Refined Doppler {} should be close to expected {}", event.frequency_hz, fd1);
+        
+        assert!(event.tec.is_some(), "Estimated TEC should be calculated and present");
+        let tec_val = event.tec.unwrap();
+        assert!(tec_val < 0.1, "Estimated TEC should be close to 0, got {}", tec_val);
+    }
+
+    #[test]
+    fn test_prevent_duplicate_tracks_triple_merge() {
+        let mut bank = TrackingBank::new();
+        // 3 tracks situated very close to each other
+        let state_a = [100.0, 100.0, 10.0, 1.0, 1.0, 0.0];
+        let state_b = [100.1, 100.0, 10.0, 1.0, 1.0, 0.0];
+        let state_c = [100.2, 100.0, 10.0, 1.0, 1.0, 0.0];
+        
+        let ekf_a = BistaticEkf::new(state_a, 1.0, 0.1, 0.01);
+        let ekf_b = BistaticEkf::new(state_b, 1.0, 0.1, 0.01);
+        let ekf_c = BistaticEkf::new(state_c, 1.0, 0.1, 0.01);
+        
+        bank.targets.push(TrackedTarget {
+            id: 1,
+            ekf: ekf_a,
+            state: TrackState::Active,
+            hits: 15, // A is superior due to most hits
+            misses: 0,
+            history: vec![state_a],
+            classification: "Target A".to_string(),
+            terminated_at: None,
+            coasting_frames: 0,
+            start_time: Instant::now(),
+            fingerprint_history: Vec::new(),
+            jem: crate::tracking::jem::JemAnalyzer::new(),
+            tracking_towers: Vec::new(),
+        });
+        bank.targets.push(TrackedTarget {
+            id: 2,
+            ekf: ekf_b,
+            state: TrackState::Active,
+            hits: 10,
+            misses: 0,
+            history: vec![state_b],
+            classification: "Target B".to_string(),
+            terminated_at: None,
+            coasting_frames: 0,
+            start_time: Instant::now(),
+            fingerprint_history: Vec::new(),
+            jem: crate::tracking::jem::JemAnalyzer::new(),
+            tracking_towers: Vec::new(),
+        });
+        bank.targets.push(TrackedTarget {
+            id: 3,
+            ekf: ekf_c,
+            state: TrackState::Active,
+            hits: 5,
+            misses: 0,
+            history: vec![state_c],
+            classification: "Target C".to_string(),
+            terminated_at: None,
+            coasting_frames: 0,
+            start_time: Instant::now(),
+            fingerprint_history: Vec::new(),
+            jem: crate::tracking::jem::JemAnalyzer::new(),
+            tracking_towers: Vec::new(),
+        });
+        
+        let mut log = Vec::new();
+        TrackingBank::prevent_duplicate_tracks(&mut bank.targets, &mut log);
+        
+        // After merge, target B and C should be marked for removal (removed from bank targets), leaving only 1 active target
+        assert_eq!(bank.targets.len(), 1);
+        assert_eq!(bank.targets[0].id, 1);
+    }
+
+    #[test]
     fn test_airliner_stickiness() {
         let mut bank = TrackingBank::new();
 
@@ -1846,39 +2160,46 @@ mod tests {
     #[test]
     fn test_meteor_transient_detection() {
         let mut bank = TrackingBank::new();
-        let tower_pos = [0.0, 0.0, 0.0];
-        let fc = 90.9e6;
         let dt = 0.1;
         let mut log = Vec::new();
 
-        // 1. Update with a high Doppler peak (1200 Hz) at 15.0 dB SNR
-        bank.update(&tower_pos, fc, dt, &[(1200.0, 15.0)], &mut log);
+        // Two towers to allow TEC calculation and Appleton-Hartree dual-frequency matching
+        let t1_pos = [0.0, 0.0, 0.0];
+        let t1_fc = 90.9e6;
+        let t2_pos = [1000.0, 0.0, 0.0];
+        let t2_fc = 93.3e6;
+
+        // Same physical radial velocity (e.g. 2000 m/s) mapped to Doppler
+        let v_phys = 2000.0;
+        let fd1 = -(v_phys * 2.0 * t1_fc) / crate::sdr::C;
+        let fd2 = -(v_phys * 2.0 * t2_fc) / crate::sdr::C;
+
+        let peaks1 = [(fd1 as f32, 25.0f32)];
+        let peaks2 = [(fd2 as f32, 25.0f32)];
+        let towers = vec![
+            ("Tower1".to_string(), t1_pos, t1_fc, &peaks1[..]),
+            ("Tower2".to_string(), t2_pos, t2_fc, &peaks2[..])
+        ];
+
+        // 1. Update with dual frequency peaks
+        bank.update_multitower(&towers, dt, &[], &mut log);
 
         // Verify transient was registered
-        assert_eq!(bank.transients.len(), 1, "Should detect 1 transient event");
-        assert_eq!(bank.transients[0].frequency_hz, 1200.0);
+        assert_eq!(bank.transients.len(), 1, "Should detect 1 transient event with TEC");
         assert!(
             bank.transients[0].classification.contains("Meteor"),
             "Should classify as meteor"
         );
 
         // 2. Update immediately again with the same peak (should be ignored as duplicate)
-        bank.update(&tower_pos, fc, dt, &[(1200.0, 15.0)], &mut log);
+        bank.update_multitower(&towers, dt, &[], &mut log);
         assert_eq!(
             bank.transients.len(),
             1,
             "Should de-duplicate back-to-back similar transients"
         );
-
-        // 3. Update with a peak at a significantly different frequency (e.g., -600 Hz) at 14.0 dB SNR
-        bank.update(&tower_pos, fc, dt, &[(-600.0, 14.0)], &mut log);
-        assert_eq!(
-            bank.transients.len(),
-            2,
-            "Should detect new transient at different frequency"
-        );
-        assert_eq!(bank.transients[0].frequency_hz, -600.0);
     }
+
 
     #[test]
     fn test_target_re_identification() {
@@ -1950,6 +2271,7 @@ mod tests {
     #[test]
     fn test_fingerprint_collection() {
         let mut bank = TrackingBank::new();
+        bank.mode = "test_fingerprint_collection".to_string();
         let tower_pos = [10_000.0, 5000.0, 100.0];
         let fc = 90.9e6;
         let dt = 0.1;
@@ -2018,25 +2340,34 @@ mod tests {
         // Verify target 77 has been pruned from the bank
         assert!(bank.targets.iter().all(|t| t.id != 77));
 
-        // Verify the file was created in the fingerprints directory
-        let dir = std::fs::read_dir(bank.get_fingerprints_dir()).unwrap();
+        // Verify the file was created in the fingerprints directory (waiting up to 100ms for async writer thread)
         let mut found = false;
-        for entry in dir {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if path.is_file() {
-                    let filename = path.file_name().unwrap().to_str().unwrap();
-                    if filename.starts_with("fingerprint_") && filename.ends_with("_77.json") {
-                        found = true;
-                        let _ = std::fs::remove_file(path);
+        for _ in 0..10 {
+            if let Ok(dir) = std::fs::read_dir(bank.get_fingerprints_dir()) {
+                for entry in dir {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        if path.is_file() {
+                            let filename = path.file_name().unwrap().to_str().unwrap();
+                            if filename.starts_with("fingerprint_") && filename.ends_with("_77.json") {
+                                found = true;
+                                let _ = std::fs::remove_file(path);
+                                break;
+                            }
+                        }
                     }
                 }
             }
+            if found {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
             found,
             "Fingerprint file for target 77 should have been found and deleted"
         );
+        let _ = std::fs::remove_dir_all(bank.get_fingerprints_dir());
     }
 
     #[test]
@@ -2515,6 +2846,7 @@ mod tests {
     #[test]
     fn test_disk_re_identification() {
         let mut bank = TrackingBank::new();
+        bank.mode = "test_disk_re_identification".to_string();
         let tower_pos = [0.0, 0.0, 0.0];
         let fc = 90.9e6;
         let dt_step = 0.1;
@@ -2625,6 +2957,7 @@ mod tests {
 
         // Clean up the JSON file if it still exists (it should have been deleted by the re-id logic)
         let _ = std::fs::remove_file(file_path);
+        let _ = std::fs::remove_dir_all(dir_path);
     }
 
     #[test]

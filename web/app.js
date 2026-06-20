@@ -1,11 +1,37 @@
 // Tactical Radar Companion Script
 // Parse dynamic host/port from URL query params (useful for custom ports or remote HUD hosts)
 const urlParams = new URLSearchParams(window.location.search);
-const wsHost = urlParams.get("host") || window.location.hostname || "127.0.0.1";
-const wsPort = urlParams.get("port") || "8085";
-const wsUrl = `ws://${wsHost}:${wsPort}`;
+let wsHost = urlParams.get("host") || window.location.hostname || "127.0.0.1";
+if (wsHost === "localhost" || wsHost === "[::1]") {
+    wsHost = "127.0.0.1";
+}
+let wsPort = urlParams.get("port") || "8085";
+let wsUrl = `ws://${wsHost}:${wsPort}`;
 let ws = null;
 let reconnectTimer = null;
+
+async function initConnection() {
+    try {
+        const response = await fetch("/config");
+        if (response.ok) {
+            const config = await response.json();
+            let resolvedHost = config.ws_host || "127.0.0.1";
+            if (resolvedHost === "localhost" || resolvedHost === "[::1]" || resolvedHost === "0.0.0.0") {
+                resolvedHost = window.location.hostname || "127.0.0.1";
+                if (resolvedHost === "localhost" || resolvedHost === "[::1]") {
+                    resolvedHost = "127.0.0.1";
+                }
+            }
+            const resolvedPort = config.ws_port || "8085";
+            const finalHost = urlParams.get("host") || resolvedHost;
+            const finalPort = urlParams.get("port") || resolvedPort;
+            wsUrl = `ws://${finalHost}:${finalPort}`;
+        }
+    } catch (e) {
+        console.log("Could not fetch /config, using default connection settings", e);
+    }
+    connect();
+}
 
 // TUI states mirrored
 let systemStatus = "OFFLINE";
@@ -22,6 +48,19 @@ let selectedTargetId = null;
 
 // DOM Elements
 const statusEl = document.getElementById("sys-status");
+// Phase 3 & 4 Controls & Displays
+const cicModeSelect = document.getElementById("cic-mode-select");
+const stareModeToggle = document.getElementById("stare-mode-toggle");
+const stareXEl = document.getElementById("stare-x");
+const stareYEl = document.getElementById("stare-y");
+const stareZEl = document.getElementById("stare-z");
+const ghostMicToggle = document.getElementById("ghost-mic-toggle");
+const ghostMicGain = document.getElementById("ghost-mic-gain");
+const ghostMicGainVal = document.getElementById("ghost-mic-gain-val");
+const cepstrumCanvas = document.getElementById("cepstrum-scope");
+const cepstrumCtx = cepstrumCanvas ? cepstrumCanvas.getContext("2d") : null;
+const respirationEl = document.getElementById("telemetry-respiration");
+const payloadEl = document.getElementById("telemetry-payload");
 const clippingEl = document.getElementById("sys-clipping");
 const cancellationEl = document.getElementById("sys-cancellation");
 const ellipsesEl = document.getElementById("sys-ellipses");
@@ -46,6 +85,8 @@ const iqConstellationCtx = iqConstellationCanvas ? iqConstellationCanvas.getCont
 // Antenna Alignment & JEM Spectrogram Globals
 const alignerCanvas = document.getElementById("antenna-aligner");
 const alignerCtx = alignerCanvas ? alignerCanvas.getContext("2d") : null;
+const multipathCanvas = document.getElementById("multipath-scope");
+const multipathCtx = multipathCanvas ? multipathCanvas.getContext("2d") : null;
 
 let antennaHeading = 0;
 let jemViewMode = "FFT"; // "FFT" or "SPECTROGRAM"
@@ -53,6 +94,28 @@ let microDopplerHistory = [];
 let lastJemTargetId = null;
 let jemOffscreenCanvas = null;
 let jemOffscreenCtx = null;
+
+const jemTemplates = {
+    'none': { name: "No Template Selected", desc: "", lines: [], envelope: null },
+    
+    // DRONES
+    'dji_mavic': { name: "DJI Mavic (Small Quad)", desc: "High RPM (6000-8000), 2-blade props", lines: [-200, -100, 100, 200], envelope: { span: 250, shape: "steep" } },
+    'dji_inspire': { name: "DJI Inspire (Large Quad)", desc: "Medium RPM (4000-6000), 2-blade props", lines: [-150, -75, 75, 150], envelope: { span: 180, shape: "steep" } },
+    'fpv_racer': { name: "Custom FPV Racer", desc: "Extreme RPM (15000+), 3-blade props", lines: [-300, -150, 150, 300], envelope: { span: 400, shape: "gradual" } },
+
+    // HELICOPTERS
+    'heli_light': { name: "Light Heli (Bell 206)", desc: "Main ~6.5 Hz, Tail ~40 Hz", lines: [-80, -40, -6.5, 6.5, 40, 80], envelope: { span: 100, shape: "sharp" } },
+    'heli_heavy': { name: "Heavy Lift (CH-47)", desc: "Tandem, ~3.7 Hz BPF, Huge RCS", lines: [-11.1, -7.4, -3.7, 3.7, 7.4, 11.1], envelope: { span: 40, shape: "wide" } },
+
+    // PROPELLERS
+    'prop_cessna': { name: "Cessna 172 (Single Prop)", desc: "2-blade prop, 2400 RPM (80 Hz BPF)", lines: [-320, -240, -160, -80, 80, 160, 240, 320], envelope: { span: 350, shape: "gradual" } },
+    'prop_c130': { name: "C-130 Hercules", desc: "4-blade turboprop (66 Hz BPF)", lines: [-264, -198, -132, -66, 66, 132, 198, 264], envelope: { span: 300, shape: "sharp" } },
+
+    // TURBOFANS (JETS)
+    'jet_737': { name: "Boeing 737 (Turbofan)", desc: "CFM56 (BPF 1920 Hz -> Aliased to 80 Hz)", lines: [-80, 80], envelope: { span: 200, shape: "turbofan" } },
+    'jet_fighter': { name: "F-16 Fighter", desc: "F110 Low Bypass", lines: [-150, -45, 45, 150], envelope: { span: 400, shape: "turbofan" } }
+};
+let currentJemTemplate = 'none';
 
 // 3D View State
 let yaw3d = -0.6;
@@ -88,6 +151,7 @@ function addLog(text, type = "system-msg") {
 function connect() {
     addLog(`Establishing connection to Rust server on ${wsUrl}...`, "system-msg");
     ws = new WebSocket(wsUrl);
+    ws.binaryType = "arraybuffer";
 
     ws.onopen = () => {
         statusEl.innerText = "CONNECTED";
@@ -100,6 +164,28 @@ function connect() {
     };
 
     ws.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+            const int16View = new Int16Array(event.data);
+            const floatData = new Float32Array(int16View.length);
+            for (let i = 0; i < int16View.length; i++) {
+                floatData[i] = int16View[i] / 32768.0;
+            }
+            playAudioChunk(floatData);
+            return;
+        }
+
+        if (typeof Blob !== "undefined" && event.data instanceof Blob) {
+            event.data.arrayBuffer().then(buf => {
+                const int16View = new Int16Array(buf);
+                const floatData = new Float32Array(int16View.length);
+                for (let i = 0; i < int16View.length; i++) {
+                    floatData[i] = int16View[i] / 32768.0;
+                }
+                playAudioChunk(floatData);
+            });
+            return;
+        }
+
         try {
             const data = JSON.parse(event.data);
             if (data.targets === undefined && data.waterfall_row === undefined) {
@@ -141,13 +227,18 @@ function handleTelemetry(data) {
     
     // Process new transients to print log alerts
     const newTransients = data.transients || [];
-    if (newTransients.length > transients.length) {
-        for (let i = transients.length; i < newTransients.length; i++) {
-            const e = newTransients[i];
-            addLog(`METEOR TRAIL DETECTED: Type=${e.classification}, Doppler=${e.frequency_hz.toFixed(1)} Hz, SNR=${e.snr_db.toFixed(1)} dB`, "meteor-msg");
+    for (let i = newTransients.length - 1; i >= 0; i--) {
+        const e = newTransients[i];
+        const key = `${e.timestamp}_${e.frequency_hz}`;
+        const alreadyLogged = transients.some(t => `${t.timestamp}_${t.frequency_hz}` === key);
+        if (!alreadyLogged) {
+            let logMsg = `METEOR TRAIL DETECTED: Type=${e.classification}, Doppler=${e.frequency_hz.toFixed(1)} Hz, SNR=${e.snr_db.toFixed(1)} dB`;
+            if (e.tec !== undefined && e.tec !== null) {
+                logMsg += `, TEC=${e.tec.toFixed(3)} TECU`;
+            }
+            addLog(logMsg, "meteor-msg");
             
             // Speak meteor alert
-            const key = `${e.timestamp}_${e.frequency_hz}`;
             if (!announcedMeteors.has(key)) {
                 announcedMeteors.add(key);
                 if (announcedMeteors.size > 100) {
@@ -157,13 +248,15 @@ function handleTelemetry(data) {
                 speakVoiceAlert("Meteor trail detected");
             }
             
-            // Trigger screen shake
-            const hudOverlay = document.querySelector(".hud-overlay");
-            if (hudOverlay) {
-                hudOverlay.classList.add("shake-active");
-                hudOverlay.addEventListener("animationend", () => {
-                    hudOverlay.classList.remove("shake-active");
-                }, { once: true });
+            // Trigger screen shake only if enabled
+            if (data.screen_shake) {
+                const hudOverlay = document.querySelector(".hud-overlay");
+                if (hudOverlay) {
+                    hudOverlay.classList.add("shake-active");
+                    hudOverlay.addEventListener("animationend", () => {
+                        hudOverlay.classList.remove("shake-active");
+                    }, { once: true });
+                }
             }
         }
     }
@@ -264,8 +357,51 @@ function handleTelemetry(data) {
 
     // Update Text elements
     clippingEl.innerText = `${(clippingRate * 100).toFixed(1)}%`;
-    cancellationEl.innerText = `${cancellationRatio.toFixed(1)} dB`;
+    cancellationEl.innerText = `${Math.max(0.0, cancellationRatio).toFixed(1)} dB`;
     ellipsesEl.innerText = ellipseMode.toUpperCase();
+
+    // Update Airspace summary
+    let planes = 0;
+    let drones = 0;
+    let other = 0;
+    targets.forEach(t => {
+        const classStr = (t.classification || "").toLowerCase();
+        const callStr = (t.callsign || "").toLowerCase();
+        if (classStr.includes("drone") || classStr.includes("uav") || callStr.includes("drn")) {
+            drones++;
+        } else if (classStr.includes("plane") || classStr.includes("b78") || classStr.includes("commercial") || callStr.includes("aal")) {
+            planes++;
+        } else {
+            other++;
+        }
+    });
+
+    const sumDensity = document.getElementById("sum-density");
+    if (sumDensity) {
+        if (targets.length === 0) {
+            sumDensity.innerText = "CLEAR";
+            sumDensity.style.color = "var(--accent-green)";
+        } else if (targets.length <= 2) {
+            sumDensity.innerText = "LOW DENSITY";
+            sumDensity.style.color = "var(--accent-green)";
+        } else if (targets.length <= 4) {
+            sumDensity.innerText = "MODERATE";
+            sumDensity.style.color = "var(--accent-yellow)";
+        } else {
+            sumDensity.innerText = "HIGH DENSITY";
+            sumDensity.style.color = "#ff1744";
+        }
+    }
+
+    const sumTotalTracks = document.getElementById("sum-total-tracks");
+    if (sumTotalTracks) {
+        sumTotalTracks.innerText = targets.length;
+    }
+
+    const sumBreakdown = document.getElementById("sum-breakdown");
+    if (sumBreakdown) {
+        sumBreakdown.innerHTML = `PLANES: <span style="color:var(--accent-cyan); font-weight:bold">${planes}</span> | DRONES: <span style="color:var(--accent-yellow); font-weight:bold">${drones}</span> | OTHER: <span style="color:var(--accent-orange); font-weight:bold">${other}</span>`;
+    }
 
     // Update live status indicators
     const sdrStatusEl = document.getElementById("sdr-status");
@@ -275,13 +411,13 @@ function handleTelemetry(data) {
     }
 
     const sdrFreqEl = document.getElementById("sdr-frequency");
-    if (sdrFreqEl && data.sdr_frequency !== undefined) {
-        sdrFreqEl.innerText = `${(data.sdr_frequency / 1e6).toFixed(3)} MHz`;
+    if (sdrFreqEl && data.center_freq !== undefined) {
+        sdrFreqEl.innerText = `${(data.center_freq / 1e6).toFixed(3)} MHz`;
     }
 
     const sdrRateEl = document.getElementById("sdr-sample-rate");
-    if (sdrRateEl && data.sdr_sample_rate !== undefined) {
-        sdrRateEl.innerText = `${(data.sdr_sample_rate / 1e6).toFixed(3)} MSPS`;
+    if (sdrRateEl && data.sample_rate !== undefined) {
+        sdrRateEl.innerText = `${(data.sample_rate / 1e6).toFixed(3)} MSPS`;
     }
 
     const sdrOverflowEl = document.getElementById("sdr-overflow");
@@ -313,6 +449,11 @@ function handleTelemetry(data) {
         if (sdrGainVal) sdrGainVal.innerText = `${data.sdr_gain.toFixed(0)} dB`;
     }
 
+    const sdrAgcInput = document.getElementById("sdr-agc");
+    if (data.software_agc !== undefined && sdrAgcInput) {
+        sdrAgcInput.checked = data.software_agc;
+    }
+
     const sdrOffsetInput = document.getElementById("sdr-offset");
     if (data.sdr_offset !== undefined && sdrOffsetInput && document.activeElement !== sdrOffsetInput) {
         sdrOffsetInput.value = data.sdr_offset;
@@ -322,13 +463,51 @@ function handleTelemetry(data) {
     if (data.sdr_dc_block !== undefined && sdrDcBlockInput && document.activeElement !== sdrDcBlockInput) {
         sdrDcBlockInput.checked = data.sdr_dc_block;
     }
+    const sdrOneBitInput = document.getElementById("sdr-one-bit");
+    if (data.one_bit_mode !== undefined && sdrOneBitInput && document.activeElement !== sdrOneBitInput) {
+        sdrOneBitInput.checked = data.one_bit_mode;
+    }
 
     const unconfirmedToggle = document.getElementById("unconfirmed-toggle");
     if (data.show_unconfirmed !== undefined && unconfirmedToggle && document.activeElement !== unconfirmedToggle) {
         unconfirmedToggle.checked = data.show_unconfirmed;
     }
 
+    const shakeToggle = document.getElementById("shake-toggle");
+    if (data.screen_shake !== undefined && shakeToggle && document.activeElement !== shakeToggle) {
+        shakeToggle.checked = data.screen_shake;
+    }
+
     // Render components
+    if (selTarget) {
+        if (cicModeSelect && document.activeElement !== cicModeSelect) {
+            cicModeSelect.value = selTarget.cic_mode || "Seismic";
+        }
+        if (stareModeToggle && document.activeElement !== stareModeToggle) {
+            stareModeToggle.checked = !!selTarget.stare_mode_active;
+        }
+        if (stareXEl && document.activeElement !== stareXEl) {
+            stareXEl.value = (selTarget.pos_enu && selTarget.pos_enu[0] !== undefined) ? selTarget.pos_enu[0].toFixed(1) : 0;
+        }
+        if (stareYEl && document.activeElement !== stareYEl) {
+            stareYEl.value = (selTarget.pos_enu && selTarget.pos_enu[1] !== undefined) ? selTarget.pos_enu[1].toFixed(1) : 0;
+        }
+        if (stareZEl && document.activeElement !== stareZEl) {
+            stareZEl.value = (selTarget.pos_enu && selTarget.pos_enu[2] !== undefined) ? selTarget.pos_enu[2].toFixed(1) : 0;
+        }
+        if (respirationEl) {
+            respirationEl.innerText = (selTarget.respiration_rate !== undefined && selTarget.respiration_rate !== null)
+                ? `${selTarget.respiration_rate.toFixed(2)} Hz`
+                : "N/A";
+        }
+        if (payloadEl) {
+            payloadEl.innerText = selTarget.payload_class || "N/A";
+        }
+    } else {
+        if (respirationEl) respirationEl.innerText = "N/A";
+        if (payloadEl) payloadEl.innerText = "N/A";
+    }
+
     updateTelemetryTable();
     drawWaterfallRow();
 
@@ -337,6 +516,9 @@ function handleTelemetry(data) {
     }
     if (data.constellation_points) {
         drawIqConstellation(data.constellation_points);
+    }
+    if (data.multipath_profile) {
+        drawMultipathProfile(data.multipath_profile, data.multipath_peak_refined);
     }
 
     // Update Tactical Records/High Scores
@@ -423,6 +605,9 @@ window.selectTarget = function(id) {
         selectedTargetId = id;
     }
     updateTelemetryTable();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ command: "SelectTarget", id: selectedTargetId }));
+    }
 };
 
 // Canvas Resize handlers
@@ -432,8 +617,25 @@ function resizeCanvases() {
     radarCanvas.height = rParent.clientHeight;
 
     const wParent = waterfallCanvas.parentElement;
+    const oldWidth = waterfallCanvas.width;
+    const oldHeight = waterfallCanvas.height;
+    
+    let backupCanvas = null;
+    if (oldWidth > 0 && oldHeight > 0) {
+        backupCanvas = document.createElement("canvas");
+        backupCanvas.width = oldWidth;
+        backupCanvas.height = oldHeight;
+        const backupCtx = backupCanvas.getContext("2d");
+        backupCtx.drawImage(waterfallCanvas, 0, 0);
+    }
+
     waterfallCanvas.width = wParent.clientWidth;
     waterfallCanvas.height = wParent.clientHeight;
+
+    if (backupCanvas) {
+        waterfallCtx.drawImage(backupCanvas, 0, 0, oldWidth, oldHeight, 0, 0, waterfallCanvas.width, waterfallCanvas.height);
+    }
+    waterfallCtx.imageSmoothingEnabled = false;
 
     if (elevationCanvas) {
         const eParent = elevationCanvas.parentElement;
@@ -460,6 +662,16 @@ function resizeCanvases() {
         const aParent = alignerCanvas.parentElement;
         alignerCanvas.width = aParent.clientWidth;
         alignerCanvas.height = aParent.clientHeight;
+    }
+    if (multipathCanvas) {
+        const mParent = multipathCanvas.parentElement;
+        multipathCanvas.width = mParent.clientWidth;
+        multipathCanvas.height = mParent.clientHeight;
+    }
+    if (cepstrumCanvas) {
+        const cParent = cepstrumCanvas.parentElement;
+        cepstrumCanvas.width = cParent.clientWidth;
+        cepstrumCanvas.height = cParent.clientHeight;
     }
 }
 window.addEventListener("resize", resizeCanvases);
@@ -557,6 +769,142 @@ function drawIqConstellation(points) {
         iqConstellationCtx.fill();
     });
 }
+
+function drawMultipathProfile(profile, refinedPeak) {
+    if (!multipathCanvas || !multipathCtx) return;
+    const w = multipathCanvas.width;
+    const h = multipathCanvas.height;
+    if (w === 0 || h === 0) return;
+
+    // Clear
+    multipathCtx.fillStyle = "rgba(3, 9, 20, 0.45)";
+    multipathCtx.fillRect(0, 0, w, h);
+
+    const paddingLeft = 40;
+    const paddingRight = 15;
+    const paddingTop = 20;
+    const paddingBottom = 25;
+
+    const graphWidth = w - paddingLeft - paddingRight;
+    const graphHeight = h - paddingTop - paddingBottom;
+
+    if (graphWidth <= 0 || graphHeight <= 0) return;
+
+    // Draw grid
+    multipathCtx.strokeStyle = "rgba(0, 229, 255, 0.08)";
+    multipathCtx.lineWidth = 1;
+    
+    // Y grid (4 levels)
+    for (let i = 1; i <= 4; i++) {
+        const y = paddingTop + graphHeight * (1 - i / 4);
+        multipathCtx.beginPath();
+        multipathCtx.moveTo(paddingLeft, y);
+        multipathCtx.lineTo(w - paddingRight, y);
+        multipathCtx.stroke();
+    }
+
+    // X grid (every 10 bins)
+    const numBins = profile.length;
+    for (let i = 0; i < numBins; i += 10) {
+        const x = paddingLeft + (i / (numBins - 1)) * graphWidth;
+        multipathCtx.beginPath();
+        multipathCtx.moveTo(x, paddingTop);
+        multipathCtx.lineTo(x, h - paddingBottom);
+        multipathCtx.stroke();
+        
+        const distKm = i * 1.171;
+        multipathCtx.fillStyle = "rgba(0, 229, 255, 0.6)";
+        multipathCtx.font = "8px Courier New";
+        multipathCtx.textAlign = "center";
+        multipathCtx.fillText(`${distKm.toFixed(0)}k`, x, h - 12);
+    }
+
+    // Find max value and index
+    let maxIdx = 0;
+    let maxVal = 1e-6;
+    for (let i = 0; i < numBins; i++) {
+        if (profile[i] > maxVal) {
+            maxVal = profile[i];
+            maxIdx = i;
+        }
+    }
+
+    // Plot line
+    multipathCtx.beginPath();
+    for (let i = 0; i < numBins; i++) {
+        const x = paddingLeft + (i / (numBins - 1)) * graphWidth;
+        const normVal = profile[i] / maxVal;
+        const y = paddingTop + graphHeight * (1 - normVal);
+        if (i === 0) {
+            multipathCtx.moveTo(x, y);
+        } else {
+            multipathCtx.lineTo(x, y);
+        }
+    }
+    multipathCtx.strokeStyle = "rgba(0, 229, 255, 0.85)";
+    multipathCtx.lineWidth = 1.5;
+    
+    // Glowing line
+    multipathCtx.shadowColor = "rgba(0, 229, 255, 0.5)";
+    multipathCtx.shadowBlur = 4;
+    multipathCtx.stroke();
+    multipathCtx.shadowBlur = 0; // reset
+
+    // Fill area under gradient
+    const gradient = multipathCtx.createLinearGradient(0, paddingTop, 0, h - paddingBottom);
+    gradient.addColorStop(0, "rgba(0, 229, 255, 0.2)");
+    gradient.addColorStop(1, "rgba(0, 229, 255, 0.0)");
+    
+    multipathCtx.beginPath();
+    multipathCtx.moveTo(paddingLeft, h - paddingBottom);
+    for (let i = 0; i < numBins; i++) {
+        const x = paddingLeft + (i / (numBins - 1)) * graphWidth;
+        const normVal = profile[i] / maxVal;
+        const y = paddingTop + graphHeight * (1 - normVal);
+        multipathCtx.lineTo(x, y);
+    }
+    multipathCtx.lineTo(w - paddingRight, h - paddingBottom);
+    multipathCtx.closePath();
+    multipathCtx.fillStyle = gradient;
+    multipathCtx.fill();
+
+    // Peak marker callout
+    if (maxVal > 1e-5) {
+        const peakIdx = (refinedPeak !== undefined && refinedPeak !== null) ? refinedPeak : maxIdx;
+        const maxPx = paddingLeft + (peakIdx / (numBins - 1)) * graphWidth;
+        const maxPy = paddingTop + graphHeight * (1 - 1.0);
+        
+        multipathCtx.fillStyle = "rgba(255, 59, 48, 0.85)"; // coral/red glow
+        multipathCtx.beginPath();
+        multipathCtx.arc(maxPx, maxPy, 3.5, 0, Math.PI * 2);
+        multipathCtx.fill();
+
+        multipathCtx.fillStyle = "#ffffff";
+        multipathCtx.font = "bold 8px Courier New";
+        multipathCtx.textAlign = peakIdx > numBins / 2 ? "right" : "left";
+        const offsetSign = peakIdx > numBins / 2 ? -6 : 6;
+        const maxDistKm = peakIdx * 1.171;
+        multipathCtx.fillText(`${maxDistKm.toFixed(3)} km`, maxPx + offsetSign, maxPy + 10);
+    }
+
+    // Axis
+    multipathCtx.strokeStyle = "rgba(0, 229, 255, 0.3)";
+    multipathCtx.lineWidth = 1;
+    multipathCtx.beginPath();
+    multipathCtx.moveTo(paddingLeft, paddingTop);
+    multipathCtx.lineTo(paddingLeft, h - paddingBottom);
+    multipathCtx.lineTo(w - paddingRight, h - paddingBottom);
+    multipathCtx.stroke();
+
+    // Y Axis labels
+    multipathCtx.fillStyle = "rgba(0, 229, 255, 0.6)";
+    multipathCtx.font = "8px Courier New";
+    multipathCtx.textAlign = "right";
+    multipathCtx.fillText("MAX", paddingLeft - 5, paddingTop + 4);
+    multipathCtx.fillText("0.5", paddingLeft - 5, paddingTop + graphHeight / 2 + 3);
+    multipathCtx.fillText("0.0", paddingLeft - 5, h - paddingBottom + 2);
+}
+
 
 // Radar PPI Paint Loop
 function drawRadarScope() {
@@ -1192,9 +1540,13 @@ function shiftAndDrawJemWaterfall(bins) {
     // Shift offscreen canvas left
     jemOffscreenCtx.drawImage(jemOffscreenCanvas, scrollAmount, 0, w - scrollAmount, h, 0, 0, w - scrollAmount, h);
 
-    // Paint new column at the right edge
+    // Clear rightmost column and fill with solid background
     const colX = w - scrollAmount;
     const colWidth = scrollAmount;
+    jemOffscreenCtx.clearRect(colX, 0, colWidth, h);
+    jemOffscreenCtx.fillStyle = "rgba(3, 9, 20, 1.0)";
+    jemOffscreenCtx.fillRect(colX, 0, colWidth, h);
+
     const numBins = bins.length;
 
     // Find max value in this bin array
@@ -1273,6 +1625,29 @@ function drawJEMSpectrum() {
         if (t.jem_frequency_hz !== undefined && t.jem_frequency_hz !== null) {
             jemCtx.fillText(`BPF: ${t.jem_frequency_hz.toFixed(1)} Hz`, padding + 10, padding + 34);
         }
+        
+        if (currentJemTemplate && jemTemplates[currentJemTemplate] && currentJemTemplate !== 'none') {
+            const tmpl = jemTemplates[currentJemTemplate];
+            jemCtx.strokeStyle = "rgba(255, 0, 255, 0.5)";
+            jemCtx.lineWidth = 1.5;
+            jemCtx.setLineDash([6, 4]);
+            
+            for (let hz of tmpl.lines) {
+                const hzNorm = (hz + 500) / 1000.0; 
+                const py = h - hzNorm * h;
+                jemCtx.beginPath();
+                jemCtx.moveTo(0, py);
+                jemCtx.lineTo(w, py);
+                jemCtx.stroke();
+            }
+            jemCtx.setLineDash([]);
+            
+            jemCtx.fillStyle = "rgba(255, 0, 255, 0.9)";
+            jemCtx.fillText(`OVERLAY: ${tmpl.name}`, padding + 10, padding + 46);
+            if (tmpl.desc) {
+                jemCtx.fillText(`${tmpl.desc}`, padding + 10, padding + 58);
+            }
+        }
     } else {
         jemCtx.fillStyle = "rgba(3, 9, 20, 0.4)";
         jemCtx.fillRect(0, 0, w, h);
@@ -1334,6 +1709,56 @@ function drawJEMSpectrum() {
         jemCtx.fillText(`TARGET: ${t.callsign || 'T' + t.id} [${t.classification || 'AIRCRAFT'}]`, padding + 10, padding + 22);
         if (t.jem_frequency_hz !== undefined && t.jem_frequency_hz !== null) {
             jemCtx.fillText(`BPF: ${t.jem_frequency_hz.toFixed(1)} Hz`, padding + 10, padding + 34);
+        }
+
+        if (currentJemTemplate && jemTemplates[currentJemTemplate] && currentJemTemplate !== 'none') {
+            const tmpl = jemTemplates[currentJemTemplate];
+            jemCtx.strokeStyle = "rgba(255, 0, 255, 0.4)";
+            jemCtx.lineWidth = 1;
+            jemCtx.setLineDash([4, 4]);
+            
+            for (let hz of tmpl.lines) {
+                const hzNorm = (hz + 500) / 1000.0; 
+                const px = padding + hzNorm * (w - 2 * padding);
+                jemCtx.beginPath();
+                jemCtx.moveTo(px, padding);
+                jemCtx.lineTo(px, h - padding);
+                jemCtx.stroke();
+            }
+
+            // Draw envelope outline if present
+            if (tmpl.envelope) {
+                jemCtx.strokeStyle = "rgba(255, 0, 255, 0.2)";
+                jemCtx.lineWidth = 2;
+                jemCtx.setLineDash([]);
+                const spanHz = tmpl.envelope.span;
+                const minHz = -spanHz/2;
+                const maxHz = spanHz/2;
+                const minPx = padding + ((minHz + 500) / 1000.0) * (w - 2 * padding);
+                const maxPx = padding + ((maxHz + 500) / 1000.0) * (w - 2 * padding);
+                
+                jemCtx.beginPath();
+                if (tmpl.envelope.shape === "steep") {
+                    jemCtx.moveTo(minPx - 10, h - padding);
+                    jemCtx.lineTo(minPx, padding + 20);
+                    jemCtx.lineTo(maxPx, padding + 20);
+                    jemCtx.lineTo(maxPx + 10, h - padding);
+                } else if (tmpl.envelope.shape === "wide" || tmpl.envelope.shape === "turbofan") {
+                    jemCtx.moveTo(minPx - 50, h - padding);
+                    jemCtx.quadraticCurveTo(w/2, padding - 20, maxPx + 50, h - padding);
+                } else {
+                    jemCtx.moveTo(minPx, h - padding);
+                    jemCtx.quadraticCurveTo(w/2, padding, maxPx, h - padding);
+                }
+                jemCtx.stroke();
+            }
+
+            jemCtx.setLineDash([]);
+            jemCtx.fillStyle = "rgba(255, 0, 255, 0.9)";
+            jemCtx.fillText(`OVERLAY: ${tmpl.name}`, padding + 10, padding + 46);
+            if (tmpl.desc) {
+                jemCtx.fillText(`${tmpl.desc}`, padding + 10, padding + 58);
+            }
         }
     }
 }
@@ -1413,6 +1838,16 @@ if (sdrGainInputListener) {
     });
 }
 
+const sdrAgcInputListener = document.getElementById("sdr-agc");
+if (sdrAgcInputListener) {
+    sdrAgcInputListener.addEventListener("change", (e) => {
+        const val = e.target.checked;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ command: "set_agc", enabled: val }));
+        }
+    });
+}
+
 if (sdrOffsetInputListener) {
     sdrOffsetInputListener.addEventListener("change", (e) => {
         const val = parseFloat(e.target.value);
@@ -1431,12 +1866,32 @@ if (sdrDcBlockInputListener) {
     });
 }
 
+const sdrOneBitInputListener = document.getElementById("sdr-one-bit");
+if (sdrOneBitInputListener) {
+    sdrOneBitInputListener.addEventListener("change", (e) => {
+        const val = e.target.checked;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ command: "set_one_bit_mode", value: val }));
+        }
+    });
+}
+
 const unconfirmedToggleListener = document.getElementById("unconfirmed-toggle");
 if (unconfirmedToggleListener) {
     unconfirmedToggleListener.addEventListener("change", (e) => {
         const val = e.target.checked;
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ command: "set_show_unconfirmed", value: val }));
+        }
+    });
+}
+
+const shakeToggleListener = document.getElementById("shake-toggle");
+if (shakeToggleListener) {
+    shakeToggleListener.addEventListener("change", (e) => {
+        const val = e.target.checked;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ command: "set_screen_shake", value: val }));
         }
     });
 }
@@ -1507,19 +1962,25 @@ if (antennaHeadingSlider) {
 const jemToggleBtn = document.getElementById("jem-toggle-btn");
 if (jemToggleBtn) {
     jemToggleBtn.addEventListener("click", () => {
-        if (jemViewMode === "FFT") {
-            jemViewMode = "SPECTROGRAM";
-            jemToggleBtn.innerText = "SWITCH TO JEM FFT";
-        } else {
-            jemViewMode = "FFT";
-            jemToggleBtn.innerText = "SWITCH TO SPECTROGRAM";
-        }
-        // Clear offscreen canvas on switch
+        jemViewMode = (jemViewMode === "FFT") ? "SPECTROGRAM" : "FFT";
+        jemToggleBtn.textContent = (jemViewMode === "FFT") ? "SWITCH TO SPECTROGRAM" : "SWITCH TO FFT";
         if (jemCanvas && jemOffscreenCtx) {
             jemOffscreenCtx.fillStyle = "rgba(3, 9, 20, 1.0)";
             jemOffscreenCtx.fillRect(0, 0, jemCanvas.width, jemCanvas.height);
         }
     });
+
+    const jemTemplateSelect = document.getElementById("jem-template-select");
+    if (jemTemplateSelect) {
+        jemTemplateSelect.addEventListener("change", (e) => {
+            currentJemTemplate = e.target.value;
+            // Clear waterfall canvas on switch so boundaries render cleanly
+            if (jemCanvas && jemOffscreenCtx) {
+                jemOffscreenCtx.fillStyle = "rgba(3, 9, 20, 1.0)";
+                jemOffscreenCtx.fillRect(0, 0, jemCanvas.width, jemCanvas.height);
+            }
+        });
+    }
 }
 
 // Antenna Alignment Scope Paint Loop
@@ -1648,7 +2109,7 @@ function drawAntennaAligner() {
 
 // Initialization
 resizeCanvases();
-connect();
+initConnection();
 
 // Global states
 let centerFreq = 90.9e6;
@@ -1734,6 +2195,32 @@ function resumeAudio() {
 }
 window.addEventListener("click", resumeAudio);
 window.addEventListener("keydown", resumeAudio);
+
+let nextPlayTime = 0;
+
+function playAudioChunk(float32Array) {
+    if (!audioCtx) return;
+    if (audioCtx.state === "suspended") return;
+    const sampleRate = 8000; // 8 kHz for Ghost Mic Acoustic PCM
+    try {
+        const buffer = audioCtx.createBuffer(1, float32Array.length, sampleRate);
+        const channelData = buffer.getChannelData(0);
+        channelData.set(float32Array);
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(masterCompressor || audioCtx.destination);
+
+        const now = audioCtx.currentTime;
+        if (nextPlayTime < now || nextPlayTime - now > 0.5) {
+            nextPlayTime = now;
+        }
+        source.start(nextPlayTime);
+        nextPlayTime += buffer.duration;
+    } catch (e) {
+        console.error("Error playing audio chunk:", e);
+    }
+}
 
 function playDopplerBeep(freq) {
     if (!audioCtx || audioCtx.state === "suspended") return;
@@ -1885,7 +2372,8 @@ function processHackerCommand(cmd) {
         if (primary === "spoof" && parts.length > 1) {
             const targetId = parseInt(parts[1]);
             if (!isNaN(targetId)) {
-                payload = `spoof --id ${targetId}`;
+                const extraArgs = parts.slice(2).join(" ");
+                payload = `spoof --id ${targetId}${extraArgs ? " " + extraArgs : ""}`;
             }
         }
         ws.send(JSON.stringify({
@@ -1972,3 +2460,206 @@ drawRadarScope();
 draw3DElevation();
 drawJEMSpectrum();
 drawAntennaAligner();
+
+// Phase 3 & 4: Cepstrum Scope draw loop
+function drawCepstrumScope() {
+    requestAnimationFrame(drawCepstrumScope);
+
+    if (!cepstrumCanvas || !cepstrumCtx) return;
+    const w = cepstrumCanvas.width;
+    const h = cepstrumCanvas.height;
+    if (w === 0 || h === 0) return;
+
+    cepstrumCtx.fillStyle = "rgba(3, 9, 20, 0.45)";
+    cepstrumCtx.fillRect(0, 0, w, h);
+
+    if (selectedTargetId === null) {
+        cepstrumCtx.fillStyle = "rgba(178, 235, 242, 0.4)";
+        cepstrumCtx.font = "12px Share Tech Mono";
+        cepstrumCtx.textAlign = "center";
+        cepstrumCtx.textBaseline = "middle";
+        cepstrumCtx.fillText("SELECT A TARGET TO VIEW CEPSTRUM & PHASE", w / 2, h / 2);
+        return;
+    }
+
+    const t = targets.find(target => target.id === selectedTargetId);
+    if (!t) {
+        cepstrumCtx.fillStyle = "rgba(178, 235, 242, 0.4)";
+        cepstrumCtx.font = "12px Share Tech Mono";
+        cepstrumCtx.textAlign = "center";
+        cepstrumCtx.textBaseline = "middle";
+        cepstrumCtx.fillText("TARGET NOT FOUND", w / 2, h / 2);
+        return;
+    }
+
+    const cep = t.cepstrum || [];
+    const ph = t.unwrapped_phase || [];
+
+    if (cep.length === 0 && ph.length === 0) {
+        cepstrumCtx.fillStyle = "rgba(178, 235, 242, 0.4)";
+        cepstrumCtx.font = "12px Share Tech Mono";
+        cepstrumCtx.textAlign = "center";
+        cepstrumCtx.textBaseline = "middle";
+        cepstrumCtx.fillText("NO CEPSTRUM/PHASE DATA", w / 2, h / 2);
+        return;
+    }
+
+    const padding = 20;
+    const drawWidth = w - 2 * padding;
+    const drawHeight = h - 2 * padding;
+
+    // Draw grid lines
+    cepstrumCtx.strokeStyle = "rgba(0, 229, 255, 0.05)";
+    cepstrumCtx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) {
+        // Horizontal grid
+        const y = padding + (i / 4) * drawHeight;
+        cepstrumCtx.beginPath();
+        cepstrumCtx.moveTo(padding, y);
+        cepstrumCtx.lineTo(w - padding, y);
+        cepstrumCtx.stroke();
+
+        // Vertical grid
+        const x = padding + (i / 4) * drawWidth;
+        cepstrumCtx.beginPath();
+        cepstrumCtx.moveTo(x, padding);
+        cepstrumCtx.lineTo(x, h - padding);
+        cepstrumCtx.stroke();
+    }
+
+    function drawDataset(data, color, label, isPhase) {
+        if (data.length < 2) return;
+        
+        let minVal = data[0];
+        let maxVal = data[0];
+        for (let i = 1; i < data.length; i++) {
+            if (data[i] < minVal) minVal = data[i];
+            if (data[i] > maxVal) maxVal = data[i];
+        }
+
+        const valRange = (maxVal - minVal) || 1.0;
+
+        cepstrumCtx.strokeStyle = color;
+        cepstrumCtx.lineWidth = 1.5;
+        cepstrumCtx.beginPath();
+
+        for (let i = 0; i < data.length; i++) {
+            const x = padding + (i / (data.length - 1)) * drawWidth;
+            const normVal = (data[i] - minVal) / valRange;
+            const y = h - padding - normVal * drawHeight;
+            if (i === 0) {
+                cepstrumCtx.moveTo(x, y);
+            } else {
+                cepstrumCtx.lineTo(x, y);
+            }
+        }
+        cepstrumCtx.stroke();
+
+        cepstrumCtx.fillStyle = color;
+        cepstrumCtx.font = "9px Share Tech Mono";
+        cepstrumCtx.textAlign = isPhase ? "left" : "right";
+        const labelY = padding + (isPhase ? 10 : 22);
+        const labelX = isPhase ? padding + 10 : w - padding - 10;
+        cepstrumCtx.fillText(`${label}: [${minVal.toFixed(1)}, ${maxVal.toFixed(1)}]`, labelX, labelY);
+    }
+
+    drawDataset(ph, "rgba(0, 230, 118, 0.85)", "PHASE (unwrap)", true);
+    drawDataset(cep, "rgba(0, 229, 255, 0.85)", "CEPSTRUM", false);
+}
+
+drawCepstrumScope();
+
+// Phase 3 & 4 Event Handlers
+if (cicModeSelect) {
+    cicModeSelect.addEventListener("change", (e) => {
+        const selectValue = e.target.value;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                command: "set_cic_mode",
+                target_id: selectedTargetId,
+                mode: selectValue
+            }));
+        }
+    });
+}
+
+function sendStareModeCommand() {
+    if (selectedTargetId === null) return;
+    const checkboxState = stareModeToggle ? stareModeToggle.checked : false;
+    const x = parseFloat(stareXEl ? stareXEl.value : 0) || 0.0;
+    const y = parseFloat(stareYEl ? stareYEl.value : 0) || 0.0;
+    const z = parseFloat(stareZEl ? stareZEl.value : 0) || 0.0;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            command: "SetStareMode",
+            target_id: selectedTargetId,
+            coords: [x, y, z],
+            enabled: checkboxState
+        }));
+    }
+}
+
+if (stareModeToggle) {
+    stareModeToggle.addEventListener("change", sendStareModeCommand);
+}
+if (stareXEl) stareXEl.addEventListener("input", sendStareModeCommand);
+if (stareYEl) stareYEl.addEventListener("input", sendStareModeCommand);
+if (stareZEl) stareZEl.addEventListener("input", sendStareModeCommand);
+
+if (ghostMicToggle) {
+    ghostMicToggle.addEventListener("change", (e) => {
+        const checkboxState = e.target.checked;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                command: "SetOmniMode",
+                mode: "GhostMic",
+                enabled: checkboxState
+            }));
+            ws.send(JSON.stringify({
+                command: "StartAudioStreaming"
+            }));
+            if (selectedTargetId !== null) {
+                ws.send(JSON.stringify({
+                    command: "toggle_ghost_mic",
+                    target_id: selectedTargetId,
+                    enabled: checkboxState
+                }));
+            }
+        }
+    });
+}
+
+if (ghostMicGain) {
+    ghostMicGain.addEventListener("input", (e) => {
+        const sliderValue = parseFloat(e.target.value);
+        if (ghostMicGainVal) {
+            ghostMicGainVal.innerText = sliderValue.toFixed(1);
+        }
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                command: "SetGhostMicGain",
+                gain: sliderValue
+            }));
+        }
+    });
+}
+
+// Tab navigation logic
+document.querySelectorAll(".tab-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+        document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+        document.querySelectorAll(".tab-content").forEach(c => c.classList.remove("active"));
+        
+        btn.classList.add("active");
+        const tabId = btn.getAttribute("data-tab");
+        const content = document.getElementById(tabId);
+        if (content) {
+            content.classList.add("active");
+        }
+        
+        // Trigger canvas resize to fit new tab containers
+        if (typeof resizeCanvases === "function") {
+            resizeCanvases();
+        }
+    });
+});

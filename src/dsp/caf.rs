@@ -281,6 +281,28 @@ impl CafEngine {
 }
 
 
+/// Compute the Channel Impulse Response (CIR) / multipath profile by correlating
+/// surveillance and reference channels over a range of delay bins.
+pub fn compute_cir(
+    surv: &[Complex<f32>],
+    reference: &[Complex<f32>],
+    max_delay: usize,
+) -> Vec<f32> {
+    let block_size = 512;
+    if surv.len() < block_size + max_delay || reference.len() < block_size + max_delay {
+        return vec![0.0; max_delay];
+    }
+
+    let mut profile = vec![0.0f32; max_delay];
+    for d in 0..max_delay {
+        let surv_sub = &surv[max_delay..max_delay + block_size];
+        let ref_sub = &reference[max_delay - d..max_delay - d + block_size];
+        let sum = correlate_slices(surv_sub, ref_sub);
+        profile[d] = sum.norm();
+    }
+    profile
+}
+
 // ============================================================================
 // Farrow Sub-Sample Delay Refinement (ported from feature/stable-tracking)
 // ============================================================================

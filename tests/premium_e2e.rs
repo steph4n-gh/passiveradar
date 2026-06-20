@@ -460,9 +460,9 @@ fn test_tier1_dc_block_toggle_off_tui() {
     run_tui_test_toggle(
         240, 40,
         "KEY d\nTICK 1\nDUMP frame_before.txt\nTICK 1\nKEY d\nTICK 1\nDUMP frame.txt",
-        &["DC Block: ON |"],
         &["DC Block: OFF |"],
         &["DC Block: ON |"],
+        &["DC Block: OFF |"],
     );
 }
 
