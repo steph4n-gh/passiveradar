@@ -206,6 +206,7 @@ body {
 
 .panel-jem { flex: 1; min-height: 150px; }
 .panel-cepstrum { flex: 1; min-height: 150px; }
+.panel-isar { flex: 1.2; min-height: 180px; }
 .panel-events { flex: 1; min-height: 120px; }
 .panel-terminal { flex: 1.2; min-height: 180px; }
 

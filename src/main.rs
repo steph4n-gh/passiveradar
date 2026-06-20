@@ -6,6 +6,7 @@ pub mod dsp {
     pub mod cic;
     pub mod decimate;
     pub mod fft;
+    pub mod gpu;
     pub mod tropical;
     pub mod isar;
     pub mod pfb;
@@ -22,6 +23,7 @@ pub mod tracking {
     pub mod jem;
     pub mod tbd;
     pub mod osm;
+    pub mod fusion;
 }
 pub mod db {
     pub mod flights;
@@ -181,6 +183,10 @@ struct Args {
     /// Override receiver longitude
     #[arg(long, allow_hyphen_values = true)]
     lon: Option<f64>,
+
+    /// Address of the multi-node Covariance Intersection track fusion hub (WebSocket server)
+    #[arg(long)]
+    fusion_hub: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1559,6 +1565,18 @@ fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard, tracking_bank
                 serde_json::json!({"error": "Invalid arguments"})
             }
         }
+        "fusion" => {
+            let report_val = raw_val.get("report").unwrap_or(&raw_val);
+            match serde_json::from_value::<crate::tracking::fusion::TrackReport>(report_val.clone()) {
+                Ok(report) => {
+                    tracking_bank.inject_fused_track(report.state, report.covariance, report.node_id.clone());
+                    serde_json::json!({"status": "success", "fused": report.track_id})
+                }
+                Err(e) => {
+                    serde_json::json!({"error": format!("Invalid TrackReport: {}", e)})
+                }
+            }
+        }
         _ => serde_json::json!({"error": "Unknown command"}),
     }
 }
@@ -1568,6 +1586,79 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.disable_gpu {
         crate::dsp::fft::DISABLE_GPU.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+
+    let fusion_tx = if let Some(ref hub_addr) = args.fusion_hub {
+        let (tx, rx) = std::sync::mpsc::channel::<crate::tracking::fusion::TrackReport>();
+        let hub_addr = hub_addr.clone();
+        std::thread::spawn(move || {
+            let mut socket_opt = None;
+            let mut pending_reports = Vec::new();
+            loop {
+                if socket_opt.is_none() {
+                    match tungstenite::connect(&hub_addr) {
+                        Ok((socket, _)) => {
+                            println!("Connected to fusion hub at {}", hub_addr);
+                            socket_opt = Some(socket);
+                        }
+                        Err(_) => {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                        }
+                    }
+                }
+
+                while let Ok(rep) = rx.try_recv() {
+                    pending_reports.push(rep);
+                }
+
+                if socket_opt.is_none() {
+                    if pending_reports.len() > 100 {
+                        pending_reports.drain(0..pending_reports.len() - 100);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+
+                if let Some(ref mut socket) = socket_opt {
+                    let mut success = true;
+                    for report in pending_reports.drain(..) {
+                        let msg = serde_json::json!({
+                            "command": "fusion",
+                            "report": report
+                        });
+                        let msg_str = serde_json::to_string(&msg).unwrap();
+                        if let Err(e) = socket.send(tungstenite::Message::Text(msg_str)) {
+                            eprintln!("Error sending to fusion hub: {:?}", e);
+                            success = false;
+                            break;
+                        }
+                        match socket.read() {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("Error reading response from fusion hub: {:?}", e);
+                                success = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !success {
+                        socket_opt = None;
+                        continue;
+                    }
+                }
+
+                if pending_reports.is_empty() {
+                    match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                        Ok(rep) => pending_reports.push(rep),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
 
     // 1. Initialize Tower Database and cross-reference geographic coordinates
     let db_path = "towers.json";
@@ -1703,6 +1794,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         tower: db::towers::TransmitterTower,
         tower_pos: [f64; 3],
         ddc: DigitalDownConverter,
+        gpu_ddc_state: Option<crate::dsp::gpu::GpuDdcState>,
+        gpu_taps: Vec<f32>,
+        gpu_history: Vec<Complex<f32>>,
+        gpu_phase: f32,
+        gpu_counter: usize,
         dc_blocker: dsp::cancel::DcBlocker,
         clutter_filter: EcaBatchedCanceler,
         fft_engine: FftEngine,
@@ -1728,10 +1824,34 @@ fn main() -> Result<(), Box<dyn Error>> {
                 } else {
                     None // ATSC, 5G, LEO use direct CAF cross-correlation without digital demod to save CPU
                 };
+                
+                let num_taps = 127;
+                let cutoff = 0.5 / decimation_factor as f32;
+                let filter = dsp::decimate::FirFilter::design_lowpass(cutoff, num_taps);
+                let gpu_taps = filter.get_taps();
+                let gpu_history = vec![Complex::new(0.0, 0.0); num_taps - 1];
+                let gpu_ddc_state = if args.disable_gpu {
+                    None
+                } else {
+                    crate::dsp::gpu::get_gpu_ddc_pipeline().map(|pipeline| {
+                        crate::dsp::gpu::GpuDdcState::new(
+                            pipeline,
+                            2048,
+                            num_taps,
+                            decimation_factor,
+                        )
+                    })
+                };
+
                 channels.push(TowerChannel {
                     tower: tower.clone(),
                     tower_pos: *enu,
                     ddc: DigitalDownConverter::new(offset, input_rate),
+                    gpu_ddc_state,
+                    gpu_taps,
+                    gpu_history,
+                    gpu_phase: 0.0,
+                    gpu_counter: 0,
                     dc_blocker: dsp::cancel::DcBlocker::new(0.99),
                     clutter_filter: EcaBatchedCanceler::new(32, 10), // 32 taps, 10 CG iterations
                     fft_engine: FftEngine::new(fft_size),
@@ -1750,6 +1870,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             } else {
                 None
             };
+            
+            let num_taps = 127;
+            let cutoff = 0.5 / decimation_factor as f32;
+            let filter = dsp::decimate::FirFilter::design_lowpass(cutoff, num_taps);
+            let gpu_taps = filter.get_taps();
+            let gpu_history = vec![Complex::new(0.0, 0.0); num_taps - 1];
+            let gpu_ddc_state = if args.disable_gpu {
+                None
+            } else {
+                crate::dsp::gpu::get_gpu_ddc_pipeline().map(|pipeline| {
+                    crate::dsp::gpu::GpuDdcState::new(
+                        pipeline,
+                        2048,
+                        num_taps,
+                        decimation_factor,
+                    )
+                })
+            };
+
             channels.push(TowerChannel {
                 tower: db::towers::TransmitterTower {
                     name: format!("Default Tuned {:?}", ill_type),
@@ -1762,6 +1901,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 },
                 tower_pos: [0.0, 0.0, 0.0],
                 ddc: DigitalDownConverter::new(0.0, input_rate),
+                gpu_ddc_state,
+                gpu_taps,
+                gpu_history,
+                gpu_phase: 0.0,
+                gpu_counter: 0,
                 dc_blocker: dsp::cancel::DcBlocker::new(0.99),
                 clutter_filter: EcaBatchedCanceler::new(32, 10),
                 fft_engine: FftEngine::new(fft_size),
@@ -2129,6 +2273,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut caf_buffers: HashMap<IlluminatorType, (VecDeque<Complex<f32>>, VecDeque<Complex<f32>>, u32)> = HashMap::new();
     let caf_engine = crate::dsp::caf::CafEngine::new();
+    let mut isar_processor = crate::dsp::isar::IsarProcessor::new();
     let mut last_telemetry_time = Instant::now();
     let mut agc_integral: f32 = 0.0;
 
@@ -2382,7 +2527,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .par_iter_mut()
                 .map(|chan| {
                     if !is_pfb_active {
-                        chan.ddc.process_block(&block, &mut chan.decimated_buf);
+                        if let (Some(pipeline), Some(ref mut gpu_state)) = (crate::dsp::gpu::get_gpu_ddc_pipeline(), &mut chan.gpu_ddc_state) {
+                            let phase_step = chan.ddc.phase_step();
+                            gpu_state.process_block(
+                                pipeline,
+                                &mut chan.gpu_phase,
+                                phase_step,
+                                decimation_factor,
+                                &mut chan.gpu_counter,
+                                &block,
+                                &chan.gpu_taps,
+                                &mut chan.gpu_history,
+                                &mut chan.decimated_buf,
+                            );
+                        } else {
+                            chan.ddc.process_block(&block, &mut chan.decimated_buf);
+                        }
                     }
                     if dashboard.dc_offset != 0.0 {
                         let offset_complex = Complex::new(dashboard.dc_offset, 0.0);
@@ -2484,7 +2644,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     // make_contiguous() ensures we can slice the VecDeque
                     let ref_slice = primary_ref_buf.make_contiguous();
                     let surv_slice = primary_surv_buf.make_contiguous();
-                    let caf_res = caf_engine.compute_acquisition_dense(
+                    let caf_res = caf_engine.compute_acquisition_gpu(
                         &surv_slice[0..fft_size],
                         &ref_slice[0..fft_size],
                         max_delay,
@@ -2495,6 +2655,49 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if ref_slice.len() >= 512 + max_cir_delay && surv_slice.len() >= 512 + max_cir_delay {
                         let cir_res = crate::dsp::caf::compute_cir(surv_slice, ref_slice, max_cir_delay);
                         dashboard.update_multipath(cir_res.clone());
+
+                        for target in &mut tracking_bank.targets {
+                            if target.state == tracking::bank::TrackState::Active {
+                                let target_pos = [target.ekf.state[0], target.ekf.state[1], target.ekf.state[2]];
+                                let tower_pos = channels[0].tower_pos;
+
+                                let v = target_pos;
+                                let u = [v[0] - tower_pos[0], v[1] - tower_pos[1], v[2] - tower_pos[2]];
+
+                                let dot = u[0]*v[0] + u[1]*v[1] + u[2]*v[2];
+                                let u_norm = (u[0].powi(2) + u[1].powi(2) + u[2].powi(2)).sqrt();
+                                let v_norm = (v[0].powi(2) + v[1].powi(2) + v[2].powi(2)).sqrt();
+
+                                let cos_beta = if u_norm * v_norm > 1e-6 {
+                                    dot / (u_norm * v_norm)
+                                } else {
+                                    1.0
+                                };
+                                let beta_rad = cos_beta.clamp(-1.0, 1.0).acos() as f32;
+
+                                let speed_of_light = 299_792_458.0;
+                                let r_rx = (target_pos[0].powi(2) + target_pos[1].powi(2) + target_pos[2].powi(2)).sqrt();
+                                let r_tx = ((target_pos[0] - tower_pos[0]).powi(2) + (target_pos[1] - tower_pos[1]).powi(2) + (target_pos[2] - tower_pos[2]).powi(2)).sqrt();
+                                let r_baseline = (tower_pos[0].powi(2) + tower_pos[1].powi(2) + tower_pos[2].powi(2)).sqrt();
+                                let r_bistatic = r_rx + r_tx - r_baseline;
+                                let delay_seconds = r_bistatic / speed_of_light;
+                                let delay_samples = delay_seconds * baseband_rate;
+
+                                let center_idx = 32isize;
+                                let delay_rounded = delay_samples.round() as isize;
+
+                                let mut aligned_profile = vec![0.0f32; 64];
+                                let shift = center_idx - delay_rounded;
+                                for i in 0..64 {
+                                    let src_idx = i as isize - shift;
+                                    if src_idx >= 0 && src_idx < cir_res.len() as isize {
+                                        aligned_profile[i] = cir_res[src_idx as usize];
+                                    }
+                                }
+
+                                isar_processor.accumulate_profile(target.id, aligned_profile, beta_rad);
+                            }
+                        }
                         let max_idx = cir_res.iter().enumerate()
                             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
                             .map(|(idx, _)| idx)
@@ -2878,6 +3081,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "payload_class": t.jem.payload_class,
                         "stare_mode_active": t.ekf.stare_mode_active,
                         "cic_mode": format!("{:?}", t.jem.cic_mode),
+                        "isar_image": if dashboard.selected_target_id == Some(t.id) {
+                            isar_processor.render_image_gpu(t.id, 128)
+                        } else {
+                            None
+                        },
                     })
                 })
                 .collect();
@@ -2943,6 +3151,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
                     }
                 });
+            }
+            if let Some(ref tx) = fusion_tx {
+                let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+                let node_id = format!("node-{}", args.port.unwrap_or(8085));
+                for target in &tracking_bank.targets {
+                    if target.state == tracking::bank::TrackState::Active {
+                        let report = crate::tracking::fusion::TrackReport {
+                            node_id: node_id.clone(),
+                            track_id: target.id,
+                            state: target.ekf.state,
+                            covariance: target.ekf.cov,
+                            timestamp_ms: now_ms,
+                            classification: target.classification.clone(),
+                        };
+                        let _ = tx.send(report);
+                    }
+                }
             }
         }
 

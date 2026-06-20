@@ -21,6 +21,9 @@ rayon = "1.8"
 libc = "0.2"
 wgsl-fft = { version = "0.4.4", optional = true }
 tungstenite = "0.21.0"
+wgpu = "29.0.3"
+pollster = "0.4.0"
+bytemuck = { version = "1.25.0", features = ["derive"] }
 
 [features]
 default = ["gpu-fft"]

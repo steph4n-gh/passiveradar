@@ -135,3 +135,39 @@ fn test_backproject_tomography() {
     assert_eq!(max_x, 8);
     assert_eq!(max_y, 8);
 }
+
+#[test]
+fn test_isar_processor() {
+    let mut processor = passiveradar::dsp::isar::IsarProcessor::new();
+    let target_id = 42;
+    let n_bins = 64;
+
+    for i in 0..4 {
+        let mut profile = vec![0.0f32; n_bins];
+        profile[32] = 10.0;
+        profile[31] = 5.0;
+        profile[33] = 5.0;
+        let angle = i as f32 * std::f32::consts::FRAC_PI_4;
+        processor.accumulate_profile(target_id, profile, angle);
+    }
+
+    let image = processor.render_image_gpu(target_id, 16).unwrap();
+
+    assert_eq!(image.len(), 16);
+    assert_eq!(image[0].len(), 16);
+
+    let mut max_val = -100.0f32;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    for x in 0..16 {
+        for y in 0..16 {
+            if image[x][y] > max_val {
+                max_val = image[x][y];
+                max_x = x;
+                max_y = y;
+            }
+        }
+    }
+    assert_eq!(max_x, 8);
+    assert_eq!(max_y, 8);
+}

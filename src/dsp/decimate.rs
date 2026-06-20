@@ -83,6 +83,16 @@ impl FirFilter {
         Self::new(taps)
     }
 
+    /// Retrieve the original filter coefficients (taps).
+    pub fn get_taps(&self) -> Vec<f32> {
+        let mut original = Vec::with_capacity(self.num_taps);
+        for i in (0..self.taps_simd.len()).step_by(2) {
+            original.push(self.taps_simd[i]);
+        }
+        original.reverse();
+        original
+    }
+
     /// Compute the filter output for a window of samples.
     #[inline(always)]
     pub fn compute(&self, window: &[Complex<f32>]) -> Complex<f32> {
@@ -398,6 +408,10 @@ impl DigitalDownConverter {
 
     pub fn update_offset(&mut self, offset_frequency: f64, sample_rate: f64) {
         self.phase_step = (2.0 * std::f64::consts::PI * offset_frequency / sample_rate) as f32;
+    }
+
+    pub fn phase_step(&self) -> f32 {
+        self.phase_step
     }
 
     pub fn process_block(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {

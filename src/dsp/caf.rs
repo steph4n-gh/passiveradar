@@ -156,6 +156,7 @@ pub fn correlate_slices_scalar(surv: &[Complex<f32>], reference: &[Complex<f32>]
 pub struct CafEngine {
     fft_512: Arc<dyn Fft<f32>>,
     fft_1024: Arc<dyn Fft<f32>>,
+    gpu_state: std::sync::Mutex<Option<crate::dsp::gpu::GpuCafState>>,
 }
 
 impl CafEngine {
@@ -164,6 +165,40 @@ impl CafEngine {
         Self {
             fft_512: planner.plan_fft_forward(512),
             fft_1024: planner.plan_fft_forward(1024),
+            gpu_state: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// GPU-accelerated Acquisition Mode:
+    /// Runs the Cross-Ambiguity Function on the GPU using wgpu/Metal, falling back to
+    /// CPU compute_acquisition_dense if the GPU pipeline is not available.
+    pub fn compute_acquisition_gpu(
+        &self,
+        clean_surv: &[Complex<f32>],
+        surrogate_ref: &[Complex<f32>],
+        max_delay: usize,
+    ) -> Vec<Vec<f32>> {
+        if let Some(pipeline) = crate::dsp::gpu::get_gpu_caf_pipeline() {
+            let mut state_lock = self.gpu_state.lock().unwrap();
+            let state = state_lock.get_or_insert_with(|| {
+                crate::dsp::gpu::GpuCafState::new(
+                    pipeline,
+                    clean_surv.len(),
+                    max_delay,
+                    512,
+                )
+            });
+            let doppler_step = clean_surv.len() as f32 / 262144.0;
+            state.process_caf(
+                pipeline,
+                clean_surv,
+                surrogate_ref,
+                max_delay,
+                512,
+                doppler_step,
+            )
+        } else {
+            self.compute_acquisition_dense(clean_surv, surrogate_ref, max_delay)
         }
     }
 

@@ -7,6 +7,7 @@ pub mod dsp {
     pub mod decimate;
     pub mod declip;
     pub mod fft;
+    pub mod gpu;
     pub mod isar;
     pub mod pfb;
     pub mod pll;
@@ -21,6 +22,7 @@ pub mod tracking {
     pub mod ekf;
     pub mod jem;
     pub mod osm;
+    pub mod fusion;
     pub mod tbd;
 }
 pub mod db {

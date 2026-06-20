@@ -1246,11 +1246,13 @@ dependencies = [
 name = "passiveradar"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "chrono",
  "clap",
  "crossterm",
  "libc",
  "num-complex",
+ "pollster",
  "rand",
  "rand_distr",
  "ratatui",
@@ -1262,6 +1264,7 @@ dependencies = [
  "tungstenite",
  "ureq",
  "urlencoding",
+ "wgpu",
  "wgsl-fft",
 ]
 

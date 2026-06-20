@@ -76,6 +76,8 @@ const elevationCanvas = document.getElementById("elevation-profile");
 const elevationCtx = elevationCanvas.getContext("2d");
 const jemCanvas = document.getElementById("jem-spectrum");
 const jemCtx = jemCanvas.getContext("2d");
+const isarCanvas = document.getElementById("isar-scope");
+const isarCtx = isarCanvas ? isarCanvas.getContext("2d") : null;
 
 const fftSpectrogramCanvas = document.getElementById("fft-spectrogram");
 const fftSpectrogramCtx = fftSpectrogramCanvas ? fftSpectrogramCanvas.getContext("2d") : null;
@@ -335,6 +337,13 @@ function handleTelemetry(data) {
     } else {
         microDopplerHistory = [];
         lastJemTargetId = null;
+    }
+
+    const isarEnabled = document.getElementById("isar-enabled-chk")?.checked !== false;
+    if (isarEnabled && selTarget && selTarget.isar_image) {
+        drawIsarImage(selTarget.isar_image);
+    } else {
+        clearIsarCanvas();
     }
 
     // Update target history cache
@@ -673,6 +682,11 @@ function resizeCanvases() {
         cepstrumCanvas.width = cParent.clientWidth;
         cepstrumCanvas.height = cParent.clientHeight;
     }
+    if (isarCanvas) {
+        const iParent = isarCanvas.parentElement;
+        isarCanvas.width = iParent.clientWidth;
+        isarCanvas.height = iParent.clientHeight;
+    }
 }
 window.addEventListener("resize", resizeCanvases);
 
@@ -708,6 +722,99 @@ function drawWaterfallRow() {
         waterfallCtx.fillStyle = getPlasmaColor(db);
         waterfallCtx.fillRect(i * binWidth, 0, binWidth + 1, 2);
     }
+}
+
+// ISAR Tomography Drawing
+function drawIsarImage(image2d) {
+    if (!isarCanvas || !isarCtx) return;
+
+    const w = isarCanvas.width;
+    const h = isarCanvas.height;
+
+    // Clear canvas
+    isarCtx.fillStyle = "#030914";
+    isarCtx.fillRect(0, 0, w, h);
+
+    const rows = image2d.length;
+    if (rows === 0) return;
+    const cols = image2d[0].length;
+    if (cols === 0) return;
+
+    // Find max value for normalization
+    let maxVal = 0;
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            if (image2d[r][c] > maxVal) {
+                maxVal = image2d[r][c];
+            }
+        }
+    }
+
+    if (maxVal === 0) maxVal = 1.0;
+
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = cols;
+    tempCanvas.height = rows;
+    const tempCtx = tempCanvas.getContext("2d");
+    const imgData = tempCtx.createImageData(cols, rows);
+
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            const val = image2d[r][c] / maxVal; // 0.0 to 1.0
+            const pixelIdx = (r * cols + c) * 4;
+            
+            // Map to bright cyan/green phosphor
+            imgData.data[pixelIdx] = 0;
+            imgData.data[pixelIdx + 1] = Math.floor(val * 229);
+            imgData.data[pixelIdx + 2] = Math.floor(val * 255);
+            imgData.data[pixelIdx + 3] = 255;
+        }
+    }
+
+    tempCtx.putImageData(imgData, 0, 0);
+
+    // Draw and scale to fit the main isarCanvas
+    isarCtx.imageSmoothingEnabled = true;
+    isarCtx.drawImage(tempCanvas, 0, 0, cols, rows, 0, 0, w, h);
+
+    // Overlay grid / crosshairs
+    isarCtx.strokeStyle = "rgba(0, 229, 255, 0.15)";
+    isarCtx.lineWidth = 1;
+    
+    // Crosshair
+    isarCtx.beginPath();
+    isarCtx.moveTo(w / 2, 0);
+    isarCtx.lineTo(w / 2, h);
+    isarCtx.moveTo(0, h / 2);
+    isarCtx.lineTo(w, h / 2);
+    isarCtx.stroke();
+    
+    // Range rings
+    isarCtx.beginPath();
+    isarCtx.arc(w / 2, h / 2, Math.min(w, h) * 0.45, 0, 2 * Math.PI);
+    isarCtx.stroke();
+    
+    // Text stats overlay
+    isarCtx.fillStyle = "rgba(0, 229, 255, 0.8)";
+    isarCtx.font = "10px 'Share Tech Mono', monospace";
+    isarCtx.textAlign = "left";
+    isarCtx.textBaseline = "alphabetic";
+    isarCtx.fillText("RESOLUTION: 128x128", 10, 20);
+    isarCtx.fillText("MODE: TOMOGRAPHY", 10, 32);
+}
+
+function clearIsarCanvas() {
+    if (!isarCanvas || !isarCtx) return;
+    const w = isarCanvas.width;
+    const h = isarCanvas.height;
+    isarCtx.fillStyle = "#030914";
+    isarCtx.fillRect(0, 0, w, h);
+    
+    isarCtx.fillStyle = "rgba(0, 229, 255, 0.4)";
+    isarCtx.font = "12px 'Share Tech Mono', monospace";
+    isarCtx.textAlign = "center";
+    isarCtx.textBaseline = "middle";
+    isarCtx.fillText("NO SELECTED TARGET FOR ISAR IMAGING", w / 2, h / 2);
 }
 
 // Neon Phosphor waterfall shader color mapper

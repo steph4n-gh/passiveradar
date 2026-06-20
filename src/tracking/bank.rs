@@ -420,6 +420,66 @@ impl TrackingBank {
         }
     }
 
+    /// Inject a multi-node CI-fused track into the local tracking bank.
+    /// If a local track correlates within a 5 km gate, its state/covariance is updated.
+    /// Otherwise, a new track is spawned using the fused estimate.
+    pub fn inject_fused_track(&mut self, state: [f64; 6], cov: [[f64; 6]; 6], source_node_id: String) {
+        let gate = 5000.0;
+        let mut matched_target: Option<&mut TrackedTarget> = None;
+
+        for target in &mut self.targets {
+            if target.state != TrackState::Terminated {
+                let dx = target.ekf.state[0] - state[0];
+                let dy = target.ekf.state[1] - state[1];
+                let dz = target.ekf.state[2] - state[2];
+                let dist = (dx*dx + dy*dy + dz*dz).sqrt();
+                if dist < gate {
+                    matched_target = Some(target);
+                    break;
+                }
+            }
+        }
+
+        if let Some(target) = matched_target {
+            target.ekf.state = state;
+            target.ekf.cov = cov;
+            target.history.push(state);
+            if target.history.len() > 100 {
+                target.history.remove(0);
+            }
+            if !target.tracking_towers.contains(&source_node_id) {
+                target.tracking_towers.push(source_node_id);
+            }
+            target.hits += 1;
+            target.misses = 0;
+            target.coasting_frames = 0;
+            if target.state == TrackState::Suspect || target.state == TrackState::Coasting {
+                target.state = TrackState::Active;
+            }
+        } else {
+            let mut ekf = BistaticEkf::new(state, self.pos_uncert, self.vel_uncert, self.r_variance);
+            ekf.state = state;
+            ekf.cov = cov;
+            let classification = Self::classify_target(&state);
+            let id = Self::allocate_id(&self.targets);
+            self.targets.push(TrackedTarget {
+                id,
+                ekf,
+                state: TrackState::Active,
+                hits: 3,
+                misses: 0,
+                coasting_frames: 0,
+                history: vec![state],
+                classification,
+                terminated_at: None,
+                start_time: std::time::Instant::now(),
+                fingerprint_history: Vec::new(),
+                jem: crate::tracking::jem::JemAnalyzer::new(),
+                tracking_towers: vec![source_node_id],
+            });
+        }
+    }
+
     /// Allocate the lowest available target ID not currently in use.
     /// Recycles IDs from pruned targets so display numbers stay compact (1, 2, 3...)
     /// instead of climbing monotonically to high values.
