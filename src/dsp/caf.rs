@@ -187,11 +187,11 @@ impl CafEngine {
             return vec![vec![0.0; num_chunks]; max_delay];
         }
 
-        // 1. Pre-allocate r_matrix sequentially on the main thread to avoid global allocator contention in parallel threads
-        let mut r_matrix = vec![vec![FftComplex::new(0.0, 0.0); num_chunks]; max_delay];
+        // Flat matrix allocation to ensure cache locality and avoid nested heap allocations
+        let mut r_matrix = vec![FftComplex::new(0.0, 0.0); max_delay * num_chunks];
 
-        // Cross-correlate in parallel across delays (Fast-Time)
-        r_matrix.par_iter_mut().enumerate().for_each(|(d, row)| {
+        // Cross-correlate in parallel across delays (Fast-Time) using contiguous chunks
+        r_matrix.par_chunks_mut(num_chunks).enumerate().for_each(|(d, row)| {
             for m in 0..available_chunks {
                 let offset = m * chunk_size + max_delay;
                 let surv_chunk = &clean_surv[offset .. offset + chunk_size];
@@ -201,16 +201,16 @@ impl CafEngine {
             }
         });
 
-        // 2. Pre-allocate results and scratch buffers sequentially on the main thread
+        // Contiguous flat scratch and results buffers
         let scratch_len = self.fft_512.get_inplace_scratch_len();
-        let mut scratches = vec![vec![FftComplex::new(0.0, 0.0); scratch_len]; max_delay];
-        let mut result = vec![vec![0.0f32; num_chunks]; max_delay];
+        let mut scratches = vec![FftComplex::new(0.0, 0.0); max_delay * scratch_len];
+        let mut result_flat = vec![0.0f32; max_delay * num_chunks];
 
         // FFT across chunks in parallel (Slow-Time)
         r_matrix
-            .par_iter_mut()
-            .zip(scratches.par_iter_mut())
-            .zip(result.par_iter_mut())
+            .par_chunks_mut(num_chunks)
+            .zip(scratches.par_chunks_mut(scratch_len))
+            .zip(result_flat.par_chunks_mut(num_chunks))
             .for_each(|((row, scratch), out_row)| {
                 self.fft_512.process_with_scratch(row, scratch);
                 
@@ -221,7 +221,11 @@ impl CafEngine {
                 }
             });
 
-        result
+        // Reconstruct the nested Vec structure expected by the caller
+        result_flat
+            .chunks(num_chunks)
+            .map(|chunk| chunk.to_vec())
+            .collect()
     }
 
     /// Tracking Mode (Sparse & De-spread): 
@@ -248,13 +252,19 @@ impl CafEngine {
 
         let mut decimated = vec![FftComplex::new(0.0, 0.0); fft_size];
         
+        // Expanded complex multiplication and conjugation to facilitate compiler auto-vectorization
         for i in 0..fft_size {
-            let mut sum = Complex::new(0.0, 0.0);
+            let mut sum_re = 0.0f32;
+            let mut sum_im = 0.0f32;
             for j in 0..65 {
                 let idx = delay + i * decimation_factor + j;
-                sum += clean_surv[idx] * surrogate_ref[idx - delay].conj() * taps[j];
+                let s = clean_surv[idx];
+                let r = surrogate_ref[idx - delay];
+                let tap = taps[j];
+                sum_re += tap * (s.re * r.re + s.im * r.im);
+                sum_im += tap * (s.im * r.re - s.re * r.im);
             }
-            decimated[i] = FftComplex::new(sum.re, sum.im);
+            decimated[i] = FftComplex::new(sum_re, sum_im);
         }
 
         let mut scratch = vec![FftComplex::new(0.0, 0.0); self.fft_1024.get_inplace_scratch_len()];
