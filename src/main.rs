@@ -38,8 +38,6 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use std::sync::{Arc, Mutex};
-use rand::Rng;
 use num_complex::Complex;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -68,7 +66,7 @@ use rayon::prelude::*;
 
 
 use db::towers::TowerDatabase;
-use dsp::cancel::{DcBlocker, EcaBatchedCanceler};
+use dsp::cancel::EcaBatchedCanceler;
 use dsp::decimate::DigitalDownConverter;
 use dsp::fft::FftEngine;
 use sdr::{SdrSource, SimulationSdrSource, SoapySdrSource};
@@ -1413,7 +1411,7 @@ fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard, tracking_bank
         }
         "InjectDroneTarget" => {
             let rpm = raw_val.get("rpm").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let vz = raw_val.get("vz").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let _vz = raw_val.get("vz").and_then(|v| v.as_f64()).unwrap_or(0.0);
             if rpm > 100000.0 {
                 serde_json::json!({"error": "RPM out of bounds"})
             } else {
@@ -2130,7 +2128,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let mut caf_buffers: HashMap<IlluminatorType, (VecDeque<Complex<f32>>, VecDeque<Complex<f32>>, u32)> = HashMap::new();
-    let mut caf_engine = crate::dsp::caf::CafEngine::new();
+    let caf_engine = crate::dsp::caf::CafEngine::new();
     let mut last_telemetry_time = Instant::now();
     let mut agc_integral: f32 = 0.0;
 
@@ -2273,7 +2271,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             got_data = true;
             processed_blocks += 1;
 
-            let mut block_buf = block.buf;
+            let block_buf = block.buf;
             let illuminator = block.illuminator;
             let freq_changed = (dashboard.center_freq - block.freq).abs() > 1.0;
             dashboard.center_freq = block.freq;
@@ -2635,6 +2633,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 let mut towers_data = Vec::new();
                 for (idx, chan) in channels.iter_mut().enumerate() {
+                    #[allow(unused_variables, unused_mut, unused_assignments)]
                     let mut tower_vel = [0.0, 0.0, 0.0];
                     if illuminator == IlluminatorType::LeoStarlink {
                         // Simple LEO mock orbital pass (straight line above)
@@ -2643,7 +2642,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let pos_y = 1000000.0 - speed * (t % 300.0);
                         let pos_z = 550000.0;
                         chan.tower_pos = [0.0, pos_y, pos_z];
-                        tower_vel = [0.0, -speed, 0.0];
+                        #[allow(unused_assignments)]
+                        { tower_vel = [0.0, -speed, 0.0]; }
                     }
                     if idx < tower_peaks_store.len() {
                         // The lifetime of the slice relies on tower_peaks_store being independent

@@ -2318,7 +2318,7 @@ impl Dashboard {
         }
 
         let max_val = self.multipath_profile.iter().copied().fold(0.0f32, |a, b| a.max(b));
-        let max_idx = self.multipath_profile.iter().enumerate()
+        let _max_idx = self.multipath_profile.iter().enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(idx, _)| idx)
             .unwrap_or(0);
@@ -2562,7 +2562,7 @@ impl Dashboard {
         let mut planes = 0;
         let mut drones = 0;
         let mut vehicles = 0;
-        let mut unknown = 0;
+        let mut _unknown = 0;
 
         for t in targets.iter().filter(|t| t.state != crate::tracking::bank::TrackState::Terminated) {
             let class = t.classification.to_lowercase();
@@ -2574,7 +2574,7 @@ impl Dashboard {
             } else if class.contains("plane") || class.contains("b78") || class.contains("com") || class.contains("aal") || call.contains("aal") {
                 planes += 1;
             } else {
-                unknown += 1;
+                _unknown += 1;
             }
         }
 

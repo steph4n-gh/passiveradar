@@ -8,7 +8,7 @@ use std::sync::Arc;
 pub struct PolyphaseChannelizer {
     num_channels: usize,
     decimation_factor: usize,
-    taps: Vec<f32>,
+    _taps: Vec<f32>,
     fft: Arc<dyn rustfft::Fft<f32>>,
     subfilters: Vec<Vec<f32>>,
     // Internal state buffers to prevent heap allocation in process loop
@@ -56,7 +56,7 @@ impl PolyphaseChannelizer {
         Self {
             num_channels,
             decimation_factor,
-            taps,
+            _taps: taps,
             fft,
             subfilters,
             filter_state,

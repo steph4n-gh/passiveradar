@@ -9,8 +9,8 @@ pub struct ViterbiTbd {
     // Range-Doppler history: Vec of frames, where each frame is a 1D flattened matrix [delay * doppler]
     rd_history: Vec<Vec<f32>>,
     // Kinematic constraints
-    max_acceleration_mps2: f32,
-    max_velocity_mps: f32,
+    _max_acceleration_mps2: f32,
+    _max_velocity_mps: f32,
 }
 
 impl ViterbiTbd {
@@ -21,8 +21,8 @@ impl ViterbiTbd {
             num_doppler_bins,
             history_depth,
             rd_history: Vec::new(),
-            max_acceleration_mps2: 40.0, // Limit search to valid physical aircraft maneuvering
-            max_velocity_mps: 340.0,     // Speed of sound limit
+            _max_acceleration_mps2: 40.0, // Limit search to valid physical aircraft maneuvering
+            _max_velocity_mps: 340.0,     // Speed of sound limit
         }
     }
 

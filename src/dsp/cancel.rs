@@ -348,7 +348,7 @@ impl EcaBatchedCanceler {
         let mut p = vec![Complex::new(0.0, 0.0); self.num_taps];
         self.apply_xh(&r, input, &mut p);
         
-        let mut s_cg = p.clone(); 
+        let s_cg = p.clone(); 
         
         let mut norms_sq = 0.0;
         for v in &s_cg { norms_sq += v.norm_sqr(); }

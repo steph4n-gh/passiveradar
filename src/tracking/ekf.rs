@@ -338,7 +338,7 @@ impl BistaticEkf {
     /// `tower_pos`: [x, y, z] of transmitter tower
     /// `fc`: FM carrier frequency of tower
     /// `z_meas`: measured Doppler shift in Hz
-    pub fn update(&mut self, tower_pos: &[f64; 3], tower_vel: &[f64; 3], fc: f64, z_meas: f64) -> f64 {
+    pub fn update(&mut self, tower_pos: &[f64; 3], _tower_vel: &[f64; 3], fc: f64, z_meas: f64) -> f64 {
         if z_meas.is_nan() || z_meas.is_infinite() {
             return 0.0;
         }

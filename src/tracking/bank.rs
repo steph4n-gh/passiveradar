@@ -1657,7 +1657,7 @@ impl TrackingBank {
         let r_r = (x * x + y * y + z * z).sqrt().max(1.0);
         let dot_r = (vx * x + vy * y + vz * z) / r_r;
 
-        let mut valid_count = 0;
+        let mut _valid_count = 0;
         let mut min_diffs = Vec::with_capacity(towers_data.len());
 
         for (_name, tower_pos, fc, peaks) in towers_data {
@@ -1680,7 +1680,7 @@ impl TrackingBank {
             }
 
             if min_diff != f64::MAX {
-                valid_count += 1;
+                _valid_count += 1;
                 min_diffs.push(Some(min_diff));
             } else {
                 min_diffs.push(None);
