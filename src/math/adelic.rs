@@ -66,7 +66,6 @@ pub fn compute_vladimirov_derivative(x: &[f64]) -> Vec<f64> {
     }
     let p = 2; // Prime base
     let alpha = 0.5;
-    let power = alpha + 1.0;
 
     // Haar measure scale (approximated as 1/n)
     let measure = 1.0 / (n as f64);
@@ -76,14 +75,20 @@ pub fn compute_vladimirov_derivative(x: &[f64]) -> Vec<f64> {
     let p_neg_alpha_minus_1 = (p as f64).powf(-alpha - 1.0);
     let c_const = (1.0 - p_alpha) / (1.0 - p_neg_alpha_minus_1);
 
+    // Precompute 2^(1.5 * vp) table for vp in 0..64
+    let mut adic_pow_table = [0.0f64; 64];
+    for vp in 0..64 {
+        adic_pow_table[vp] = 2.0f64.powf(1.5 * vp as f64);
+    }
+
     for i in 0..n {
         let mut sum = 0.0;
         for j in 0..n {
             if i != j {
-                let dist = p_adic_distance(i as u64, j as u64, p);
-                if dist > 1e-9 {
-                    sum += (x[i] - x[j]) / dist.powf(power);
-                }
+                let diff = (i as isize - j as isize).unsigned_abs();
+                let vp = diff.trailing_zeros() as usize;
+                let weight = unsafe { *adic_pow_table.get_unchecked(vp) };
+                sum += (x[i] - x[j]) * weight;
             }
         }
         deriv[i] = c_const * sum * measure;
