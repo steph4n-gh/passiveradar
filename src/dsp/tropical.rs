@@ -4,14 +4,27 @@ pub struct TropicalWaveletCanceller {
     scratch: Vec<f32>,
     approx: Vec<f32>,
     background: Vec<f32>,
+    weights: [f64; 129],
 }
 
 impl TropicalWaveletCanceller {
     pub fn new(max_size: usize) -> Self {
+        let mut weights = [0.0f64; 129];
+        for offset in -64isize..=64isize {
+            if offset != 0 {
+                let v = offset.unsigned_abs().trailing_zeros() as usize;
+                weights[(offset + 64) as usize] = if v < 8 {
+                    Self::ADIC_WEIGHTS[v]
+                } else {
+                    2.0_f64.powf(1.2 * v as f64)
+                };
+            }
+        }
         Self {
             scratch: Vec::with_capacity(max_size),
             approx: Vec::with_capacity(max_size),
             background: Vec::with_capacity(max_size),
+            weights,
         }
     }
 
@@ -126,7 +139,8 @@ impl TropicalWaveletCanceller {
 
         let mut spikes = Vec::new();
 
-        // Vladimirov 2-adic local difference check
+        // Vladimirov 2-adic local difference check using precomputed weights and loop splitting
+        let weights = &self.weights;
         for i in 0..n {
             let x_i = if magnitudes[i].is_finite() { magnitudes[i] as f64 } else { 0.0 };
 
@@ -139,20 +153,21 @@ impl TropicalWaveletCanceller {
             // Scan nearby neighborhood for localized difference quotient
             let start = i.saturating_sub(64);
             let end = (i + 64).min(n);
-            for j in start..end {
-                if i != j {
-                    let x_j = if magnitudes[j].is_finite() { magnitudes[j] as f64 } else { 0.0 };
-                    let diff = (i as isize - j as isize).unsigned_abs();
-                    let v = diff.trailing_zeros() as usize;
-                    // Lookup pre-computed weight instead of calling powf()
-                    let weight = if v < Self::ADIC_WEIGHTS.len() {
-                        Self::ADIC_WEIGHTS[v]
-                    } else {
-                        // Fallback for very large v (should never happen with neighborhood ≤128)
-                        2.0_f64.powf(1.2 * v as f64)
-                    };
-                    sum_deriv += (x_i - x_j) * weight;
-                }
+
+            let offset_base = 64isize - i as isize;
+
+            // Loop 1: left of i (j < i)
+            for j in start..i {
+                let x_j = if magnitudes[j].is_finite() { magnitudes[j] as f64 } else { 0.0 };
+                let weight = unsafe { *weights.get_unchecked((j as isize + offset_base) as usize) };
+                sum_deriv += (x_i - x_j) * weight;
+            }
+
+            // Loop 2: right of i (j > i)
+            for j in (i + 1)..end {
+                let x_j = if magnitudes[j].is_finite() { magnitudes[j] as f64 } else { 0.0 };
+                let weight = unsafe { *weights.get_unchecked((j as isize + offset_base) as usize) };
+                sum_deriv += (x_i - x_j) * weight;
             }
 
             // If the fractional difference rate is high, it is a sharp spur/spike

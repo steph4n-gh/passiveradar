@@ -123,9 +123,12 @@ impl FftEngine {
         }
 
         // 3. Compute magnitude and perform fftshift to center DC (0 Hz) at index fft_size / 2
-        for i in 0..self.fft_size {
-            let shift_idx = (i + self.fft_size / 2) % self.fft_size;
-            self.magnitude[shift_idx] = self.fft_input[i].norm();
+        let half = self.fft_size / 2;
+        for i in 0..half {
+            self.magnitude[i + half] = self.fft_input[i].norm();
+        }
+        for i in half..self.fft_size {
+            self.magnitude[i - half] = self.fft_input[i].norm();
         }
 
         // 4. Advance the sliding window
