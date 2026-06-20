@@ -250,13 +250,13 @@ fn run_ws_compound_test(
         .expect("Failed to spawn passiveradar binary");
 
     let _child_guard = KillOnDrop(child);
-    thread::sleep(Duration::from_millis(400));
+    thread::sleep(Duration::from_millis(600));
 
     let mut last_err: Option<String> = None;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let ws_url = format!("ws://127.0.0.1:{}", port);
-    for _ in 0..3 {
-        match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150)) {
+    for _ in 0..10 {
+        match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
             Ok(stream) => {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
                 let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));

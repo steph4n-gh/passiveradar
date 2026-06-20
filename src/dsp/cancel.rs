@@ -50,6 +50,7 @@ pub struct NlmsCanceler {
     signal_history: Vec<Complex<f32>>,
     sig_index: usize,
     power: f32,
+    counter: usize,
 }
 
 impl NlmsCanceler {
@@ -67,6 +68,7 @@ impl NlmsCanceler {
             signal_history: vec![Complex::new(0.0, 0.0); delay + 1],
             sig_index: 0,
             power: 0.0,
+            counter: 0,
         }
     }
 
@@ -80,25 +82,35 @@ impl NlmsCanceler {
         // 2. Store the current sample in signal history for future delays
         self.signal_history[self.sig_index] = sample;
 
+        let old_ref = self.ref_history[self.ref_index];
         self.ref_history[self.ref_index] = ref_val;
 
-        // 3. Exact recomputation of power to prevent numerical drift
-        let mut exact_power = 0.0;
-        for i in 0..self.num_taps {
-            exact_power += self.ref_history[i].norm_sqr();
-        }
-        self.power = exact_power;
+        // 3. Sliding window power update to avoid expensive O(N) loop
+        let new_power = self.power - old_ref.norm_sqr() + ref_val.norm_sqr();
+        self.power = new_power.max(0.0);
 
-        // 4. Compute filter output (estimated clutter using delayed samples): y(n) = w^H * x_delayed(n)
-        let mut y = Complex::new(0.0, 0.0);
-        let mut r_idx = self.ref_index;
-        for i in 0..self.num_taps {
-            y += self.ref_history[r_idx] * self.weights[i].conj();
-            if r_idx == 0 {
-                r_idx = self.num_taps - 1;
-            } else {
-                r_idx -= 1;
+        // Periodically exact recomputation of power to prevent numerical drift
+        self.counter += 1;
+        if self.counter >= 1024 {
+            self.counter = 0;
+            let mut exact_power = 0.0;
+            for i in 0..self.num_taps {
+                exact_power += self.ref_history[i].norm_sqr();
             }
+            self.power = exact_power;
+        }
+
+        // 4. Compute filter output (estimated clutter using delayed samples)
+        let mut y = Complex::new(0.0, 0.0);
+        let ref_idx = self.ref_index;
+        let num_taps = self.num_taps;
+        
+        // Contiguous Split Loops (enables auto-vectorization)
+        for i in 0..=ref_idx {
+            y += self.ref_history[ref_idx - i] * self.weights[i].conj();
+        }
+        for i in (ref_idx + 1)..num_taps {
+            y += self.ref_history[num_taps + ref_idx - i] * self.weights[i].conj();
         }
 
         // 5. The target to cancel is the current sample (d(n) = x(n))
@@ -107,14 +119,14 @@ impl NlmsCanceler {
         // 6. Update weights: w(n+1) = w(n) + mu * e^*(n) * x_delayed(n) / (power + eps)
         let normalization = self.mu / (self.power + self.eps);
         let error_conj = error.conj();
-        let mut r_idx_w = self.ref_index;
-        for i in 0..self.num_taps {
-            self.weights[i] += self.ref_history[r_idx_w] * error_conj * normalization;
-            if r_idx_w == 0 {
-                r_idx_w = self.num_taps - 1;
-            } else {
-                r_idx_w -= 1;
-            }
+        let term = error_conj * normalization;
+        
+        // Contiguous Split Loops (enables auto-vectorization)
+        for i in 0..=ref_idx {
+            self.weights[i] += self.ref_history[ref_idx - i] * term;
+        }
+        for i in (ref_idx + 1)..num_taps {
+            self.weights[i] += self.ref_history[num_taps + ref_idx - i] * term;
         }
 
         // 7. Advance indices
