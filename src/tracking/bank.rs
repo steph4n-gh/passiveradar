@@ -570,7 +570,7 @@ impl TrackingBank {
                 let snr_db = peaks[p_idx].1 as f64;
 
                 // EKF measurement update for this tower!
-                target.ekf.update(&tower_pos, fc, meas_doppler);
+                target.ekf.update(&tower_pos, &[0.0, 0.0, 0.0], fc, meas_doppler);
 
                 // Target classification updates based on updated state
                 target.classification = Self::classify_target(&target.ekf.state);

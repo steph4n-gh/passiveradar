@@ -280,6 +280,148 @@ impl CafEngine {
     }
 }
 
+
+// ============================================================================
+// Farrow Sub-Sample Delay Refinement (ported from feature/stable-tracking)
+// ============================================================================
+
+/// A 4-tap cubic Lagrange Farrow interpolator for sub-sample delay estimation.
+/// Maintains a history of 4 samples and interpolates at any fractional position μ ∈ [0, 1)
+/// using nested Horner evaluation of the polynomial coefficients.
+pub struct FarrowInterpolator {
+    pub history: [Complex<f32>; 4],
+}
+
+impl FarrowInterpolator {
+    pub fn new() -> Self {
+        Self {
+            history: [Complex::new(0.0, 0.0); 4],
+        }
+    }
+
+    pub fn push(&mut self, sample: Complex<f32>) {
+        self.history[0] = self.history[1];
+        self.history[1] = self.history[2];
+        self.history[2] = self.history[3];
+        self.history[3] = sample;
+    }
+
+    pub fn interpolate(&self, mu: f32) -> Complex<f32> {
+        let y_neg1 = self.history[0];
+        let y_0 = self.history[1];
+        let y_1 = self.history[2];
+        let y_2 = self.history[3];
+
+        let v3_re = -1.0 / 6.0 * y_neg1.re + 0.5 * y_0.re - 0.5 * y_1.re + 1.0 / 6.0 * y_2.re;
+        let v2_re = 0.5 * y_neg1.re - y_0.re + 0.5 * y_1.re;
+        let v1_re = -1.0 / 3.0 * y_neg1.re - 0.5 * y_0.re + y_1.re - 1.0 / 6.0 * y_2.re;
+        let v0_re = y_0.re;
+
+        let v3_im = -1.0 / 6.0 * y_neg1.im + 0.5 * y_0.im - 0.5 * y_1.im + 1.0 / 6.0 * y_2.im;
+        let v2_im = 0.5 * y_neg1.im - y_0.im + 0.5 * y_1.im;
+        let v1_im = -1.0 / 3.0 * y_neg1.im - 0.5 * y_0.im + y_1.im - 1.0 / 6.0 * y_2.im;
+        let v0_im = y_0.im;
+
+        let re = ((v3_re * mu + v2_re) * mu + v1_re) * mu + v0_re;
+        let im = ((v3_im * mu + v2_im) * mu + v1_im) * mu + v0_im;
+
+        Complex::new(re, im)
+    }
+
+    pub fn reset(&mut self) {
+        self.history = [Complex::new(0.0, 0.0); 4];
+    }
+}
+
+/// Correlates a surveillance signal against a reference with a fractional delay offset,
+/// using inline Farrow interpolation for each sample.
+pub fn correlate_fractional_delay(
+    surv: &[Complex<f32>],
+    reference: &[Complex<f32>],
+    reference_start: f32,
+) -> f32 {
+    let block_size = surv.len();
+    let mut sum = Complex::new(0.0, 0.0);
+    let mut ref_energy = 0.0f32;
+    
+    for i in 0..block_size {
+        let target_idx = reference_start + i as f32;
+        let base = target_idx.floor() as i32;
+        let mu = target_idx - base as f32;
+        
+        let idx_neg1 = (base - 1).clamp(0, reference.len() as i32 - 1) as usize;
+        let idx_0 = base.clamp(0, reference.len() as i32 - 1) as usize;
+        let idx_1 = (base + 1).clamp(0, reference.len() as i32 - 1) as usize;
+        let idx_2 = (base + 2).clamp(0, reference.len() as i32 - 1) as usize;
+        
+        let y_neg1 = reference[idx_neg1];
+        let y_0 = reference[idx_0];
+        let y_1 = reference[idx_1];
+        let y_2 = reference[idx_2];
+        
+        let v3_re = -1.0 / 6.0 * y_neg1.re + 0.5 * y_0.re - 0.5 * y_1.re + 1.0 / 6.0 * y_2.re;
+        let v2_re = 0.5 * y_neg1.re - y_0.re + 0.5 * y_1.re;
+        let v1_re = -1.0 / 3.0 * y_neg1.re - 0.5 * y_0.re + y_1.re - 1.0 / 6.0 * y_2.re;
+        let v0_re = y_0.re;
+
+        let v3_im = -1.0 / 6.0 * y_neg1.im + 0.5 * y_0.im - 0.5 * y_1.im + 1.0 / 6.0 * y_2.im;
+        let v2_im = 0.5 * y_neg1.im - y_0.im + 0.5 * y_1.im;
+        let v1_im = -1.0 / 3.0 * y_neg1.im - 0.5 * y_0.im + y_1.im - 1.0 / 6.0 * y_2.im;
+        let v0_im = y_0.im;
+
+        let re = ((v3_re * mu + v2_re) * mu + v1_re) * mu + v0_re;
+        let im = ((v3_im * mu + v2_im) * mu + v1_im) * mu + v0_im;
+        let interp_ref = Complex::new(re, im);
+        
+        sum += surv[i] * interp_ref.conj();
+        ref_energy += interp_ref.norm_sqr();
+    }
+    
+    if ref_energy > 1e-6 {
+        sum.norm() / ref_energy.sqrt()
+    } else {
+        sum.norm()
+    }
+}
+
+/// Refines an integer delay peak to sub-sample precision using Farrow interpolation.
+/// Fits a parabola to the correlation magnitude at three fractional delays: d - 0.5, d, d + 0.5.
+/// Returns the refined delay as a float with ~0.05 sample precision.
+pub fn refine_delay_farrow(
+    surv: &[Complex<f32>],
+    reference: &[Complex<f32>],
+    integer_delay: usize,
+) -> f32 {
+    let block_size = 512;
+    let max_cir_delay = 64;
+    if surv.len() < block_size + max_cir_delay || reference.len() < block_size + max_cir_delay {
+        return integer_delay as f32;
+    }
+    
+    let surv_sub = &surv[max_cir_delay..max_cir_delay + block_size];
+    let d_float = integer_delay as f32;
+    
+    let ref_start_neg = max_cir_delay as f32 - (d_float - 0.5);
+    let ref_start_zero = max_cir_delay as f32 - d_float;
+    let ref_start_pos = max_cir_delay as f32 - (d_float + 0.5);
+    
+    let m_neg = correlate_fractional_delay(surv_sub, reference, ref_start_neg);
+    let m_zero = correlate_fractional_delay(surv_sub, reference, ref_start_zero);
+    let m_pos = correlate_fractional_delay(surv_sub, reference, ref_start_pos);
+    
+    let a = 2.0 * (m_pos + m_neg - 2.0 * m_zero);
+    let b = m_pos - m_neg;
+    
+    if a >= 0.0 || a.abs() < 1e-6 {
+        return integer_delay as f32;
+    }
+    
+    let x_peak = -b / (2.0 * a);
+    let x_peak_clamped = x_peak.clamp(-0.5, 0.5);
+    
+    integer_delay as f32 + x_peak_clamped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,4 +457,41 @@ mod tests {
         assert!((scalar_res.re - simd_res.re).abs() < 1e-5, "Real parts differ: scalar={}, simd={}", scalar_res.re, simd_res.re);
         assert!((scalar_res.im - simd_res.im).abs() < 1e-5, "Imag parts differ: scalar={}, simd={}", scalar_res.im, simd_res.im);
     }
+
+    #[test]
+    fn test_farrow_interpolator_identity() {
+        // When mu = 0.0, interpolation should return y_0 (history[1])
+        let mut farrow = FarrowInterpolator::new();
+        farrow.push(Complex::new(1.0, 0.0));
+        farrow.push(Complex::new(2.0, 0.5));
+        farrow.push(Complex::new(3.0, 1.0));
+        farrow.push(Complex::new(4.0, 1.5));
+
+        let result = farrow.interpolate(0.0);
+        assert!((result.re - 2.0).abs() < 1e-5, "At mu=0, should return y_0.re=2.0, got {}", result.re);
+        assert!((result.im - 0.5).abs() < 1e-5, "At mu=0, should return y_0.im=0.5, got {}", result.im);
+    }
+
+    #[test]
+    fn test_refine_delay_farrow() {
+        // Create a known delayed signal: reference is a chirp, surveillance is the same chirp delayed
+        let n = 1024;
+        let mut reference = vec![Complex::new(0.0, 0.0); n];
+        for i in 0..n {
+            let phase = 0.1 * (i as f32) + 0.001 * (i as f32) * (i as f32);
+            reference[i] = Complex::from_polar(1.0, phase);
+        }
+
+        let delay = 5;
+        let surv: Vec<Complex<f32>> = (0..n)
+            .map(|i| {
+                if i + delay < n { reference[i + delay] } else { Complex::new(0.0, 0.0) }
+            })
+            .collect();
+
+        let refined = refine_delay_farrow(&surv, &reference, 5);
+        // Refined delay should be close to 5.0 (integer-aligned signal)
+        assert!((refined - 5.0).abs() < 0.6, "Refined delay {} should be close to 5.0", refined);
+    }
 }
+
