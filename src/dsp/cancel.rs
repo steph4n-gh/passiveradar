@@ -259,7 +259,7 @@ impl EcaCanceler {
         // We use tau to inject a tiny bit of "virtual noise" scaled by the block size.
         // This prevents the linear predictor from achieving "perfect cancellation" of the
         // constant-modulus phase signal, preserving the target echoes!
-        let tau = 1e-3 * n as f32; 
+        let tau = 1e-3 * (r[0][0].re / taps as f32 + 1e-6); 
         for j in 0..taps {
             r[j][j] += Complex::new(tau, 0.0);
         }
@@ -281,12 +281,13 @@ impl EcaCanceler {
         }
 
         // Update history
-        for i in 0..6 {
-            self.history[i] = if n > 5 - i {
-                input[n - 1 - (5 - i)]
-            } else {
-                self.history[self.history.len() - (5 - i) + n]
-            };
+        if n >= 6 {
+            self.history.copy_from_slice(&input[n - 6..n]);
+        } else {
+            for i in 0..(6 - n) {
+                self.history[i] = self.history[i + n];
+            }
+            self.history[6 - n..6].copy_from_slice(input);
         }
     }
 }
@@ -314,6 +315,182 @@ mod tests {
         for i in 10..100 {
             assert!(clean_surv[i].norm() < 0.1, "Failed to cancel direct path, got {}", clean_surv[i]);
             assert!(surr_ref[i].norm() > 900.0, "Failed to capture surrogate reference");
+        }
+    }
+
+    #[test]
+    fn test_eca_batched_canceler_correctness() {
+        let mut canceler = EcaBatchedCanceler::new(32, 10);
+        let mut input = vec![Complex::new(0.0, 0.0); 256];
+        
+        for i in 0..256 {
+            input[i] = Complex::new((i as f32).cos(), (i as f32).sin()) * 100.0;
+        }
+        
+        for i in 0..256 {
+            input[i] += Complex::new((i as f32 * 0.15).cos(), (i as f32 * 0.15).sin()) * 2.0;
+        }
+
+        let mut output = Vec::new();
+        canceler.process_block(&input, &mut output);
+
+        assert_eq!(output.len(), 256);
+        
+        let mut sum_target = 0.0;
+        for i in 100..256 {
+            sum_target += output[i].norm();
+        }
+        let avg_target = sum_target / 156.0;
+        assert!(avg_target < 10.0, "Static clutter not suppressed, avg output norm: {}", avg_target);
+        assert!(avg_target > 0.2, "Moving target signal cancelled out, avg output norm: {}", avg_target);
+    }
+}
+
+pub struct EcaBatchedCanceler {
+    num_taps: usize,
+    history: Vec<Complex<f32>>,
+    pub max_cg_iterations: usize,
+    gpu_state: Option<crate::dsp::gpu::GpuEcaState>,
+}
+
+impl EcaBatchedCanceler {
+    pub fn new(num_taps: usize, max_cg_iterations: usize) -> Self {
+        Self {
+            num_taps,
+            history: vec![Complex::new(0.0, 0.0); num_taps],
+            max_cg_iterations,
+            gpu_state: None,
+        }
+    }
+
+    pub fn process_block(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
+        let n_samples = input.len();
+        output.clear();
+        
+        if n_samples == 0 {
+            return;
+        }
+
+        // Try GPU path
+        if let Some(pipeline) = crate::dsp::gpu::get_gpu_eca_pipeline() {
+            let state = self.gpu_state.get_or_insert_with(|| {
+                crate::dsp::gpu::GpuEcaState::new(pipeline, n_samples, self.num_taps)
+            });
+            let gpu_out = state.process_eca(pipeline, input, &self.history, self.max_cg_iterations);
+            *output = gpu_out;
+
+            if n_samples >= self.num_taps {
+                for i in 0..self.num_taps {
+                    self.history[i] = input[n_samples - self.num_taps + i];
+                }
+            } else {
+                self.history.rotate_left(n_samples);
+                for i in 0..n_samples {
+                    self.history[self.num_taps - n_samples + i] = input[i];
+                }
+            }
+            return;
+        }
+
+        output.resize(n_samples, Complex::new(0.0, 0.0));
+
+        let mut w = vec![Complex::new(0.0, 0.0); self.num_taps];
+        let mut r = input.to_vec(); 
+        let mut p = vec![Complex::new(0.0, 0.0); self.num_taps];
+        self.apply_xh(&r, input, &mut p);
+        
+        let s_cg = p.clone(); 
+        
+        let mut norms_sq = 0.0;
+        for v in &s_cg { norms_sq += v.norm_sqr(); }
+
+        for _ in 0..self.max_cg_iterations {
+            if norms_sq < 1e-10 { break; }
+            
+            let mut q = vec![Complex::new(0.0, 0.0); n_samples];
+            self.apply_x(&p, input, &mut q);
+            
+            let mut normq_sq = 0.0;
+            for v in &q { normq_sq += v.norm_sqr(); }
+            
+            if normq_sq < 1e-15 { break; }
+            
+            let alpha = norms_sq / normq_sq;
+            
+            for i in 0..self.num_taps {
+                w[i] = w[i] + p[i] * alpha;
+            }
+            
+            for i in 0..n_samples {
+                r[i] = r[i] - q[i] * alpha;
+            }
+            
+            let mut s_new = vec![Complex::new(0.0, 0.0); self.num_taps];
+            self.apply_xh(&r, input, &mut s_new);
+            
+            let mut norms_new_sq = 0.0;
+            for v in &s_new { norms_new_sq += v.norm_sqr(); }
+            
+            let beta = norms_new_sq / norms_sq;
+            
+            for i in 0..self.num_taps {
+                p[i] = s_new[i] + p[i] * beta;
+            }
+            
+            norms_sq = norms_new_sq;
+        }
+        
+        for i in 0..n_samples {
+            output[i] = r[i];
+        }
+
+        if n_samples >= self.num_taps {
+            for i in 0..self.num_taps {
+                self.history[i] = input[n_samples - self.num_taps + i];
+            }
+        } else {
+            self.history.rotate_left(n_samples);
+            for i in 0..n_samples {
+                self.history[self.num_taps - n_samples + i] = input[i];
+            }
+        }
+    }
+    
+    fn apply_x(&self, p: &[Complex<f32>], input: &[Complex<f32>], q: &mut [Complex<f32>]) {
+        let n = input.len();
+        let k_taps = p.len();
+        
+        for i in 0..n {
+            let mut sum = Complex::new(0.0, 0.0);
+            for k in 0..k_taps {
+                let delay = k + 1;
+                let val = if i >= delay {
+                    input[i - delay]
+                } else {
+                    self.history[self.num_taps - delay + i]
+                };
+                sum += val * p[k];
+            }
+            q[i] = sum;
+        }
+    }
+
+    fn apply_xh(&self, r: &[Complex<f32>], input: &[Complex<f32>], s: &mut [Complex<f32>]) {
+        let n = input.len();
+        let k_taps = s.len();
+        
+        for k in 0..k_taps {
+            let mut sum = Complex::new(0.0, 0.0);
+            let delay = k + 1;
+            for i in 0..n {
+                let val = if i >= delay {
+                    input[i - delay]
+                } else {
+                    self.history[self.num_taps - delay + i]
+                };
+                sum += val.conj() * r[i];
+            }
+            s[k] = sum;
         }
     }
 }

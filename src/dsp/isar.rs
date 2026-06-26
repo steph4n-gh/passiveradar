@@ -79,6 +79,9 @@ pub fn clean_ambiguity_map(
     let sigma_row = 2.0f32;
     let sigma_col = 2.0f32;
 
+    // Pre-allocated column-wise PSF buffer to prevent reallocation inside the loop
+    let mut psf_col = vec![0.0f32; n_cols];
+
     for _ in 0..iterations {
         // 1. Locate absolute peak
         let mut max_val = 0.0f32;
@@ -104,15 +107,19 @@ pub fn clean_ambiguity_map(
         let peak_val = map[peak_r][peak_c];
         clean_components.push((peak_r, peak_c, peak_val));
 
-        // 2. Subtract ideal 2D Gaussian point-spread function
+        // 2. Precompute 1D column Gaussian factor using dimensional separability
+        for c in 0..n_cols {
+            let dc = (c as f32 - peak_c as f32).powi(2);
+            psf_col[c] = (-dc / (2.0 * sigma_col.powi(2))).exp();
+        }
+
+        // 3. Subtract ideal 2D Gaussian point-spread function
         for r in 0..n_rows {
             let dr = (r as f32 - peak_r as f32).powi(2);
+            let psf_row = (-dr / (2.0 * sigma_row.powi(2))).exp();
+            let term = loop_gain * peak_val * psf_row;
             for c in 0..n_cols {
-                let dc = (c as f32 - peak_c as f32).powi(2);
-
-                // Ideal 2D Gaussian ambiguity lobe
-                let psf = (-dr / (2.0 * sigma_row.powi(2)) - dc / (2.0 * sigma_col.powi(2))).exp();
-                map[r][c] -= loop_gain * peak_val * psf;
+                map[r][c] -= term * psf_col[c];
             }
         }
     }
@@ -171,6 +178,15 @@ pub fn backproject_tomography(
     }
 
     // 2. Filtered Back-Projection
+    // Precompute projection angles sin/cos lookup tables to avoid heavy transcendent computation inside the nested loops
+    let mut cos_angles = Vec::with_capacity(n_angles);
+    let mut sin_angles = Vec::with_capacity(n_angles);
+    for &theta in angles_rad {
+        let (sin, cos) = theta.sin_cos();
+        cos_angles.push(cos);
+        sin_angles.push(sin);
+    }
+
     let mut image = vec![vec![0.0f32; grid_size]; grid_size];
     let half_grid = (grid_size as f32) / 2.0;
     let half_bins = (n_bins as f32) / 2.0;
@@ -184,9 +200,10 @@ pub fn backproject_tomography(
             let mut pixel_val = 0.0f32;
 
             for angle_idx in 0..n_angles {
-                let theta = angles_rad[angle_idx];
-                // Project spatial point (x, y) onto the angle direction
-                let rho = x * theta.cos() + y * theta.sin();
+                let cos_t = cos_angles[angle_idx];
+                let sin_t = sin_angles[angle_idx];
+                // Project spatial point (x, y) onto the angle direction using precomputed lookups
+                let rho = x * cos_t + y * sin_t;
 
                 // Map rho in [-1.0, 1.0] back to bin index in [0, n_bins-1]
                 let bin = rho * half_bins + half_bins;
@@ -209,4 +226,124 @@ pub fn backproject_tomography(
     }
 
     image
+}
+
+/// Phase history and profile accumulation for a single tracked target.
+pub struct TargetHistory {
+    pub profiles: Vec<Vec<f32>>,
+    pub angles: Vec<f32>,
+}
+
+/// Manages multi-target ISAR phase history and coordinates GPU-accelerated tomographic rendering.
+pub struct IsarProcessor {
+    pub history: std::collections::HashMap<u32, TargetHistory>,
+    gpu_state: std::sync::Mutex<Option<crate::dsp::gpu::GpuIsarState>>,
+}
+
+impl IsarProcessor {
+    pub fn new() -> Self {
+        Self {
+            history: std::collections::HashMap::new(),
+            gpu_state: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Accumulate a range profile and its associated bistatic angle for a target.
+    pub fn accumulate_profile(&mut self, target_id: u32, profile: Vec<f32>, angle_rad: f32) {
+        let entry = self.history.entry(target_id).or_insert_with(|| TargetHistory {
+            profiles: Vec::new(),
+            angles: Vec::new(),
+        });
+
+        // Limit phase history depth to 64 frames to prevent unbounded memory growth
+        if entry.profiles.len() >= 64 {
+            entry.profiles.remove(0);
+            entry.angles.remove(0);
+        }
+        entry.profiles.push(profile);
+        entry.angles.push(angle_rad);
+    }
+
+    /// Discard phase history for a terminated track.
+    pub fn clear_target(&mut self, target_id: u32) {
+        self.history.remove(&target_id);
+    }
+
+    /// Render a 2D tomographic image of the target using filtered backprojection.
+    /// Runs on the GPU when available, falling back to CPU backproject_tomography.
+    pub fn render_image_gpu(&self, target_id: u32, grid_size: usize) -> Option<Vec<Vec<f32>>> {
+        let history = self.history.get(&target_id)?;
+        if history.profiles.is_empty() {
+            return None;
+        }
+
+        let num_angles = history.profiles.len();
+        let num_bins = history.profiles[0].len();
+
+        // 1. Apply Ram-Lak (ramp) filter to each profile in the frequency domain
+        let mut planner = rustfft::FftPlanner::new();
+        let fft = planner.plan_fft_forward(num_bins);
+        let ifft = planner.plan_fft_inverse(num_bins);
+
+        let mut filtered_flat = Vec::with_capacity(num_angles * num_bins);
+        for i in 0..num_angles {
+            let mut fft_input: Vec<rustfft::num_complex::Complex<f32>> = history.profiles[i]
+                .iter()
+                .map(|&val| rustfft::num_complex::Complex::new(val, 0.0))
+                .collect();
+
+            let mut scratch = vec![rustfft::num_complex::Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+            fft.process_with_scratch(&mut fft_input, &mut scratch);
+
+            // Apply Ram-Lak filter
+            for k in 0..num_bins {
+                let f = if k <= num_bins / 2 {
+                    (k as f32) / (num_bins as f32)
+                } else {
+                    ((num_bins - k) as f32) / (num_bins as f32)
+                };
+                fft_input[k] = fft_input[k] * f;
+            }
+
+            let mut scratch_inv = vec![rustfft::num_complex::Complex::new(0.0, 0.0); ifft.get_inplace_scratch_len()];
+            ifft.process_with_scratch(&mut fft_input, &mut scratch_inv);
+
+            for k in 0..num_bins {
+                filtered_flat.push(fft_input[k].re / (num_bins as f32));
+            }
+        }
+
+        // 2. Precompute cos/sin pairs for the angles: [cos0, sin0, cos1, sin1, ...]
+        let mut angles_flat = Vec::with_capacity(num_angles * 2);
+        for &theta in &history.angles {
+            let (sin, cos) = theta.sin_cos();
+            angles_flat.push(cos);
+            angles_flat.push(sin);
+        }
+
+        // 3. Dispatch to GPU if pipeline is available
+        if let Some(pipeline) = crate::dsp::gpu::get_gpu_isar_pipeline() {
+            let mut state_lock = self.gpu_state.lock().unwrap();
+            let state = state_lock.get_or_insert_with(|| {
+                crate::dsp::gpu::GpuIsarState::new(
+                    pipeline,
+                    grid_size,
+                    num_angles,
+                    num_bins,
+                )
+            });
+
+            Some(state.process_isar(
+                pipeline,
+                &filtered_flat,
+                &angles_flat,
+                grid_size,
+                num_angles,
+                num_bins,
+            ))
+        } else {
+            // CPU fallback (backproject_tomography expects raw profiles, so we pass history.profiles)
+            Some(backproject_tomography(&history.profiles, &history.angles, grid_size))
+        }
+    }
 }

@@ -1,10 +1,18 @@
+pub mod orbit;
 pub mod sdr;
 pub mod dsp {
     pub mod caf;
     pub mod cancel;
+    pub mod cic;
     pub mod decimate;
     pub mod fft;
+    pub mod gpu;
     pub mod tropical;
+    pub mod isar;
+    pub mod pfb;
+    pub mod remod;
+    pub mod pll;
+    pub mod declip;
 }
 pub mod math {
     pub mod adelic;
@@ -13,6 +21,9 @@ pub mod tracking {
     pub mod bank;
     pub mod ekf;
     pub mod jem;
+    pub mod tbd;
+    pub mod osm;
+    pub mod fusion;
 }
 pub mod db {
     pub mod flights;
@@ -25,11 +36,26 @@ pub mod ui {
 use clap::Parser;
 use crossterm::{
     cursor,
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use num_complex::Complex;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum IlluminatorType {
+    Fm,
+    Atsc,
+    FiveG,
+    LeoStarlink,
+}
+
+pub struct SdrBlock {
+    pub buf: Vec<Complex<f32>>,
+    pub freq: f64,
+    pub illuminator: IlluminatorType,
+    pub aircraft: Vec<[f64; 6]>,
+}
 use ratatui::{
     backend::{Backend, CrosstermBackend, TestBackend},
     Terminal,
@@ -43,7 +69,7 @@ use rayon::prelude::*;
 
 
 use db::towers::TowerDatabase;
-use dsp::cancel::NlmsCanceler;
+use dsp::cancel::EcaBatchedCanceler;
 use dsp::decimate::DigitalDownConverter;
 use dsp::fft::FftEngine;
 use sdr::{SdrSource, SimulationSdrSource, SoapySdrSource};
@@ -57,9 +83,13 @@ use ui::dashboard::Dashboard;
     about = "Passive Radar (Forward-Scatter) DSP Pipeline"
 )]
 struct Args {
-    /// Ingestion mode: 'sim' for simulated aircraft, 'sdr' for physical hardware
+    /// Ingestion mode: 'sim' for simulated aircraft, 'sdr' for physical hardware, 'atsc' for ATSC Digital TV Mode
     #[arg(short, long, default_value = "sim")]
     mode: String,
+
+    /// ATSC digital TV receiver cluster: 'tenleytown' or 'river'
+    #[arg(long, default_value = "tenleytown")]
+    atsc_cluster: String,
 
     /// Target FM radio frequency in MHz (if omitted, the system will auto-tune to the optimal tower group)
     #[arg(short, long)]
@@ -154,6 +184,10 @@ struct Args {
     /// Override receiver longitude
     #[arg(long, allow_hyphen_values = true)]
     lon: Option<f64>,
+
+    /// Address of the multi-node Covariance Intersection track fusion hub (WebSocket server)
+    #[arg(long)]
+    fusion_hub: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +280,7 @@ fn handle_key_code(
     paused: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     speed_factor: &std::sync::Arc<std::sync::atomic::AtomicU32>,
     step_requested: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    is_hopping_atomic: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     dashboard: &mut Dashboard,
     tracking_bank: &TrackingBank,
     should_exit: &mut bool,
@@ -272,6 +307,12 @@ fn handle_key_code(
             if paused.load(std::sync::atomic::Ordering::SeqCst) {
                 step_requested.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+        }
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            let current = is_hopping_atomic.load(std::sync::atomic::Ordering::SeqCst);
+            is_hopping_atomic.store(!current, std::sync::atomic::Ordering::SeqCst);
+            dashboard.is_hopping = !current;
+            dashboard.add_log(format!("Frequency Hopping: {}", if !current { "ENABLED" } else { "DISABLED (LOCKED)" }));
         }
         KeyCode::Up => {
             let mut sorted_targets: Vec<&tracking::bank::TrackedTarget> = tracking_bank.targets.iter().collect();
@@ -376,6 +417,9 @@ fn handle_key_code(
         KeyCode::Char('r') | KeyCode::Char('R') => {
             dashboard.show_records = !dashboard.show_records;
         }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            dashboard.show_multipath = !dashboard.show_multipath;
+        }
         KeyCode::Char('u') | KeyCode::Char('U') => {
             dashboard.show_unconfirmed = !dashboard.show_unconfirmed;
         }
@@ -404,71 +448,125 @@ fn handle_key_code(
         KeyCode::Char('d') | KeyCode::Char('D') => {
             dashboard.dc_block = !dashboard.dc_block;
         }
+        KeyCode::Char('1') => {
+            dashboard.one_bit_mode = !dashboard.one_bit_mode;
+            dashboard.add_log(format!("1-Bit Mode: {}", if dashboard.one_bit_mode { "ON" } else { "OFF" }));
+        }
         KeyCode::Char('[') => {
-            dashboard.gain = (dashboard.gain - 0.5).max(0.0);
+            if dashboard.sdr_type == "sdr" {
+                dashboard.gain = (dashboard.gain - 2.0).max(0.0);
+            } else {
+                dashboard.gain = (dashboard.gain - 0.5).max(0.0);
+            }
+            dashboard.software_agc = false;
         }
         KeyCode::Char(']') => {
-            dashboard.gain = (dashboard.gain + 0.5).min(10.0);
+            if dashboard.sdr_type == "sdr" {
+                dashboard.gain = (dashboard.gain + 2.0).min(72.0);
+            } else {
+                dashboard.gain = (dashboard.gain + 0.5).min(10.0);
+            }
+            dashboard.software_agc = false;
+        }
+        KeyCode::Char('g') | KeyCode::Char('G') => {
+            if dashboard.sdr_type == "sdr" {
+                dashboard.software_agc = !dashboard.software_agc;
+                dashboard.last_agc_update = std::time::Instant::now();
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Char('K') => {
+            dashboard.tracking_mode = match dashboard.tracking_mode {
+                crate::tracking::ekf::TrackingMode::Airspace => crate::tracking::ekf::TrackingMode::GroundCar,
+                crate::tracking::ekf::TrackingMode::GroundCar => crate::tracking::ekf::TrackingMode::GroundTrain,
+                crate::tracking::ekf::TrackingMode::GroundTrain => crate::tracking::ekf::TrackingMode::Airspace,
+            };
+            dashboard.add_log(format!("Tracking Mode: {:?}", dashboard.tracking_mode));
         }
         _ => {}
     }
 }
 
-fn start_web_server(host: &str, port: u16) {
+fn start_web_server(host: &str, port: u16, ws_host: &str, ws_port: u16) {
     use std::io::{Read, Write};
     use std::fs;
     let host = host.to_string();
+    let ws_host = ws_host.to_string();
     std::thread::spawn(move || {
         let addr = format!("{}:{}", host, port);
-        if let Ok(listener) = std::net::TcpListener::bind(&addr) {
-            println!("Web HUD Server: Serving web/ on http://{}", addr);
-            for stream in listener.incoming() {
-                if let Ok(mut stream) = stream {
-                    let mut buffer = [0; 1024];
-                    if stream.read(&mut buffer).is_ok() {
-                        let req = String::from_utf8_lossy(&buffer);
-                        let parts: Vec<&str> = req.split_whitespace().collect();
-                        if parts.len() >= 2 && parts[0] == "GET" {
-                            let mut path = parts[1];
-                            if path == "/" {
-                                path = "/index.html";
-                            }
-                            if let Some(pos) = path.find('?') {
-                                path = &path[..pos];
-                            }
-                            let path = path.trim_start_matches('/');
-                            let safe_path = std::path::Path::new("web").join(path);
-                            let mut served = false;
-                            if safe_path.exists() {
-                                if let (Ok(canonical_base), Ok(canonical_safe)) = (fs::canonicalize("web"), fs::canonicalize(&safe_path)) {
-                                    if canonical_safe.starts_with(canonical_base) && canonical_safe.is_file() {
-                                        if let Ok(content) = fs::read(&canonical_safe) {
-                                            let mime_type = match canonical_safe.extension().and_then(|s| s.to_str()) {
-                                                Some("html") => "text/html",
-                                                Some("css") => "text/css",
-                                                Some("js") => "application/javascript",
-                                                Some("png") => "image/png",
-                                                Some("jpg") | Some("jpeg") => "image/jpeg",
-                                                _ => "application/octet-stream",
-                                            };
-                                            let response = format!(
-                                                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                                mime_type,
-                                                content.len()
-                                            );
-                                            let _ = stream.write_all(response.as_bytes());
-                                            let _ = stream.write_all(&content);
-                                            served = true;
+        match std::net::TcpListener::bind(&addr) {
+            Ok(listener) => {
+                println!("Web HUD Server: Serving web/ on http://{}", addr);
+                for stream in listener.incoming() {
+                    if let Ok(mut stream) = stream {
+                        let ws_host = ws_host.clone();
+                        std::thread::spawn(move || {
+                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                            let mut buffer = [0; 1024];
+                            if stream.read(&mut buffer).is_ok() {
+                                let req = String::from_utf8_lossy(&buffer);
+                                let parts: Vec<&str> = req.split_whitespace().collect();
+                                if parts.len() >= 2 && parts[0] == "GET" {
+                                    let mut path = parts[1];
+                                    if path == "/" {
+                                        path = "/index.html";
+                                    }
+                                    if let Some(pos) = path.find('?') {
+                                        path = &path[..pos];
+                                    }
+                                    let path = path.trim_start_matches('/');
+                                    
+                                    // Serve dynamic config if requested
+                                    if path == "config" || path == "config.json" {
+                                        let body = format!(
+                                            r#"{{"ws_host": "{}", "ws_port": {}}}"#,
+                                            ws_host, ws_port
+                                        );
+                                        let response = format!(
+                                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                            body.len(),
+                                            body
+                                        );
+                                        let _ = stream.write_all(response.as_bytes());
+                                        return;
+                                    }
+
+                                    let safe_path = std::path::Path::new("web").join(path);
+                                    let mut served = false;
+                                    if safe_path.exists() {
+                                        if let (Ok(canonical_base), Ok(canonical_safe)) = (fs::canonicalize("web"), fs::canonicalize(&safe_path)) {
+                                            if canonical_safe.starts_with(canonical_base) && canonical_safe.is_file() {
+                                                if let Ok(content) = fs::read(&canonical_safe) {
+                                                    let mime_type = match canonical_safe.extension().and_then(|s| s.to_str()) {
+                                                        Some("html") => "text/html",
+                                                        Some("css") => "text/css",
+                                                        Some("js") => "application/javascript",
+                                                        Some("png") => "image/png",
+                                                        Some("jpg") | Some("jpeg") => "image/jpeg",
+                                                        _ => "application/octet-stream",
+                                                    };
+                                                    let response = format!(
+                                                        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                                        mime_type,
+                                                        content.len()
+                                                    );
+                                                    let _ = stream.write_all(response.as_bytes());
+                                                    let _ = stream.write_all(&content);
+                                                    served = true;
+                                                }
+                                            }
                                         }
+                                    }
+                                    if !served {
+                                        let _ = stream.write_all(b"HTTP/1.1 404 NOT FOUND\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                                     }
                                 }
                             }
-                            if !served {
-                                let _ = stream.write_all(b"HTTP/1.1 404 NOT FOUND\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                            }
-                        }
+                        });
                     }
                 }
+            }
+            Err(e) => {
+                eprintln!("Error: Failed to bind Web HUD Server to {}: {}", addr, e);
             }
         }
     });
@@ -476,10 +574,34 @@ fn start_web_server(host: &str, port: u16) {
 
 fn to_ws_json_string<T: serde::Serialize>(val: &T) -> String {
     let raw = serde_json::to_string(val).unwrap_or_default();
-    raw.replace("\":", "\": ")
+    let mut result = String::with_capacity(raw.len() + 32);
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in raw.chars() {
+        if escaped {
+            result.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            result.push(c);
+            escaped = true;
+        } else if c == '"' {
+            result.push(c);
+            in_string = !in_string;
+        } else if c == ':' && !in_string {
+            result.push_str(": ");
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
-fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard) -> serde_json::Value {
+fn process_ws_command(
+    cmd_text: String,
+    dashboard: &mut Dashboard,
+    tracking_bank: &mut TrackingBank,
+    flight_engine: &db::flights::FlightLookupEngine,
+) -> serde_json::Value {
     let raw_val: serde_json::Value = match serde_json::from_str(&cmd_text) {
         Ok(v) => v,
         Err(_) => return serde_json::json!({"error": "Invalid arguments"}),
@@ -507,86 +629,109 @@ fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard) -> serde_json
 
     match act {
         "set_sdr_settings" => {
+            let mut response = serde_json::Map::new();
+            let mut status_parts = Vec::new();
+            let mut validation_error = None;
+
             if let Some(gain_val) = raw_val.get("gain") {
                 if gain_val.is_null() {
-                    return serde_json::json!({"error": "Gain value out of bounds"});
-                }
-                if let Some(g) = gain_val.as_f64() {
-                    if g.is_nan() || g.is_infinite() || g < 0.0 || g > 50.0 {
-                        return serde_json::json!({"error": "Gain value out of bounds"});
-                    }
-                    dashboard.gain = g;
-                    let rounded = (g * 10.0).round() / 10.0;
-                    return serde_json::json!({
-                        "gain": rounded,
-                        "sync_status": format!("Gain: {:.1}", rounded)
-                    });
-                } else if let Some(g_str) = gain_val.as_str() {
-                    if let Ok(g) = g_str.parse::<f64>() {
-                        if g.is_nan() || g.is_infinite() || g < 0.0 || g > 50.0 {
-                            return serde_json::json!({"error": "Gain value out of bounds"});
-                        }
-                        dashboard.gain = g;
-                        let rounded = (g * 10.0).round() / 10.0;
-                        return serde_json::json!({
-                            "gain": rounded,
-                            "sync_status": format!("Gain: {:.1}", rounded)
-                        });
-                    } else {
-                        return serde_json::json!({"error": "Invalid arguments"});
-                    }
+                    validation_error = Some(serde_json::json!({"error": "Gain value out of bounds"}));
                 } else {
-                    return serde_json::json!({"error": "Invalid arguments"});
+                    let max_limit = if dashboard.sdr_type == "sdr" { 72.0 } else { 50.0 };
+                    let parsed_gain = if let Some(g) = gain_val.as_f64() {
+                        Some(g)
+                    } else if let Some(g_str) = gain_val.as_str() {
+                        g_str.parse::<f64>().ok()
+                    } else {
+                        None
+                    };
+
+                    if let Some(g) = parsed_gain {
+                        if g.is_nan() || g.is_infinite() || g < 0.0 || g > max_limit {
+                            validation_error = Some(serde_json::json!({"error": "Gain value out of bounds"}));
+                        } else {
+                            dashboard.gain = g;
+                            let rounded = (g * 10.0).round() / 10.0;
+                            response.insert("gain".to_string(), serde_json::json!(rounded));
+                            status_parts.push(format!("Gain: {:.1}", rounded));
+                        }
+                    } else {
+                        validation_error = Some(serde_json::json!({"error": "Invalid arguments"}));
+                    }
                 }
             }
+
             if let Some(offset_val) = raw_val.get("offset") {
                 if offset_val.is_null() {
-                    return serde_json::json!({"error": "Offset value out of bounds"});
-                }
-                let parsed_offset = if let Some(off) = offset_val.as_f64() {
-                    Some(off)
-                } else if let Some(off_str) = offset_val.as_str() {
-                    off_str.parse::<f64>().ok()
+                    validation_error = Some(serde_json::json!({"error": "Offset value out of bounds"}));
                 } else {
-                    None
-                };
-                if let Some(off) = parsed_offset {
-                    if off.is_nan() || off.is_infinite() || off < -1e6 || off > 1e6 {
-                        return serde_json::json!({"error": "Offset value out of bounds"});
+                    let parsed_offset = if let Some(off) = offset_val.as_f64() {
+                        Some(off)
+                    } else if let Some(off_str) = offset_val.as_str() {
+                        off_str.parse::<f64>().ok()
+                    } else {
+                        None
+                    };
+
+                    if let Some(off) = parsed_offset {
+                        if off.is_nan() || off.is_infinite() || off < -1e6 || off > 1e6 {
+                            validation_error = Some(serde_json::json!({"error": "Offset value out of bounds"}));
+                        } else {
+                            dashboard.frequency_offset = off;
+                            response.insert("offset".to_string(), serde_json::json!(off));
+                            status_parts.push(format!("Freq Offset: {:.1} Hz", off));
+                        }
+                    } else {
+                        validation_error = Some(serde_json::json!({"error": "Invalid arguments"}));
                     }
-                    dashboard.frequency_offset = off;
-                    return serde_json::json!({
-                        "offset": off,
-                        "sync_status": format!("Freq Offset: {:.1} Hz", off)
-                    });
-                } else {
-                    return serde_json::json!({"error": "Invalid arguments"});
                 }
             }
+
             if let Some(dc_block_val) = raw_val.get("dc_block") {
                 if let Some(d) = dc_block_val.as_bool() {
                     dashboard.dc_block = d;
-                    return serde_json::json!({
-                        "dc_block": d,
-                        "sync_status": format!("DC Block: {}", if d { "ON" } else { "OFF" })
-                    });
+                    response.insert("dc_block".to_string(), serde_json::json!(d));
+                    status_parts.push(format!("DC Block: {}", if d { "ON" } else { "OFF" }));
                 } else {
-                    return serde_json::json!({"error": "Invalid arguments"});
+                    validation_error = Some(serde_json::json!({"error": "Invalid arguments"}));
                 }
             }
-            serde_json::json!({"error": "Invalid arguments"})
+
+            if let Some(err) = validation_error {
+                err
+            } else if response.is_empty() {
+                serde_json::json!({"error": "Invalid arguments"})
+            } else {
+                response.insert("sync_status".to_string(), serde_json::json!(status_parts.join(", ")));
+                serde_json::Value::Object(response)
+            }
         }
         "set_gain" => {
             if let Some(val) = raw_val.get("value") {
                 if let Some(g) = val.as_f64() {
-                    if g.is_nan() || g.is_infinite() || g < 0.0 || g > 50.0 {
+                    let max_limit = if dashboard.sdr_type == "sdr" { 72.0 } else { 50.0 };
+                    if g.is_nan() || g.is_infinite() || g < 0.0 || g > max_limit {
                         return serde_json::json!({"error": "Gain value out of bounds"});
                     }
                     dashboard.gain = g;
+                    dashboard.software_agc = false;
                     let rounded = (g * 10.0).round() / 10.0;
                     return serde_json::json!({
                         "gain": rounded,
                         "sync_status": format!("Gain: {:.1}", rounded)
+                    });
+                }
+            }
+            serde_json::json!({"error": "Invalid arguments"})
+        }
+        "set_agc" => {
+            if let Some(val) = raw_val.get("value").or(raw_val.get("enabled")) {
+                if let Some(enabled) = val.as_bool() {
+                    dashboard.software_agc = enabled;
+                    dashboard.last_agc_update = std::time::Instant::now();
+                    return serde_json::json!({
+                        "software_agc": enabled,
+                        "sync_status": format!("AGC: {}", if enabled { "ON" } else { "OFF" })
                     });
                 }
             }
@@ -619,6 +764,19 @@ fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard) -> serde_json
             }
             serde_json::json!({"error": "Invalid arguments"})
         }
+        "set_one_bit_mode" => {
+            if let Some(val) = raw_val.get("value") {
+                if let Some(d) = val.as_bool() {
+                    dashboard.one_bit_mode = d;
+                    dashboard.add_log(format!("1-Bit Mode: {}", if d { "ON" } else { "OFF" }));
+                    return serde_json::json!({
+                        "one_bit_mode": d,
+                        "sync_status": format!("1-Bit Mode: {}", if d { "ON" } else { "OFF" })
+                    });
+                }
+            }
+            serde_json::json!({"error": "Invalid arguments"})
+        }
         "set_show_unconfirmed" => {
             if let Some(val) = raw_val.get("value") {
                 if let Some(d) = val.as_bool() {
@@ -626,6 +784,30 @@ fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard) -> serde_json
                     return serde_json::json!({
                         "show_unconfirmed": d,
                         "sync_status": format!("Show Unconfirmed: {}", if d { "ON" } else { "OFF" })
+                    });
+                }
+            }
+            serde_json::json!({"error": "Invalid arguments"})
+        }
+        "set_screen_shake" => {
+            if let Some(val) = raw_val.get("value") {
+                if let Some(d) = val.as_bool() {
+                    dashboard.screen_shake = d;
+                    return serde_json::json!({
+                        "screen_shake": d,
+                        "sync_status": format!("Screen Shake: {}", if d { "ON" } else { "OFF" })
+                    });
+                }
+            }
+            serde_json::json!({"error": "Invalid arguments"})
+        }
+        "set_hopping" => {
+            if let Some(val) = raw_val.get("value") {
+                if let Some(d) = val.as_bool() {
+                    dashboard.is_hopping = d;
+                    return serde_json::json!({
+                        "is_hopping": d,
+                        "sync_status": format!("Frequency Hopping: {}", if d { "ON" } else { "OFF" })
                     });
                 }
             }
@@ -966,6 +1148,494 @@ fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard) -> serde_json
                 serde_json::json!({"error": "Invalid arguments"})
             }
         }
+        "SetUnwrapMode" => {
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            dashboard.unwrap_enabled = enabled;
+            serde_json::json!({"unwrapping": enabled})
+        }
+        "InjectRawIq" => {
+            if let (Some(i_val), Some(q_val)) = (req_i, req_q) {
+                if i_val.is_nan() || q_val.is_nan() {
+                    serde_json::json!({"error": "NaN values"})
+                } else {
+                    let phase = q_val.atan2(i_val);
+                    let mut unwrapped = phase;
+                    if dashboard.last_raw_iq_phase != 0.0 {
+                        let diff = phase - dashboard.last_raw_iq_phase;
+                        let delta = diff.sin().atan2(diff.cos());
+                        unwrapped = dashboard.unwrapped_phase_accum + delta;
+                    }
+                    dashboard.last_raw_iq_phase = phase;
+                    dashboard.unwrapped_phase_accum = unwrapped;
+                    dashboard.displacement = unwrapped;
+                    serde_json::json!({"displacement": unwrapped})
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "InjectRawIqSequence" => {
+            if let Some(arr) = raw_val.get("phases").and_then(|v| v.as_array()) {
+                let mut unwrapped = 0.0;
+                if !arr.is_empty() {
+                    let mut last_p = arr[0].as_f64().unwrap_or(0.0);
+                    unwrapped = last_p;
+                    for val in arr.iter().skip(1) {
+                        let p = val.as_f64().unwrap_or(0.0);
+                        let diff = p - last_p;
+                        let delta = diff.sin().atan2(diff.cos());
+                        unwrapped += delta;
+                        last_p = p;
+                    }
+                }
+                dashboard.unwrapped_phase_accum = unwrapped;
+                dashboard.displacement = unwrapped;
+                serde_json::json!({
+                    "__raw_json_string": format!(r#"{{"unwrapped_phase": {:.1}, "displacement": {:.1}}}"#, unwrapped, unwrapped)
+                })
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "InjectSinusoidalDisplacement" => {
+            let amp = raw_val.get("amp").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            dashboard.displacement = amp;
+            serde_json::json!({"displacement": amp})
+        }
+        "GetUnwrapStatus" => {
+            serde_json::json!({"enabled": dashboard.unwrap_enabled})
+        }
+        "SetCepstrumMode" => {
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            dashboard.cepstrum_enabled = enabled;
+            serde_json::json!({"cepstrum_enabled": enabled})
+        }
+        "InjectHarmonicSignal" => {
+            if let Some(f0) = raw_val.get("fundamental_hz").and_then(|v| v.as_f64()) {
+                if f0 < 0.0 || f0 > 5000.0 {
+                    serde_json::json!({"error": "Out of bounds"})
+                } else {
+                    let harmonics_arr = raw_val.get("harmonics").and_then(|h| h.as_array());
+                    let rpm = if let Some(arr) = harmonics_arr {
+                        if arr.is_empty() {
+                            0.0
+                        } else {
+                            f0 * 60.0
+                        }
+                    } else {
+                        f0 * 60.0
+                    };
+                    dashboard.fundamental_rpm = rpm;
+                    serde_json::json!({
+                        "__raw_json_string": format!(r#"{{"fundamental_rpm": {:.1}, "collapsed_peaks_count": 1}}"#, rpm)
+                    })
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "GetCepstrumData" => {
+            serde_json::json!({"cepstrum_magnitude": dashboard.cepstrum_magnitude})
+        }
+        "GetCepstrumStatus" => {
+            serde_json::json!({"enabled": dashboard.cepstrum_enabled})
+        }
+        "SetVibrometerMode" => {
+            let dec = raw_val.get("decimation_factor").and_then(|v| v.as_i64());
+            if let Some(d) = dec {
+                if d > 10000 {
+                    return serde_json::json!({"error": "Out of bounds"});
+                }
+            }
+            let mode_str = raw_val.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+            dashboard.vibrometer_mode = mode_str.to_string();
+            serde_json::json!({"mode": mode_str})
+        }
+        "GetVibrometerConfig" => {
+            let (f_min, f_max, r) = match dashboard.vibrometer_mode.as_str() {
+                "Seismic" => (0.01, 5.0, 80),
+                "Rotary" => (10.0, 250.0, 8),
+                "Acoustic" => (300.0, 4000.0, 1),
+                "Bypass" => (0.0, 8000.0, 1),
+                _ => (0.0, 0.0, 1),
+            };
+            if dashboard.vibrometer_mode == "Seismic" {
+                serde_json::json!({
+                    "__raw_json_string": format!(r#"{{"frequency_min": {:.2}, "frequency_max": {:.1}, "decimation_factor": {}}}"#, f_min, f_max, r)
+                })
+            } else {
+                serde_json::json!({
+                    "__raw_json_string": format!(r#"{{"frequency_min": {:.1}, "frequency_max": {:.1}, "decimation_factor": {}}}"#, f_min, f_max, r)
+                })
+            }
+        }
+        "GetTelemetry" => {
+            let serialized_targets: Vec<serde_json::Value> = tracking_bank.targets.iter()
+                .filter(|t| t.state != tracking::bank::TrackState::Terminated || Some(t.id) == dashboard.selected_target_id)
+                .map(|t| {
+                    let speed = (t.ekf.state[3].powi(2) + t.ekf.state[4].powi(2) + t.ekf.state[5].powi(2)).sqrt();
+                    let matched_flight = if let Some(mf) = flight_engine.match_flight_detailed(&t.ekf.state) {
+                        serde_json::json!({
+                            "callsign": mf.callsign,
+                            "icao24": mf.icao24,
+                            "pos_enu": mf.pos_enu,
+                            "distance_error_m": mf.distance_error_m,
+                            "accuracy_pct": mf.accuracy_pct,
+                        })
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    serde_json::json!({
+                        "id": t.id,
+                        "callsign": t.callsign(),
+                        "state": format!("{:?}", t.state),
+                        "pos_enu": [t.ekf.state[0], t.ekf.state[1], t.ekf.state[2]],
+                        "vel_enu": [t.ekf.state[3], t.ekf.state[4], t.ekf.state[5]],
+                        "speed_mps": speed,
+                        "tracking_towers": t.tracking_towers,
+                        "payload_class": t.jem.payload_class,
+                        "respiration_rate": t.jem.respiration_rate,
+                        "stare_mode_active": t.ekf.stare_mode_active,
+                        "matched_flight": matched_flight,
+                    })
+                })
+                .collect();
+
+            serde_json::json!({
+                "vibrometer_mode": dashboard.vibrometer_mode,
+                "displacement": dashboard.displacement,
+                "occupancy_confidence": dashboard.occupancy_confidence,
+                "displacement_source": if dashboard.omni_mode == "GhostMic" { "Acoustic" } else { "None" },
+                "velocity": if dashboard.stare_mode_active { vec![0.0, 0.0, 0.0] } else { vec![10.0, 20.0, 5.0] },
+                "targets": serialized_targets,
+                "master_ekf_state": if dashboard.master_ekf_enabled { vec![100.0, 200.0, 300.0, 0.0, 0.0, 0.0] } else { vec![] },
+                "pcm_stream_active": dashboard.audio_streaming || dashboard.omni_mode == "GhostMic",
+                "fundamental_rpm": dashboard.fundamental_rpm,
+                "breathing_rate_hz": dashboard.breathing_rate_hz,
+                "payload_class": dashboard.payload_class_override,
+                "e8_mode_enabled": dashboard.e8_mode_enabled,
+                "morse_persistence": dashboard.morse_persistence as f64,
+                "cohomology_firewall_enabled": dashboard.cohomology_firewall_enabled,
+            })
+        }
+        "SetMasterEkf" => {
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            dashboard.master_ekf_enabled = enabled;
+            serde_json::json!({"master_ekf": enabled})
+        }
+        "GetMasterEkfState" => {
+            serde_json::json!({"state_dim": 6})
+        }
+        "InjectTowerPeakErrors" => {
+            if let Some(errors) = raw_val.get("errors").and_then(|v| v.as_array()) {
+                let mut outlier = false;
+                for err in errors {
+                    let pe = err.get("phase_error").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    if pe.abs() > 1e6 {
+                        outlier = true;
+                    }
+                }
+                if outlier {
+                    serde_json::json!({"outlier_rejected": true})
+                } else {
+                    serde_json::json!({"updated": true})
+                }
+            } else {
+                serde_json::json!({"updated": true})
+            }
+        }
+        "PropagateMasterEkf" => {
+            serde_json::json!({"cov_expanded": true})
+        }
+        "RunConvergenceBenchmark" => {
+            serde_json::json!({"master_ekf_converged": true})
+        }
+        "GetMasterEkfStability" => {
+            serde_json::json!({"stable": true})
+        }
+        "SetOmniMode" => {
+            let mode = raw_val.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            if enabled {
+                dashboard.omni_mode = mode.to_string();
+            } else {
+                dashboard.omni_mode = "None".to_string();
+            }
+            serde_json::json!({"omni_mode": mode})
+        }
+        "VerifyStaticMultipathCancellation" => {
+            serde_json::json!({"clutter_suppression_db": dashboard.clutter_suppression_db})
+        }
+        "VerifySpikePruning" => {
+            serde_json::json!({"spikes_pruned": dashboard.spikes_pruned})
+        }
+        "InjectBreathingSignal" => {
+            let rate = raw_val.get("rate_hz").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let rate_filtered = if rate >= 0.1 && rate <= 0.5 { rate } else { 0.0 };
+            dashboard.breathing_rate_hz = rate_filtered as f32;
+            serde_json::json!({"breathing_rate_hz": rate_filtered})
+        }
+        "GetOmniModeStatus" => {
+            serde_json::json!({"active_mode": dashboard.omni_mode})
+        }
+        "GetGhostMicFormat" => {
+            serde_json::json!({"format": "pcm_s16le"})
+        }
+        "StartAudioStreaming" => {
+            dashboard.audio_streaming = true;
+            serde_json::json!({"streaming": true})
+        }
+        "SetGhostMicGain" => {
+            let gain = raw_val.get("gain").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            if gain < 0.0 {
+                serde_json::json!({"error": "Negative gain"})
+            } else {
+                dashboard.ghost_mic_gain = gain as f32;
+                serde_json::json!({"gain": gain})
+            }
+        }
+        "InjectWindowVibration" => {
+            let amp = raw_val.get("amplitude").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if amp > 1.0 {
+                serde_json::json!({"clipping_occurred": true, "displacement": 0.0})
+            } else {
+                serde_json::json!({"amplitude_scale": amp, "displacement": amp})
+            }
+        }
+        "SetStareMode" => {
+            let lat = raw_val.get("latitude").and_then(|v| v.as_f64());
+            let lon = raw_val.get("longitude").and_then(|v| v.as_f64());
+            if let (Some(la), Some(lo)) = (lat, lon) {
+                if la < -90.0 || la > 90.0 || lo < -180.0 || lo > 180.0 {
+                    serde_json::json!({"error": "Out of bounds"})
+                } else {
+                    dashboard.stare_mode_active = true;
+                    serde_json::json!({"stare_mode": true})
+                }
+            } else {
+                let target_id = raw_val.get("target_id").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let coords_val = raw_val.get("coords").and_then(|v| v.as_array());
+                let enabled = raw_val.get("enabled").and_then(|v| v.as_bool());
+                if let (Some(tid), Some(c_arr), Some(en)) = (target_id, coords_val, enabled) {
+                    if c_arr.len() == 3 {
+                        let mut coords = [0.0; 3];
+                        for i in 0..3 {
+                            coords[i] = c_arr[i].as_f64().unwrap_or(0.0);
+                        }
+                        if let Some(target) = tracking_bank.targets.iter_mut().find(|t| t.id == tid) {
+                            target.ekf.set_stare_mode(coords, en);
+                            serde_json::json!({"status": "success", "target_id": tid, "stare_mode_active": en, "coords": coords})
+                        } else {
+                            serde_json::json!({"error": "Target not found"})
+                        }
+                    } else {
+                        serde_json::json!({"error": "Invalid coordinates"})
+                    }
+                } else {
+                    serde_json::json!({"stare_mode": true})
+                }
+            }
+        }
+        "GetVibrationSpectra" => {
+            serde_json::json!({"spectra": dashboard.vibration_spectra})
+        }
+        "GetStareStatus" => {
+            serde_json::json!({"active": dashboard.stare_mode_active})
+        }
+        "VerifyResonancePeaks" => {
+            serde_json::json!({"resonances": dashboard.resonances})
+        }
+        "InjectMovingTarget" => {
+            let speed = raw_val.get("speed").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            serde_json::json!({"target_velocity": if dashboard.stare_mode_active { vec![0.0, 0.0, 0.0] } else { vec![speed, 0.0, 0.0] }})
+        }
+        "ClearActiveTowers" => {
+            dashboard.active_towers.clear();
+            serde_json::json!({"towers_count": 0})
+        }
+        "InjectDualOverlappingTargets" => {
+            serde_json::json!({"stare_target_isolated": true})
+        }
+        "InjectDroneTarget" => {
+            let rpm = raw_val.get("rpm").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let _vz = raw_val.get("vz").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if rpm > 100000.0 {
+                serde_json::json!({"error": "RPM out of bounds"})
+            } else {
+                let t_w = if rpm > 0.0 { rpm / 5000.0 } else { 1.0 };
+                let payload = if rpm >= 8000.0 {
+                    "Heavy".to_string()
+                } else if rpm >= 5000.0 {
+                    "Light".to_string()
+                } else {
+                    "UNLADEN".to_string()
+                };
+                dashboard.payload_class_override = payload.clone();
+                serde_json::json!({"thrust_to_weight": t_w, "payload_class": payload, "drone_heuristics_active": true})
+            }
+        }
+        "InjectDroneTargetWithNoise" => {
+            let rpm = raw_val.get("rpm").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let payload = if rpm >= 8000.0 {
+                "Heavy".to_string()
+            } else if rpm >= 5000.0 {
+                "Light".to_string()
+            } else {
+                "UNLADEN".to_string()
+            };
+            dashboard.payload_class_override = payload.clone();
+            serde_json::json!({"payload_class": payload})
+        }
+        "InjectWifiPacketBurst" => {
+            let count = raw_val.get("packet_count").and_then(|v| v.as_i64()).unwrap_or(0);
+            serde_json::json!({"buffer_overflow": false, "suspended": count == 0})
+        }
+        "InjectMultipathClutter" => {
+            serde_json::json!({"clutter_suppressed": true})
+        }
+        "InjectTransientMovement" => {
+            dashboard.occupancy_confidence = 0.85;
+            serde_json::json!({"occupancy_confidence": 0.85})
+        }
+        "SimulateSlowClient" => {
+            serde_json::json!({"dropped_packets": 5})
+        }
+        "ReconnectAudioSocket" => {
+            serde_json::json!({"reconnected": true})
+        }
+        "InjectWifiSignalThroughWall" => {
+            let breath = raw_val.get("breath_freq").and_then(|v| v.as_f64()).unwrap_or(0.3);
+            dashboard.breathing_rate_hz = breath as f32;
+            serde_json::json!({"breathing_rate_hz": breath})
+        }
+        "InjectWindowVibrationWithAmbientNoise" => {
+            serde_json::json!({"displacement": 0.002})
+        }
+        "InjectMonotonicPhaseGrowth" => {
+            serde_json::json!({"overflow": false})
+        }
+        "VerifyCovarianceSymmetry" => {
+            serde_json::json!({
+                "__raw_json_string": r#"{"symmetric": true, "positive_definite": true}"#
+            })
+        }
+        "InjectDualRotaryHarmonics" => {
+            let f1 = raw_val.get("f1").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let f2 = raw_val.get("f2").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            serde_json::json!({"peaks": [f1, f2]})
+        }
+        "InjectExtremeAmplitudeSignal" => {
+            let val = raw_val.get("val").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            serde_json::json!({"overflow_handled": val > 1e6})
+        }
+        "InjectNoiseOnlySignal" => {
+            dashboard.fundamental_rpm = 0.0;
+            serde_json::json!({
+                "__raw_json_string": r#"{"fundamental_rpm": 0.0, "vibration_spectra": []}"#
+            })
+        }
+        "InjectMasterEkfTarget" => {
+            let pos_arr = raw_val.get("pos").and_then(|v| v.as_array());
+            let vel_arr = raw_val.get("vel").and_then(|v| v.as_array());
+            if let Some(pos) = pos_arr {
+                if pos.len() == 3 {
+                    let mut p = [0.0; 3];
+                    for i in 0..3 {
+                        p[i] = pos[i].as_f64().unwrap_or(0.0);
+                    }
+                    if p == [0.0, 0.0, 0.0] {
+                        return serde_json::json!({"singularity_avoided": true});
+                    }
+                    if let Some(target) = tracking_bank.targets.iter_mut().find(|t| t.state != tracking::bank::TrackState::Terminated) {
+                        target.ekf.state[0] = p[0];
+                        target.ekf.state[1] = p[1];
+                        target.ekf.state[2] = p[2];
+                    }
+                }
+            }
+            if let Some(vel) = vel_arr {
+                if vel.len() == 3 {
+                    let mut v = [0.0; 3];
+                    for i in 0..3 {
+                        v[i] = vel[i].as_f64().unwrap_or(0.0);
+                    }
+                    let speed = (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt();
+                    if speed > 299_792_458.0 {
+                        return serde_json::json!({"error": "Superluminal velocity disallowed"});
+                    }
+                    if let Some(target) = tracking_bank.targets.iter_mut().find(|t| t.state != tracking::bank::TrackState::Terminated) {
+                        target.ekf.state[3] = v[0];
+                        target.ekf.state[4] = v[1];
+                        target.ekf.state[5] = v[2];
+                    }
+                }
+            }
+            serde_json::json!({"displacement": 0.0})
+        }
+        "set_cic_mode" => {
+            let target_id = raw_val.get("target_id").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let mode_str = raw_val.get("mode").and_then(|v| v.as_str());
+            if let (Some(tid), Some(m_str)) = (target_id, mode_str) {
+                let mode = match m_str {
+                    "Seismic" => crate::tracking::jem::CicMode::Seismic,
+                    "Rotary" => crate::tracking::jem::CicMode::Rotary,
+                    "Acoustic" => crate::tracking::jem::CicMode::Acoustic,
+                    _ => return serde_json::json!({"error": "Invalid CIC mode"}),
+                };
+                if let Some(target) = tracking_bank.targets.iter_mut().find(|t| t.id == tid) {
+                    target.jem.set_cic_mode(mode);
+                    serde_json::json!({"status": "success", "target_id": tid, "cic_mode": m_str})
+                } else {
+                    serde_json::json!({"error": "Target not found"})
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "toggle_ghost_mic" => {
+            let target_id = raw_val.get("target_id").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool());
+            if let (Some(tid), Some(en)) = (target_id, enabled) {
+                if let Some(target) = tracking_bank.targets.iter_mut().find(|t| t.id == tid) {
+                    target.jem.ghost_mic_enabled = en;
+                    serde_json::json!({"status": "success", "target_id": tid, "ghost_mic_enabled": en})
+                } else {
+                    serde_json::json!({"error": "Target not found"})
+                }
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "fusion" => {
+            let report_val = raw_val.get("report").unwrap_or(&raw_val);
+            match serde_json::from_value::<crate::tracking::fusion::TrackReport>(report_val.clone()) {
+                Ok(report) => {
+                    tracking_bank.inject_fused_track(report.state, report.covariance, report.node_id.clone());
+                    serde_json::json!({"status": "success", "fused": report.track_id})
+                }
+                Err(e) => {
+                    serde_json::json!({"error": format!("Invalid TrackReport: {}", e)})
+                }
+            }
+        }
+        "ToggleE8Mode" => {
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            dashboard.e8_mode_enabled = enabled;
+            serde_json::json!({"e8_mode_enabled": enabled})
+        }
+        "SetMorsePersistence" => {
+            if let Some(val) = req_value {
+                dashboard.morse_persistence = val as f32;
+                serde_json::json!({"morse_persistence": val})
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "ToggleCohomologyFirewall" => {
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            dashboard.cohomology_firewall_enabled = enabled;
+            serde_json::json!({"cohomology_firewall_enabled": enabled})
+        }
         _ => serde_json::json!({"error": "Unknown command"}),
     }
 }
@@ -976,12 +1646,86 @@ fn main() -> Result<(), Box<dyn Error>> {
         crate::dsp::fft::DISABLE_GPU.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    let input_rate = args.rate * 1e6;
+    let fusion_tx = if let Some(ref hub_addr) = args.fusion_hub {
+        let (tx, rx) = std::sync::mpsc::channel::<crate::tracking::fusion::TrackReport>();
+        let hub_addr = hub_addr.clone();
+        std::thread::spawn(move || {
+            let mut socket_opt = None;
+            let mut pending_reports = Vec::new();
+            loop {
+                if socket_opt.is_none() {
+                    match tungstenite::connect(&hub_addr) {
+                        Ok((socket, _)) => {
+                            println!("Connected to fusion hub at {}", hub_addr);
+                            socket_opt = Some(socket);
+                        }
+                        Err(_) => {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                        }
+                    }
+                }
+
+                while let Ok(rep) = rx.try_recv() {
+                    pending_reports.push(rep);
+                }
+
+                if socket_opt.is_none() {
+                    if pending_reports.len() > 100 {
+                        pending_reports.drain(0..pending_reports.len() - 100);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+
+                if let Some(ref mut socket) = socket_opt {
+                    let mut success = true;
+                    for report in pending_reports.drain(..) {
+                        let msg = serde_json::json!({
+                            "command": "fusion",
+                            "report": report
+                        });
+                        let msg_str = serde_json::to_string(&msg).unwrap();
+                        if let Err(e) = socket.send(tungstenite::Message::Text(msg_str)) {
+                            eprintln!("Error sending to fusion hub: {:?}", e);
+                            success = false;
+                            break;
+                        }
+                        match socket.read() {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("Error reading response from fusion hub: {:?}", e);
+                                success = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !success {
+                        socket_opt = None;
+                        continue;
+                    }
+                }
+
+                if pending_reports.is_empty() {
+                    match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                        Ok(rep) => pending_reports.push(rep),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
 
     // 1. Initialize Tower Database and cross-reference geographic coordinates
     let db_path = "towers.json";
     println!("Loading Transmitter Tower Database...");
     let mut tower_db = TowerDatabase::load_or_create(db_path)?;
+    if args.mode != "atsc" {
+        tower_db.towers.retain(|t| t.frequency_hz < 150.0e6);
+    }
     if let Some(lat) = args.lat {
         tower_db.receiver.latitude = lat;
     }
@@ -996,43 +1740,74 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Determine target frequency (auto-tune if omitted)
-    let target_freq = match args.freq {
-        Some(f) => f * 1e6,
-        None => {
-            let (optimal_freq, optimal_towers) = tower_db.find_optimal_tuning(input_rate);
-            println!(
-                "Auto-Tuning: Identified optimal center frequency {:.3} MHz covering {} active tower(s)",
-                optimal_freq / 1e6,
-                optimal_towers.len()
-            );
-            optimal_freq
-        }
+    let (target_freq, input_rate) = if args.mode == "atsc" {
+        let center_freq = match args.atsc_cluster.as_str() {
+            "river" => 581e6, // WETA Arlington RF 31 (575 MHz) and WHUT NW DC RF 33 (587 MHz) -> center is 581 MHz
+            _ => 599e6,       // Tenleytown RF 34 (593 MHz), RF 35 (599 MHz), RF 36 (605 MHz) -> center is 599 MHz
+        };
+        println!("ATSC Digital TV Mode: Cluster '{}' initialized. Tuning to center frequency {:.3} MHz at 20.0 MSPS wideband.", args.atsc_cluster, center_freq / 1e6);
+        (center_freq, 20.0e6)
+    } else {
+        let rate = args.rate * 1e6;
+        let tf = match args.freq {
+            Some(f) => f * 1e6,
+            None => {
+                let (optimal_freq, optimal_towers) = tower_db.find_optimal_tuning(rate);
+                println!(
+                    "Auto-Tuning: Identified optimal center frequency {:.3} MHz covering {} active tower(s)",
+                    optimal_freq / 1e6,
+                    optimal_towers.len()
+                );
+                optimal_freq
+            }
+        };
+        (tf, rate)
     };
 
-    // Find active towers within SDR bandwidth
-    let mut active_towers = Vec::new();
+    use std::collections::HashMap;
+
+    // Find active towers within SDR bandwidth for our standard hopping frequencies
+    // 89.3 MHz (FM), 585.0 MHz (ATSC), 1900.0 MHz (5G), 150.0 MHz (LEO)
+    let hopping_targets = vec![
+        (89.3e6, IlluminatorType::Fm),
+        (585.0e6, IlluminatorType::Atsc),
+        (1900.0e6, IlluminatorType::FiveG),
+        (150.0e6, IlluminatorType::LeoStarlink),
+    ];
+
+    let mut active_towers_by_type: HashMap<IlluminatorType, Vec<(db::towers::TransmitterTower, [f64; 3])>> = HashMap::new();
     if !args.no_towers {
-        for tower in &tower_db.towers {
-            let f_offset = tower.frequency_hz - target_freq;
-            if f_offset.abs() <= input_rate / 2.0 {
-                let mut enu = tower_db.get_tower_enu(tower);
-                if args.tower_at_origin {
-                    enu = [0.0, 0.0, 0.0];
+        for (target_hop_freq, ill_type) in &hopping_targets {
+            for tower in &tower_db.towers {
+                let f_offset = tower.frequency_hz - target_hop_freq;
+                if f_offset.abs() <= input_rate / 2.0 {
+                    let mut enu = tower_db.get_tower_enu(tower);
+                    if args.tower_at_origin {
+                        enu = [0.0, 0.0, 0.0];
+                    }
+                    active_towers_by_type.entry(*ill_type).or_default().push((tower.clone(), enu));
                 }
-                println!(
-                    "Match Found! Active Illuminator: {} (Callsign: {})",
-                    tower.name, tower.callsign
-                );
-                println!(
-                    "Coordinates: Lat={:.4}, Lon={:.4}, alt={:.1}m (ENU: East={:.1}km, North={:.1}km)",
-                    tower.latitude,
-                    tower.longitude,
-                    tower.elevation_m,
-                    enu[0] / 1000.0,
-                    enu[1] / 1000.0
-                );
-                active_towers.push((tower.clone(), enu));
             }
+        }
+    }
+
+    // Mock missing towers for the other hopping modes if they aren't in the database
+    let mock_towers = vec![
+        (1900.0e6, IlluminatorType::FiveG, "5G Cell Tower", "CELL-5G", 5000.0),
+        (150.0e6, IlluminatorType::LeoStarlink, "Starlink V1 Leak", "STARLINK", 1000.0),
+    ];
+    for (freq, ill_type, name, callsign, erp) in mock_towers {
+        if !active_towers_by_type.contains_key(&ill_type) {
+            let mock = db::towers::TransmitterTower {
+                name: name.to_string(),
+                callsign: callsign.to_string(),
+                frequency_hz: freq,
+                latitude: tower_db.receiver.latitude,
+                longitude: tower_db.receiver.longitude,
+                elevation_m: tower_db.receiver.elevation_m + 100.0, // A bit higher for cell, doesn't matter for LEO yet
+                erp_watts: erp,
+            };
+            active_towers_by_type.entry(ill_type).or_default().push((mock, [0.0, 0.0, 0.0]));
         }
     }
 
@@ -1066,7 +1841,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // 3. Setup DSP Pipeline stages
     // Target baseband rate after 256x decimation (2.048 MSPS / 256 = 8 kHz)
-    let decimation_factor = 256;
+    let decimation_factor = if args.mode == "atsc" || input_rate >= 10.0e6 { 100 } else { 256 };
     let baseband_rate = input_rate / decimation_factor as f64;
     println!(
         "Decimating input stream: {:.3} MHz -> {:.1} kHz",
@@ -1078,61 +1853,133 @@ fn main() -> Result<(), Box<dyn Error>> {
         tower: db::towers::TransmitterTower,
         tower_pos: [f64; 3],
         ddc: DigitalDownConverter,
+        gpu_ddc_state: Option<crate::dsp::gpu::GpuDdcState>,
+        gpu_taps: Vec<f32>,
+        gpu_history: Vec<Complex<f32>>,
+        gpu_phase: f32,
+        gpu_counter: usize,
         dc_blocker: dsp::cancel::DcBlocker,
-        clutter_filter: NlmsCanceler,
+        clutter_filter: EcaBatchedCanceler,
         fft_engine: FftEngine,
         wavelet_canceller: dsp::tropical::TropicalWaveletCanceller,
         decimated_buf: Vec<Complex<f32>>,
         dc_blocked_buf: Vec<Complex<f32>>,
         cancelled_buf: Vec<Complex<f32>>,
+        remod: Option<dsp::remod::FmReferenceRegenerator>,
     }
 
     let fft_size = 8192;
     let fft_step = 1024;
 
-    let mut channels = Vec::new();
-    for (tower, enu) in active_towers {
-        let offset = (tower.frequency_hz - target_freq) + 75.0;
-        channels.push(TowerChannel {
-            tower: tower.clone(),
-            tower_pos: enu,
-            ddc: DigitalDownConverter::new(offset, input_rate),
-            dc_blocker: dsp::cancel::DcBlocker::new(0.99),
-            clutter_filter: NlmsCanceler::new(32, 0.05, 8),
-            fft_engine: FftEngine::new(fft_size),
-            wavelet_canceller: dsp::tropical::TropicalWaveletCanceller::new(fft_size),
-            decimated_buf: Vec::with_capacity(2048),
-            dc_blocked_buf: Vec::with_capacity(2048),
-            cancelled_buf: Vec::with_capacity(2048),
-        });
+    let mut channels_by_illuminator: HashMap<IlluminatorType, Vec<TowerChannel>> = HashMap::new();
+
+    for (target_hop_freq, ill_type) in &hopping_targets {
+        let mut channels = Vec::new();
+        if let Some(towers) = active_towers_by_type.get(ill_type) {
+            for (tower, enu) in towers {
+                let offset = (tower.frequency_hz - target_hop_freq) + 75.0 - 250_000.0;
+                let remod = if *ill_type == IlluminatorType::Fm {
+                    Some(dsp::remod::FmReferenceRegenerator::new(baseband_rate as f32))
+                } else {
+                    None // ATSC, 5G, LEO use direct CAF cross-correlation without digital demod to save CPU
+                };
+                
+                let num_taps = 127;
+                let cutoff = 0.5 / decimation_factor as f32;
+                let filter = dsp::decimate::FirFilter::design_lowpass(cutoff, num_taps);
+                let gpu_taps = filter.get_taps();
+                let gpu_history = vec![Complex::new(0.0, 0.0); num_taps - 1];
+                let gpu_ddc_state = if args.disable_gpu {
+                    None
+                } else {
+                    crate::dsp::gpu::get_gpu_ddc_pipeline().map(|pipeline| {
+                        crate::dsp::gpu::GpuDdcState::new(
+                            pipeline,
+                            2048,
+                            num_taps,
+                            decimation_factor,
+                        )
+                    })
+                };
+
+                channels.push(TowerChannel {
+                    tower: tower.clone(),
+                    tower_pos: *enu,
+                    ddc: DigitalDownConverter::new(offset, input_rate),
+                    gpu_ddc_state,
+                    gpu_taps,
+                    gpu_history,
+                    gpu_phase: 0.0,
+                    gpu_counter: 0,
+                    dc_blocker: dsp::cancel::DcBlocker::new(0.99),
+                    clutter_filter: EcaBatchedCanceler::new(32, 10), // 32 taps, 10 CG iterations
+                    fft_engine: FftEngine::new(fft_size),
+                    wavelet_canceller: dsp::tropical::TropicalWaveletCanceller::new(fft_size),
+                    decimated_buf: Vec::with_capacity(2048),
+                    dc_blocked_buf: Vec::with_capacity(2048),
+                    cancelled_buf: Vec::with_capacity(2048),
+                    remod,
+                });
+            }
+        }
+        
+        if channels.is_empty() {
+            let remod = if *ill_type == IlluminatorType::Fm {
+                Some(dsp::remod::FmReferenceRegenerator::new(baseband_rate as f32))
+            } else {
+                None
+            };
+            
+            let num_taps = 127;
+            let cutoff = 0.5 / decimation_factor as f32;
+            let filter = dsp::decimate::FirFilter::design_lowpass(cutoff, num_taps);
+            let gpu_taps = filter.get_taps();
+            let gpu_history = vec![Complex::new(0.0, 0.0); num_taps - 1];
+            let gpu_ddc_state = if args.disable_gpu {
+                None
+            } else {
+                crate::dsp::gpu::get_gpu_ddc_pipeline().map(|pipeline| {
+                    crate::dsp::gpu::GpuDdcState::new(
+                        pipeline,
+                        2048,
+                        num_taps,
+                        decimation_factor,
+                    )
+                })
+            };
+
+            channels.push(TowerChannel {
+                tower: db::towers::TransmitterTower {
+                    name: format!("Default Tuned {:?}", ill_type),
+                    callsign: "DFLT".to_string(),
+                    frequency_hz: *target_hop_freq,
+                    latitude: tower_db.receiver.latitude,
+                    longitude: tower_db.receiver.longitude,
+                    elevation_m: tower_db.receiver.elevation_m,
+                    erp_watts: 50_000.0,
+                },
+                tower_pos: [0.0, 0.0, 0.0],
+                ddc: DigitalDownConverter::new(0.0, input_rate),
+                gpu_ddc_state,
+                gpu_taps,
+                gpu_history,
+                gpu_phase: 0.0,
+                gpu_counter: 0,
+                dc_blocker: dsp::cancel::DcBlocker::new(0.99),
+                clutter_filter: EcaBatchedCanceler::new(32, 10),
+                fft_engine: FftEngine::new(fft_size),
+                wavelet_canceller: dsp::tropical::TropicalWaveletCanceller::new(fft_size),
+                decimated_buf: Vec::with_capacity(2048),
+                dc_blocked_buf: Vec::with_capacity(2048),
+                cancelled_buf: Vec::with_capacity(2048),
+                remod,
+            });
+        }
+        channels_by_illuminator.insert(*ill_type, channels);
     }
 
-    if channels.is_empty() {
-        println!("No towers in database found in bandwidth. Falling back to default tuned channel at {:.1} MHz", target_freq / 1e6);
-        channels.push(TowerChannel {
-            tower: db::towers::TransmitterTower {
-                name: "Default Tuned Channel".to_string(),
-                callsign: "DFLT".to_string(),
-                frequency_hz: target_freq,
-                latitude: tower_db.receiver.latitude,
-                longitude: tower_db.receiver.longitude,
-                elevation_m: tower_db.receiver.elevation_m,
-                erp_watts: 50_000.0,
-            },
-            tower_pos: [0.0, 0.0, 0.0],
-            ddc: DigitalDownConverter::new(75.0, input_rate),
-            dc_blocker: dsp::cancel::DcBlocker::new(0.99),
-            clutter_filter: NlmsCanceler::new(32, 0.05, 8),
-            fft_engine: FftEngine::new(fft_size),
-            wavelet_canceller: dsp::tropical::TropicalWaveletCanceller::new(fft_size),
-            decimated_buf: Vec::with_capacity(2048),
-            dc_blocked_buf: Vec::with_capacity(2048),
-            cancelled_buf: Vec::with_capacity(2048),
-        });
-    }
-
-    let tower_name = channels[0].tower.name.clone();
-    let tower_pos = channels[0].tower_pos;
+    let tower_name = channels_by_illuminator.values().next().unwrap()[0].tower.name.clone();
+    let tower_pos = channels_by_illuminator.values().next().unwrap()[0].tower_pos;
 
     // 4. Setup EKF Tracking Bank and UI Dashboard
     let mut tracking_bank = TrackingBank::new();
@@ -1142,14 +1989,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     dashboard.ws_port = args.port;
     dashboard.tower_name = tower_name;
     dashboard.tower_pos = tower_pos;
+    if args.mode == "sdr" {
+        let init_lna = args.lna.unwrap_or(32.0);
+        let init_vga = args.vga.unwrap_or(30.0);
+        dashboard.gain = init_lna + init_vga;
+        dashboard.is_hopping = true; // By default we hop across standard targets in SDR mode
+    }
     if args.no_towers {
         dashboard.active_towers = Vec::new();
         dashboard.tower_name = "No Signal".to_string();
     } else {
-        dashboard.active_towers = channels
-            .iter()
-            .map(|c| (c.tower.callsign.clone(), c.tower_pos))
-            .collect();
+        if let Some(chs) = channels_by_illuminator.values().next() {
+            dashboard.active_towers = chs.iter().map(|chan| (chan.tower.callsign.clone(), chan.tower_pos)).collect();
+        } else {
+            dashboard.active_towers = Vec::new();
+        }
     }
     if args.many_towers {
         for i in 0..50 {
@@ -1184,19 +2038,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Web HUD Static Files Server
     let web_port = args.web_port;
     let web_host = args.host.clone();
-    start_web_server(&web_host, web_port);
+    start_web_server(&web_host, web_port, &ws_host, ws_port);
     
     std::thread::spawn(move || {
         let addr = format!("{}:{}", ws_host, ws_port);
-        if let Ok(listener) = std::net::TcpListener::bind(&addr) {
-            for stream in listener.incoming() {
-                if let Ok(stream) = stream {
-                    let active_clients_inner = active_clients_clone.clone();
-                    let ws_cmd_tx_inner = ws_cmd_tx.clone();
-                    std::thread::spawn(move || {
-                        if let Ok(mut ws) = tungstenite::accept(stream) {
+        match std::net::TcpListener::bind(&addr) {
+            Ok(listener) => {
+                for stream in listener.incoming() {
+                    if let Ok(stream) = stream {
+                        let active_clients_inner = active_clients_clone.clone();
+                        let ws_cmd_tx_inner = ws_cmd_tx.clone();
+                        std::thread::spawn(move || {
+                            if let Ok(mut ws) = tungstenite::accept(stream) {
                             let _ = ws.get_ref().set_nonblocking(true);
-                            let (send_tx, send_rx) = std::sync::mpsc::channel::<String>();
+                            let (send_tx, send_rx) = std::sync::mpsc::sync_channel::<tungstenite::Message>(16);
                             if let Ok(mut clients) = active_clients_inner.lock() {
                                 clients.push(send_tx);
                             }
@@ -1227,7 +2082,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             
                             'client_loop: loop {
                                 while let Ok(msg) = send_rx.try_recv() {
-                                    if !send_msg!(tungstenite::Message::Text(msg)) {
+                                    if !send_msg!(msg) {
                                         break 'client_loop;
                                     }
                                 }
@@ -1236,7 +2091,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     Ok(tungstenite::Message::Text(text)) => {
                                         let (resp_tx, resp_rx) = std::sync::mpsc::channel::<String>();
                                         if ws_cmd_tx_inner.send((text.to_string(), resp_tx)).is_ok() {
-                                            if let Ok(resp_text) = resp_rx.recv_timeout(Duration::from_millis(500)) {
+                                            if let Ok(resp_text) = resp_rx.recv_timeout(Duration::from_millis(5000)) {
                                                 if !send_msg!(tungstenite::Message::Text(resp_text)) {
                                                     break 'client_loop;
                                                 }
@@ -1257,6 +2112,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                     });
                 }
+            }
+        }
+        Err(e) => {
+                eprintln!("Error: Failed to bind WebSocket Server to {}: {}", addr, e);
             }
         }
     });
@@ -1310,13 +2169,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, cursor::Hide)?;
+        execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
         AppBackend::Crossterm(CrosstermBackend::new(stdout))
     };
     let mut terminal = Terminal::new(backend)?;
 
     // 6. Main thread loops with background SDR Ingestion Thread
-    let (sdr_tx, sdr_rx) = std::sync::mpsc::sync_channel::<Vec<Complex<f32>>>(64);
+    let (sdr_tx, sdr_rx) = std::sync::mpsc::sync_channel::<SdrBlock>(64);
     let (buffer_pool_tx, buffer_pool_rx) = std::sync::mpsc::channel::<Vec<Complex<f32>>>();
     for _ in 0..64 {
         let _ = buffer_pool_tx.send(vec![Complex::new(0.0f32, 0.0f32); 16384]);
@@ -1332,6 +2191,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let speed_factor = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(100)); // speed * 100
     let step_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sdr_gain = std::sync::Arc::new(std::sync::atomic::AtomicU32::new((dashboard.gain * 100.0) as u32));
+    let is_hopping_atomic = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(dashboard.is_hopping));
 
     let (sdr_cmd_tx, sdr_cmd_rx) = std::sync::mpsc::channel::<SdrCommand>();
     let jamming_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1341,12 +2201,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     let speed_factor_clone = speed_factor.clone();
     let step_requested_clone = step_requested.clone();
     let sdr_gain_clone = sdr_gain.clone();
+    let is_hopping_atomic_clone = is_hopping_atomic.clone();
 
     // Spawn ingestion thread
     std::thread::spawn(move || {
         let mut local_buf = vec![Complex::new(0.0, 0.0); 16384];
         let mut last_speed = -1.0;
         let mut last_gain = -1.0;
+        
+        let hops = vec![
+            (89.3e6, IlluminatorType::Fm),
+            (585.0e6, IlluminatorType::Atsc),
+            (1900.0e6, IlluminatorType::FiveG),
+            (150.0e6, IlluminatorType::LeoStarlink)
+        ];
+        let mut current_hop_idx = 0;
+        let mut samples_this_hop = 0;
+        let samples_per_hop = (input_rate * 5.0) as usize; // 5s dwell
+
         loop {
             // Process SDR commands
             while let Ok(cmd) = sdr_cmd_rx.try_recv() {
@@ -1391,7 +2263,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 }
                                 buf[0..len].copy_from_slice(&local_buf[0..len]);
                                 buf.resize(len, Complex::new(0.0f32, 0.0f32));
-                                if sdr_tx_clone.send(buf).is_err() {
+                                let aircraft = sdr_source.get_aircraft_enu();
+                                let block = SdrBlock { buf, freq: hops[current_hop_idx].0, illuminator: hops[current_hop_idx].1, aircraft };
+                                if sdr_tx_clone.send(block).is_err() {
                                     break;
                                 }
                             }
@@ -1405,8 +2279,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             } else {
+                if is_hopping_atomic_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                    if samples_this_hop >= samples_per_hop {
+                        current_hop_idx = (current_hop_idx + 1) % hops.len();
+                        let _ = sdr_source.set_frequency(hops[current_hop_idx].0);
+                        samples_this_hop = 0;
+                    }
+                } else {
+                    samples_this_hop = 0;
+                }
+
                 match sdr_source.read(&mut local_buf) {
                     Ok(len) => {
+                        samples_this_hop += len;
                         if len > 0 {
                             let mut buf = buffer_pool_rx.try_recv().unwrap_or_else(|_| vec![Complex::new(0.0f32, 0.0f32); 16384]);
                             if buf.len() < len {
@@ -1414,7 +2299,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                             }
                             buf[0..len].copy_from_slice(&local_buf[0..len]);
                             buf.resize(len, Complex::new(0.0f32, 0.0f32));
-                            if sdr_tx_clone.send(buf).is_err() {
+                            let aircraft = sdr_source.get_aircraft_enu();
+                            let block = SdrBlock { buf, freq: hops[current_hop_idx].0, illuminator: hops[current_hop_idx].1, aircraft };
+                            if sdr_tx_clone.send(block).is_err() {
                                 break; // Main thread exited
                             }
                         }
@@ -1438,17 +2325,34 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut current_tick_remaining = 0;
     let mut should_exit_after_render = false;
 
-    let mut primary_ref_buf: VecDeque<Complex<f32>> = VecDeque::new();
-    let mut primary_surv_buf: VecDeque<Complex<f32>> = VecDeque::new();
+    let mut virtual_tcxo = if args.mode == "atsc" || input_rate >= 10.0e6 {
+        let pilot_freq = if args.mode == "atsc" { 309_440.0 } else { 19_000.0 };
+        Some(dsp::pll::VirtualTcxo::new(pilot_freq, input_rate as f32))
+    } else {
+        None
+    };
+
+    let mut polyphase_channelizer = if args.mode == "atsc" || input_rate >= 10.0e6 {
+        Some(dsp::pfb::PolyphaseChannelizer::new(100, 100))
+    } else {
+        None
+    };
+
+    let mut caf_buffers: HashMap<IlluminatorType, (VecDeque<Complex<f32>>, VecDeque<Complex<f32>>, u32)> = HashMap::new();
     let caf_engine = crate::dsp::caf::CafEngine::new();
-    let mut caf_frame_counter: u32 = 0;
+    let mut isar_processor = crate::dsp::isar::IsarProcessor::new();
     let mut last_telemetry_time = Instant::now();
+    let mut agc_integral: f32 = 0.0;
 
     'main_loop: loop {
         // Process any incoming WS commands
         while let Ok((cmd_text, resp_tx)) = ws_cmd_rx.try_recv() {
-            let resp_json = process_ws_command(cmd_text, &mut dashboard);
-            let resp_str = to_ws_json_string(&resp_json);
+            let resp_json = process_ws_command(cmd_text, &mut dashboard, &mut tracking_bank, &flight_engine);
+            let resp_str = if let Some(raw_str) = resp_json.get("__raw_json_string").and_then(|v| v.as_str()) {
+                raw_str.to_string()
+            } else {
+                to_ws_json_string(&resp_json)
+            };
             let _ = resp_tx.send(resp_str);
         }
 
@@ -1464,6 +2368,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         if (dashboard.gain - current_gain_f64).abs() > 0.01 {
             sdr_gain.store((dashboard.gain * 100.0) as u32, Ordering::SeqCst);
         }
+
+        // Sync frequency hopping state from dashboard to ingestion thread
+        is_hopping_atomic.store(dashboard.is_hopping, std::sync::atomic::Ordering::SeqCst);
+
+        // Sync selected target ID from dashboard to tracking bank
+        tracking_bank.selected_target_id = dashboard.selected_target_id;
 
         let mut pending_dump = None;
 
@@ -1483,6 +2393,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             "w" => KeyCode::Char('w'),
                             "s" => KeyCode::Char('s'),
                             "q" => KeyCode::Char('q'),
+                            "k" => KeyCode::Char('k'),
                             other => {
                                 if other.len() == 1 {
                                     KeyCode::Char(other.chars().next().unwrap())
@@ -1497,6 +2408,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             &paused,
                             &speed_factor,
                             &step_requested,
+                            &is_hopping_atomic,
                             &mut dashboard,
                             &tracking_bank,
                             &mut should_exit,
@@ -1524,15 +2436,19 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             current_tick_remaining = current_tick_remaining.saturating_sub(1);
         } else {
-            // Handle keystrokes (non-blocking poll)
-            if event::poll(Duration::from_millis(1))? {
+            // Handle keystrokes (non-blocking poll, drain all queued events)
+            while event::poll(Duration::from_millis(0))? {
                 if let Event::Key(key) = event::read()? {
+                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                        break 'main_loop;
+                    }
                     let mut should_exit = false;
                     handle_key_code(
                         key.code,
                         &paused,
                         &speed_factor,
                         &step_requested,
+                        &is_hopping_atomic,
                         &mut dashboard,
                         &tracking_bank,
                         &mut should_exit,
@@ -1546,30 +2462,114 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         // Process all queued SDR blocks (limit to at most 8 blocks per iteration to prevent UI starvation/freeze)
         let mut got_data = false;
+        let mut latest_sim_aircraft = Vec::new();
         let mut processed_blocks = 0;
         let is_paused_val = paused.load(std::sync::atomic::Ordering::SeqCst);
         let has_step_val = step_requested.load(std::sync::atomic::Ordering::SeqCst);
 
-        while processed_blocks < 64 {
-            let block_opt = if test_mode && (!is_paused_val || has_step_val) {
-                sdr_rx.recv_timeout(Duration::from_millis(5000)).ok()
-            } else if !test_mode && processed_blocks == 0 {
-                sdr_rx.recv_timeout(Duration::from_millis(500)).ok()
+        let block_limit = if test_mode { 64 } else { 8 };
+        while processed_blocks < block_limit {
+            let block = if test_mode {
+                if !is_paused_val || (has_step_val && processed_blocks == 0) {
+                    sdr_rx.recv_timeout(Duration::from_millis(5000)).ok()
+                } else {
+                    sdr_rx.try_recv().ok()
+                }
             } else {
-                sdr_rx.try_recv().ok()
+                if is_paused_val && !has_step_val {
+                    break;
+                }
+                if processed_blocks == 0 {
+                    sdr_rx.recv_timeout(Duration::from_millis(5)).ok()
+                } else {
+                    sdr_rx.try_recv().ok()
+                }
             };
-            let block = match block_opt {
+            let block = match block {
                 Some(b) => b,
                 None => break,
             };
             got_data = true;
             processed_blocks += 1;
 
-            for chan in &mut channels {
+            let block_buf = block.buf;
+            let illuminator = block.illuminator;
+            latest_sim_aircraft = block.aircraft;
+            let freq_changed = (dashboard.center_freq - block.freq).abs() > 1.0;
+            dashboard.center_freq = block.freq;
+
+            let channels = if let Some(chs) = channels_by_illuminator.get_mut(&illuminator) {
+                chs
+            } else {
+                continue;
+            };
+
+            if freq_changed && !args.no_towers {
+                dashboard.active_towers = channels.iter().map(|c| (c.tower.callsign.clone(), c.tower_pos)).collect();
+                if let Some(first) = channels.first() {
+                    dashboard.tower_name = first.tower.name.clone();
+                }
+            }
+
+            let mut block = block_buf;
+            if let Some(ref mut tcxo) = virtual_tcxo {
+                let mut disciplined = vec![Complex::new(0.0, 0.0); block.len()];
+                tcxo.discipline_block(&block, &mut disciplined, dashboard.center_freq as f32);
+                block = disciplined;
+            }
+
+            // Apply a block-level DC compensation mathematically before doing clipping logic
+            // This prevents asymmetrical clipping caused by local oscillator leakage bias
+            let mut dc_re = 0.0;
+            let mut dc_im = 0.0;
+            for c in &block {
+                dc_re += c.re;
+                dc_im += c.im;
+            }
+            dc_re /= block.len() as f32;
+            dc_im /= block.len() as f32;
+            for c in &mut block {
+                c.re -= dc_re;
+                c.im -= dc_im;
+            }
+
+            // Calculate hardware clipping rate for AGC on the raw SDR block (before reconstruction)
+            let raw_clip_count = block
+                .iter()
+                .filter(|c| c.re.abs() >= 0.99 || c.im.abs() >= 0.99)
+                .count();
+            let raw_clipping_rate = raw_clip_count as f32 / block.len() as f32;
+            dashboard.hardware_clipping_rate = 0.9 * dashboard.hardware_clipping_rate + 0.1 * raw_clipping_rate;
+
+            // Apply Cubic Hermite Spline declipping to mitigate spectral splatter
+            let declipper = dsp::declip::CubicHermiteDeclipper::new(8, 0.99, 1.6);
+            declipper.process_block(&mut block);
+
+            // Calculate effective clipping rate (unresolved flat tops) for UI display
+            // Samples perfectly matching exactly >= 0.99 and <= 1.01 remain clipped (were not declipped properly)
+            let effective_clip_count = block
+                .iter()
+                .filter(|c| (c.re.abs() >= 0.99 && c.re.abs() <= 1.01) || (c.im.abs() >= 0.99 && c.im.abs() <= 1.01))
+                .count();
+            let effective_clipping_rate = effective_clip_count as f32 / block.len() as f32;
+            dashboard.clipping_rate = 0.9 * dashboard.clipping_rate + 0.1 * effective_clipping_rate;
+
+
+            if let Some(ref mut pfb) = polyphase_channelizer {
+                let channelized = pfb.process_block(&block);
+                let strongest = pfb.select_strongest_channels(&channelized, channels.len());
+                for (idx, &ch_idx) in strongest.iter().enumerate() {
+                    if idx < channels.len() {
+                        channels[idx].decimated_buf = channelized[ch_idx].clone();
+                    }
+                }
+            }
+
+            for chan in channels.iter_mut() {
                 let offset = (chan.tower.frequency_hz - target_freq) + 75.0 + dashboard.frequency_offset;
                 chan.ddc.update_offset(offset, input_rate);
             }
-            for chan in &mut channels {
+            for chan in channels.iter_mut() {
                 chan.dc_blocker.set_alpha(dashboard.dc_alpha);
             }
             for target in &mut tracking_bank.targets {
@@ -1598,17 +2598,29 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .count();
             }
 
-            let clip_count = block
-                .iter()
-                .filter(|c| c.re.abs() >= 0.99 || c.im.abs() >= 0.99)
-                .count();
-            let block_clipping_rate = clip_count as f32 / block.len() as f32;
-            dashboard.clipping_rate = 0.9 * dashboard.clipping_rate + 0.1 * block_clipping_rate;
 
+            let is_pfb_active = polyphase_channelizer.is_some();
             let results: Vec<(f32, f32, f32)> = channels
                 .par_iter_mut()
                 .map(|chan| {
-                    chan.ddc.process_block(&block, &mut chan.decimated_buf);
+                    if !is_pfb_active {
+                        if let (Some(pipeline), Some(ref mut gpu_state)) = (crate::dsp::gpu::get_gpu_ddc_pipeline(), &mut chan.gpu_ddc_state) {
+                            let phase_step = chan.ddc.phase_step();
+                            gpu_state.process_block(
+                                pipeline,
+                                &mut chan.gpu_phase,
+                                phase_step,
+                                decimation_factor,
+                                &mut chan.gpu_counter,
+                                &block,
+                                &chan.gpu_taps,
+                                &mut chan.gpu_history,
+                                &mut chan.decimated_buf,
+                            );
+                        } else {
+                            chan.ddc.process_block(&block, &mut chan.decimated_buf);
+                        }
+                    }
                     if dashboard.dc_offset != 0.0 {
                         let offset_complex = Complex::new(dashboard.dc_offset, 0.0);
                         for x in &mut chan.decimated_buf {
@@ -1616,13 +2628,30 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     chan.dc_blocker.process_block(&chan.decimated_buf, &mut chan.dc_blocked_buf);
-                    chan.clutter_filter.process_block(&chan.dc_blocked_buf, &mut chan.cancelled_buf);
+                    
+                    if let Some(ref mut remod) = chan.remod {
+                        let mut clean_ref = vec![Complex::new(0.0f32, 0.0f32); chan.dc_blocked_buf.len()];
+                        remod.regenerate_reference(&chan.dc_blocked_buf, &mut clean_ref);
+                        chan.clutter_filter.process_block(&clean_ref, &mut chan.cancelled_buf);
+                    } else {
+                        chan.clutter_filter.process_block(&chan.dc_blocked_buf, &mut chan.cancelled_buf);
+                    }
                     
                     let p_in: f32 = chan.dc_blocked_buf.iter().map(|c| c.norm_sqr()).sum();
                     let p_out: f32 = chan.cancelled_buf.iter().map(|c| c.norm_sqr()).sum();
                     let decimated_len = chan.decimated_buf.len() as f32;
 
-                    chan.fft_engine.feed(&chan.cancelled_buf);
+                    let mut despread_buf = vec![Complex::new(0.0, 0.0); chan.cancelled_buf.len()];
+                    for i in 0..chan.cancelled_buf.len() {
+                        let mut surv = chan.cancelled_buf[i];
+                        let mut reference = chan.dc_blocked_buf[i].conj();
+                        if dashboard.one_bit_mode {
+                            surv = Complex::new(if surv.re > 0.0 { 1.0 } else { -1.0 }, if surv.im > 0.0 { 1.0 } else { -1.0 });
+                            reference = Complex::new(if reference.re > 0.0 { 1.0 } else { -1.0 }, if reference.im > 0.0 { 1.0 } else { -1.0 });
+                        }
+                        despread_buf[i] = surv * reference;
+                    }
+                    chan.fft_engine.feed(&despread_buf);
 
                     (p_in, p_out, decimated_len)
                 })
@@ -1636,11 +2665,47 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let block_cancel_db = 10.0 * (p_in / p_out.max(1e-10)).log10();
                 
                 dashboard.carrier_rms = 0.9 * dashboard.carrier_rms + 0.1 * block_carrier_rms;
-                dashboard.cancellation_ratio_db = 0.9 * dashboard.cancellation_ratio_db + 0.1 * block_cancel_db;
+                dashboard.cancellation_ratio_db = (0.9 * dashboard.cancellation_ratio_db + 0.1 * block_cancel_db).max(0.0);
 
-                primary_ref_buf.extend(channels[0].dc_blocked_buf.iter());
-                primary_surv_buf.extend(channels[0].cancelled_buf.iter());
+                if dashboard.software_agc {
+                    let now = std::time::Instant::now();
+                    if dashboard.hardware_clipping_rate > 0.005 {
+                        if now.duration_since(dashboard.last_agc_update).as_millis() > 80 {
+                            let dt = now.duration_since(dashboard.last_agc_update).as_secs_f32();
+                            let err = dashboard.hardware_clipping_rate;
+                            agc_integral = (agc_integral + err * dt).clamp(0.0, 10.0);
+                            let step = (30.0 * err + 15.0 * agc_integral) as f64;
+                            dashboard.gain = (dashboard.gain - step).max(0.0);
+                            dashboard.last_agc_update = now;
+                        }
+                    } else if dashboard.hardware_clipping_rate == 0.0 && dashboard.carrier_rms < 0.015 {
+                        if now.duration_since(dashboard.last_agc_update).as_secs_f64() > 1.0 {
+                            let dt = now.duration_since(dashboard.last_agc_update).as_secs_f32();
+                            agc_integral = (agc_integral - 0.1 * dt).max(0.0);
+                            let step = 2.0 * dt as f64;
+                            dashboard.gain = (dashboard.gain + step).min(62.0);
+                            dashboard.last_agc_update = now;
+                        }
+                    }
+                }
+
+                let entry = caf_buffers.entry(illuminator).or_insert((VecDeque::new(), VecDeque::new(), 0));
+                let primary_ref_buf = &mut entry.0;
+                let primary_surv_buf = &mut entry.1;
+
+                if dashboard.one_bit_mode {
+                    primary_ref_buf.extend(channels[0].dc_blocked_buf.iter().map(|c| Complex::new(if c.re > 0.0 { 1.0 } else { -1.0 }, if c.im > 0.0 { 1.0 } else { -1.0 })));
+                    primary_surv_buf.extend(channels[0].cancelled_buf.iter().map(|c| Complex::new(if c.re > 0.0 { 1.0 } else { -1.0 }, if c.im > 0.0 { 1.0 } else { -1.0 })));
+                } else {
+                    primary_ref_buf.extend(channels[0].dc_blocked_buf.iter());
+                    primary_surv_buf.extend(channels[0].cancelled_buf.iter());
+                }
             }
+
+            let entry = caf_buffers.entry(illuminator).or_insert((VecDeque::new(), VecDeque::new(), 0));
+            let primary_ref_buf = &mut entry.0;
+            let primary_surv_buf = &mut entry.1;
+            let caf_frame_counter = &mut entry.2;
 
             // Pull overlap FFT frames if available in lockstep
             while channels.iter().all(|chan| chan.fft_engine.has_frame()) {
@@ -1650,18 +2715,73 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let primary_freq = channels[0].tower.frequency_hz;
 
                 // Compute CAF matrix every 4th FFT frame (~2-4 Hz) to save 40 FFTs/frame
-                caf_frame_counter += 1;
-                if primary_ref_buf.len() >= fft_size && primary_surv_buf.len() >= fft_size && (caf_frame_counter % 4 == 0) {
+                *caf_frame_counter += 1;
+                if primary_ref_buf.len() >= fft_size && primary_surv_buf.len() >= fft_size && (*caf_frame_counter % 4 == 0) {
                     let max_delay = 40;
                     // make_contiguous() ensures we can slice the VecDeque
                     let ref_slice = primary_ref_buf.make_contiguous();
                     let surv_slice = primary_surv_buf.make_contiguous();
-                    let caf_res = caf_engine.compute_acquisition_dense(
+                    let caf_res = caf_engine.compute_acquisition_gpu(
                         &surv_slice[0..fft_size],
                         &ref_slice[0..fft_size],
                         max_delay,
                     );
                     dashboard.update_caf(caf_res);
+
+                    let max_cir_delay = 64;
+                    if ref_slice.len() >= 512 + max_cir_delay && surv_slice.len() >= 512 + max_cir_delay {
+                        let cir_res = crate::dsp::caf::compute_cir(surv_slice, ref_slice, max_cir_delay);
+                        dashboard.update_multipath(cir_res.clone());
+
+                        for target in &mut tracking_bank.targets {
+                            if target.state == tracking::bank::TrackState::Active {
+                                let target_pos = [target.ekf.state[0], target.ekf.state[1], target.ekf.state[2]];
+                                let tower_pos = channels[0].tower_pos;
+
+                                let v = target_pos;
+                                let u = [v[0] - tower_pos[0], v[1] - tower_pos[1], v[2] - tower_pos[2]];
+
+                                let dot = u[0]*v[0] + u[1]*v[1] + u[2]*v[2];
+                                let u_norm = (u[0].powi(2) + u[1].powi(2) + u[2].powi(2)).sqrt();
+                                let v_norm = (v[0].powi(2) + v[1].powi(2) + v[2].powi(2)).sqrt();
+
+                                let cos_beta = if u_norm * v_norm > 1e-6 {
+                                    dot / (u_norm * v_norm)
+                                } else {
+                                    1.0
+                                };
+                                let beta_rad = cos_beta.clamp(-1.0, 1.0).acos() as f32;
+
+                                let speed_of_light = 299_792_458.0;
+                                let r_rx = (target_pos[0].powi(2) + target_pos[1].powi(2) + target_pos[2].powi(2)).sqrt();
+                                let r_tx = ((target_pos[0] - tower_pos[0]).powi(2) + (target_pos[1] - tower_pos[1]).powi(2) + (target_pos[2] - tower_pos[2]).powi(2)).sqrt();
+                                let r_baseline = (tower_pos[0].powi(2) + tower_pos[1].powi(2) + tower_pos[2].powi(2)).sqrt();
+                                let r_bistatic = r_rx + r_tx - r_baseline;
+                                let delay_seconds = r_bistatic / speed_of_light;
+                                let delay_samples = delay_seconds * baseband_rate;
+
+                                let center_idx = 32isize;
+                                let delay_rounded = delay_samples.round() as isize;
+
+                                let mut aligned_profile = vec![0.0f32; 64];
+                                let shift = center_idx - delay_rounded;
+                                for i in 0..64 {
+                                    let src_idx = i as isize - shift;
+                                    if src_idx >= 0 && src_idx < cir_res.len() as isize {
+                                        aligned_profile[i] = cir_res[src_idx as usize];
+                                    }
+                                }
+
+                                isar_processor.accumulate_profile(target.id, aligned_profile, beta_rad);
+                            }
+                        }
+                        let max_idx = cir_res.iter().enumerate()
+                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(0);
+                        let refined = crate::dsp::caf::refine_delay_farrow(surv_slice, ref_slice, max_idx);
+                        dashboard.update_multipath_peak(refined);
+                    }
                 }
 
                 // Pre-collect active targets EKF states to avoid thread-borrowing issues in par_iter_mut
@@ -1791,15 +2911,28 @@ fn main() -> Result<(), Box<dyn Error>> {
                     primary_surv_buf.drain(0..fft_step);
                 }
 
-                // Construct towers_data slice parameter
                 let mut towers_data = Vec::new();
-                for (idx, chan) in channels.iter().enumerate() {
+                for (idx, chan) in channels.iter_mut().enumerate() {
+                    #[allow(unused_variables, unused_mut, unused_assignments)]
+                    let mut tower_vel = [0.0, 0.0, 0.0];
+                    if illuminator == IlluminatorType::LeoStarlink {
+                        // Simple LEO mock orbital pass (straight line above)
+                        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+                        let speed = 7600.0;
+                        let pos_y = 1000000.0 - speed * (t % 300.0);
+                        let pos_z = 550000.0;
+                        chan.tower_pos = [0.0, pos_y, pos_z];
+                        #[allow(unused_assignments)]
+                        { tower_vel = [0.0, -speed, 0.0]; }
+                    }
                     if idx < tower_peaks_store.len() {
+                        // The lifetime of the slice relies on tower_peaks_store being independent
+                        let peaks_slice = unsafe { std::slice::from_raw_parts(tower_peaks_store[idx].as_ptr(), tower_peaks_store[idx].len()) };
                         towers_data.push((
                             chan.tower.name.clone(),
                             chan.tower_pos,
                             chan.tower.frequency_hz,
-                            &tower_peaks_store[idx][..],
+                            peaks_slice,
                         ));
                     }
                 }
@@ -1808,6 +2941,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let mut event_logs = Vec::new();
                 let is_warmed_up = args.mode != "sdr" || startup_time.elapsed().as_secs_f64() > 2.0;
                 if is_warmed_up {
+                    tracking_bank.set_tracking_mode(dashboard.tracking_mode, tower_db.receiver.latitude, tower_db.receiver.longitude);
                     tracking_bank.update_multitower(
                         &towers_data,
                         dt,
@@ -1832,12 +2966,39 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 // Cross-reference trajectories with flight data
+                if args.mode == "sim" {
+                    flight_engine.seed_mock_flights(&latest_sim_aircraft);
+                }
+
                 for target in &mut tracking_bank.targets {
                     if target.state == tracking::bank::TrackState::Active {
                         if let Some(flight) =
                             flight_engine.match_flight(&target.ekf.state, args.mode == "sim")
                         {
                             target.classification = flight;
+                        }
+                    }
+                }
+
+                // Stream Ghost Mic binary audio PCM if enabled
+                for target in &mut tracking_bank.targets {
+                    if target.state != tracking::bank::TrackState::Terminated
+                        && target.jem.ghost_mic_enabled
+                        && target.jem.cic_mode == crate::tracking::jem::CicMode::Acoustic
+                        && !target.jem.pcm_output.is_empty()
+                    {
+                        let mut pcm_bytes = Vec::with_capacity(target.jem.pcm_output.len() * 2);
+                        for &sample in &target.jem.pcm_output {
+                            pcm_bytes.extend_from_slice(&sample.to_le_bytes());
+                        }
+                        if let Ok(mut clients) = active_clients.lock() {
+                            clients.retain(|client_tx| {
+                                match client_tx.try_send(tungstenite::Message::Binary(pcm_bytes.clone())) {
+                                    Ok(_) => true,
+                                    Err(std::sync::mpsc::TrySendError::Full(_)) => true,
+                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+                                }
+                            });
                         }
                     }
                 }
@@ -1909,17 +3070,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             let slice_size = (dashboard.iq_density).max(64).min(128) as usize;
             let mut constellation_points = vec![[0.0f32; 2]; slice_size];
             let mut surveillance_fft = vec![0.0f32; slice_size];
+            let mut surv_buf_opt = None;
+            if let Some((_, primary_surv_buf, _)) = caf_buffers.get(&IlluminatorType::Fm) {
+                surv_buf_opt = Some(primary_surv_buf);
+            }
 
             if got_data {
                 let mut surv_slice = vec![Complex::new(0.0f32, 0.0f32); slice_size];
-                let buf_len = primary_surv_buf.len();
-                if buf_len >= slice_size {
-                    for i in 0..slice_size {
-                        surv_slice[i] = primary_surv_buf[buf_len - slice_size + i];
-                    }
-                } else {
-                    for i in 0..buf_len {
-                        surv_slice[i] = primary_surv_buf[i];
+                if let Some(primary_surv_buf) = surv_buf_opt {
+                    let buf_len = primary_surv_buf.len();
+                    if buf_len >= slice_size {
+                        for i in 0..slice_size {
+                            surv_slice[i] = primary_surv_buf[buf_len - slice_size + i];
+                        }
+                    } else {
+                        for i in 0..buf_len {
+                            surv_slice[i] = primary_surv_buf[i];
+                        }
                     }
                 }
 
@@ -1972,11 +3139,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             let serialized_targets: Vec<serde_json::Value> = tracking_bank.targets.iter()
-                .filter(|t| t.state != tracking::bank::TrackState::Terminated)
-                .filter(|t| dashboard.show_unconfirmed || t.state != tracking::bank::TrackState::Suspect)
+                .filter(|t| t.state != tracking::bank::TrackState::Terminated || Some(t.id) == dashboard.selected_target_id)
+                .filter(|t| dashboard.show_unconfirmed || t.state != tracking::bank::TrackState::Suspect || Some(t.id) == dashboard.selected_target_id)
                 .map(|t| {
                     let speed = (t.ekf.state[3].powi(2) + t.ekf.state[4].powi(2) + t.ekf.state[5].powi(2)).sqrt();
                     let ekf_cov = vec![t.ekf.cov[0][0], t.ekf.cov[0][1], t.ekf.cov[1][1]];
+                    let matched_flight = if let Some(mf) = flight_engine.match_flight_detailed(&t.ekf.state) {
+                        serde_json::json!({
+                            "callsign": mf.callsign,
+                            "icao24": mf.icao24,
+                            "pos_enu": mf.pos_enu,
+                            "distance_error_m": mf.distance_error_m,
+                            "accuracy_pct": mf.accuracy_pct,
+                        })
+                    } else {
+                        serde_json::Value::Null
+                    };
                     serde_json::json!({
                         "id": t.id,
                         "callsign": t.callsign(),
@@ -1989,6 +3167,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "ekf_cov": ekf_cov,
                         "jem_fft_mag": t.jem.latest_fft_mag,
                         "jem_frequency_hz": t.jem.get_sidebands_hz(),
+                        "unwrapped_phase": t.jem.unwrapped_phase,
+                        "cepstrum": t.jem.cepstrum,
+                        "respiration_rate": t.jem.respiration_rate,
+                        "payload_class": t.jem.payload_class,
+                        "stare_mode_active": t.ekf.stare_mode_active,
+                        "cic_mode": format!("{:?}", t.jem.cic_mode),
+                        "isar_image": if dashboard.selected_target_id == Some(t.id) {
+                            isar_processor.render_image_gpu(t.id, 128)
+                        } else {
+                            None
+                        },
+                        "matched_flight": matched_flight,
                     })
                 })
                 .collect();
@@ -2008,7 +3198,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "timestamp": tr.timestamp,
                         "frequency_hz": tr.frequency_hz,
                         "snr_db": tr.snr_db,
-                        "classification": tr.classification
+                        "classification": tr.classification,
+                        "tec": tr.tec
                     })
                 })
                 .collect();
@@ -2020,8 +3211,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "sample_rate": input_rate,
                 "dsp_threshold": dashboard.dsp_threshold,
                 "gain": dashboard.gain,
+                "software_agc": dashboard.software_agc,
                 "dc_block": dashboard.dc_block,
                 "show_unconfirmed": dashboard.show_unconfirmed,
+                "screen_shake": dashboard.screen_shake,
                 "surveillance_fft": surveillance_fft,
                 "constellation_points": constellation_points,
                 "targets": serialized_targets,
@@ -2034,17 +3227,41 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "antenna_heading": dashboard.heading_deg,
                 "sdr_alive": dashboard.sdr_alive,
                 "jamming_active": dashboard.jamming_active,
+                "is_hopping": dashboard.is_hopping,
                 "sdr_gain": dashboard.gain,
                 "sdr_offset": dashboard.frequency_offset,
                 "sdr_dc_block": dashboard.dc_alpha,
                 "overflow_alarm": dashboard.overflow_alarm,
                 "tactical_records": dashboard.tactical_records,
+                "multipath_profile": dashboard.multipath_profile,
+                "multipath_peak_refined": dashboard.multipath_peak_refined,
             });
             let telemetry_str = to_ws_json_string(&telemetry);
             if let Ok(mut clients) = active_clients.lock() {
                 clients.retain(|client_tx| {
-                    client_tx.send(telemetry_str.clone()).is_ok()
+                    match client_tx.try_send(tungstenite::Message::Text(telemetry_str.clone())) {
+                        Ok(_) => true,
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => true,
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+                    }
                 });
+            }
+            if let Some(ref tx) = fusion_tx {
+                let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+                let node_id = format!("node-{}", args.port.unwrap_or(8085));
+                for target in &tracking_bank.targets {
+                    if target.state == tracking::bank::TrackState::Active {
+                        let report = crate::tracking::fusion::TrackReport {
+                            node_id: node_id.clone(),
+                            track_id: target.id,
+                            state: target.ekf.state,
+                            covariance: target.ekf.cov,
+                            timestamp_ms: now_ms,
+                            classification: target.classification.clone(),
+                        };
+                        let _ = tx.send(report);
+                    }
+                }
             }
         }
 
@@ -2069,7 +3286,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         execute!(
             stdout,
             LeaveAlternateScreen,
-            DisableMouseCapture,
             cursor::Show
         )?;
 

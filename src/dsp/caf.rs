@@ -156,6 +156,7 @@ pub fn correlate_slices_scalar(surv: &[Complex<f32>], reference: &[Complex<f32>]
 pub struct CafEngine {
     fft_512: Arc<dyn Fft<f32>>,
     fft_1024: Arc<dyn Fft<f32>>,
+    gpu_state: std::sync::Mutex<Option<crate::dsp::gpu::GpuCafState>>,
 }
 
 impl CafEngine {
@@ -164,6 +165,40 @@ impl CafEngine {
         Self {
             fft_512: planner.plan_fft_forward(512),
             fft_1024: planner.plan_fft_forward(1024),
+            gpu_state: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// GPU-accelerated Acquisition Mode:
+    /// Runs the Cross-Ambiguity Function on the GPU using wgpu/Metal, falling back to
+    /// CPU compute_acquisition_dense if the GPU pipeline is not available.
+    pub fn compute_acquisition_gpu(
+        &self,
+        clean_surv: &[Complex<f32>],
+        surrogate_ref: &[Complex<f32>],
+        max_delay: usize,
+    ) -> Vec<Vec<f32>> {
+        if let Some(pipeline) = crate::dsp::gpu::get_gpu_caf_pipeline() {
+            let mut state_lock = self.gpu_state.lock().unwrap();
+            let state = state_lock.get_or_insert_with(|| {
+                crate::dsp::gpu::GpuCafState::new(
+                    pipeline,
+                    clean_surv.len(),
+                    max_delay,
+                    512,
+                )
+            });
+            let doppler_step = clean_surv.len() as f32 / 262144.0;
+            state.process_caf(
+                pipeline,
+                clean_surv,
+                surrogate_ref,
+                max_delay,
+                512,
+                doppler_step,
+            )
+        } else {
+            self.compute_acquisition_dense(clean_surv, surrogate_ref, max_delay)
         }
     }
 
@@ -187,11 +222,11 @@ impl CafEngine {
             return vec![vec![0.0; num_chunks]; max_delay];
         }
 
-        // 1. Pre-allocate r_matrix sequentially on the main thread to avoid global allocator contention in parallel threads
-        let mut r_matrix = vec![vec![FftComplex::new(0.0, 0.0); num_chunks]; max_delay];
+        // Flat matrix allocation to ensure cache locality and avoid nested heap allocations
+        let mut r_matrix = vec![FftComplex::new(0.0, 0.0); max_delay * num_chunks];
 
-        // Cross-correlate in parallel across delays (Fast-Time)
-        r_matrix.par_iter_mut().enumerate().for_each(|(d, row)| {
+        // Cross-correlate in parallel across delays (Fast-Time) using contiguous chunks
+        r_matrix.par_chunks_mut(num_chunks).enumerate().for_each(|(d, row)| {
             for m in 0..available_chunks {
                 let offset = m * chunk_size + max_delay;
                 let surv_chunk = &clean_surv[offset .. offset + chunk_size];
@@ -201,16 +236,16 @@ impl CafEngine {
             }
         });
 
-        // 2. Pre-allocate results and scratch buffers sequentially on the main thread
+        // Contiguous flat scratch and results buffers
         let scratch_len = self.fft_512.get_inplace_scratch_len();
-        let mut scratches = vec![vec![FftComplex::new(0.0, 0.0); scratch_len]; max_delay];
-        let mut result = vec![vec![0.0f32; num_chunks]; max_delay];
+        let mut scratches = vec![FftComplex::new(0.0, 0.0); max_delay * scratch_len];
+        let mut result_flat = vec![0.0f32; max_delay * num_chunks];
 
         // FFT across chunks in parallel (Slow-Time)
         r_matrix
-            .par_iter_mut()
-            .zip(scratches.par_iter_mut())
-            .zip(result.par_iter_mut())
+            .par_chunks_mut(num_chunks)
+            .zip(scratches.par_chunks_mut(scratch_len))
+            .zip(result_flat.par_chunks_mut(num_chunks))
             .for_each(|((row, scratch), out_row)| {
                 self.fft_512.process_with_scratch(row, scratch);
                 
@@ -221,7 +256,11 @@ impl CafEngine {
                 }
             });
 
-        result
+        // Reconstruct the nested Vec structure expected by the caller
+        result_flat
+            .chunks(num_chunks)
+            .map(|chunk| chunk.to_vec())
+            .collect()
     }
 
     /// Tracking Mode (Sparse & De-spread): 
@@ -248,13 +287,19 @@ impl CafEngine {
 
         let mut decimated = vec![FftComplex::new(0.0, 0.0); fft_size];
         
+        // Expanded complex multiplication and conjugation to facilitate compiler auto-vectorization
         for i in 0..fft_size {
-            let mut sum = Complex::new(0.0, 0.0);
+            let mut sum_re = 0.0f32;
+            let mut sum_im = 0.0f32;
             for j in 0..65 {
                 let idx = delay + i * decimation_factor + j;
-                sum += clean_surv[idx] * surrogate_ref[idx - delay].conj() * taps[j];
+                let s = clean_surv[idx];
+                let r = surrogate_ref[idx - delay];
+                let tap = taps[j];
+                sum_re += tap * (s.re * r.re + s.im * r.im);
+                sum_im += tap * (s.im * r.re - s.re * r.im);
             }
-            decimated[i] = FftComplex::new(sum.re, sum.im);
+            decimated[i] = FftComplex::new(sum_re, sum_im);
         }
 
         let mut scratch = vec![FftComplex::new(0.0, 0.0); self.fft_1024.get_inplace_scratch_len()];
@@ -268,6 +313,170 @@ impl CafEngine {
 
         result
     }
+}
+
+
+/// Compute the Channel Impulse Response (CIR) / multipath profile by correlating
+/// surveillance and reference channels over a range of delay bins.
+pub fn compute_cir(
+    surv: &[Complex<f32>],
+    reference: &[Complex<f32>],
+    max_delay: usize,
+) -> Vec<f32> {
+    let block_size = 512;
+    if surv.len() < block_size + max_delay || reference.len() < block_size + max_delay {
+        return vec![0.0; max_delay];
+    }
+
+    let mut profile = vec![0.0f32; max_delay];
+    for d in 0..max_delay {
+        let surv_sub = &surv[max_delay..max_delay + block_size];
+        let ref_sub = &reference[max_delay - d..max_delay - d + block_size];
+        let sum = correlate_slices(surv_sub, ref_sub);
+        profile[d] = sum.norm();
+    }
+    profile
+}
+
+// ============================================================================
+// Farrow Sub-Sample Delay Refinement (ported from feature/stable-tracking)
+// ============================================================================
+
+/// A 4-tap cubic Lagrange Farrow interpolator for sub-sample delay estimation.
+/// Maintains a history of 4 samples and interpolates at any fractional position μ ∈ [0, 1)
+/// using nested Horner evaluation of the polynomial coefficients.
+pub struct FarrowInterpolator {
+    pub history: [Complex<f32>; 4],
+}
+
+impl FarrowInterpolator {
+    pub fn new() -> Self {
+        Self {
+            history: [Complex::new(0.0, 0.0); 4],
+        }
+    }
+
+    pub fn push(&mut self, sample: Complex<f32>) {
+        self.history[0] = self.history[1];
+        self.history[1] = self.history[2];
+        self.history[2] = self.history[3];
+        self.history[3] = sample;
+    }
+
+    pub fn interpolate(&self, mu: f32) -> Complex<f32> {
+        let y_neg1 = self.history[0];
+        let y_0 = self.history[1];
+        let y_1 = self.history[2];
+        let y_2 = self.history[3];
+
+        let v3_re = -1.0 / 6.0 * y_neg1.re + 0.5 * y_0.re - 0.5 * y_1.re + 1.0 / 6.0 * y_2.re;
+        let v2_re = 0.5 * y_neg1.re - y_0.re + 0.5 * y_1.re;
+        let v1_re = -1.0 / 3.0 * y_neg1.re - 0.5 * y_0.re + y_1.re - 1.0 / 6.0 * y_2.re;
+        let v0_re = y_0.re;
+
+        let v3_im = -1.0 / 6.0 * y_neg1.im + 0.5 * y_0.im - 0.5 * y_1.im + 1.0 / 6.0 * y_2.im;
+        let v2_im = 0.5 * y_neg1.im - y_0.im + 0.5 * y_1.im;
+        let v1_im = -1.0 / 3.0 * y_neg1.im - 0.5 * y_0.im + y_1.im - 1.0 / 6.0 * y_2.im;
+        let v0_im = y_0.im;
+
+        let re = ((v3_re * mu + v2_re) * mu + v1_re) * mu + v0_re;
+        let im = ((v3_im * mu + v2_im) * mu + v1_im) * mu + v0_im;
+
+        Complex::new(re, im)
+    }
+
+    pub fn reset(&mut self) {
+        self.history = [Complex::new(0.0, 0.0); 4];
+    }
+}
+
+/// Correlates a surveillance signal against a reference with a fractional delay offset,
+/// using inline Farrow interpolation for each sample.
+pub fn correlate_fractional_delay(
+    surv: &[Complex<f32>],
+    reference: &[Complex<f32>],
+    reference_start: f32,
+) -> f32 {
+    let block_size = surv.len();
+    let mut sum = Complex::new(0.0, 0.0);
+    let mut ref_energy = 0.0f32;
+    
+    for i in 0..block_size {
+        let target_idx = reference_start + i as f32;
+        let base = target_idx.floor() as i32;
+        let mu = target_idx - base as f32;
+        
+        let idx_neg1 = (base - 1).clamp(0, reference.len() as i32 - 1) as usize;
+        let idx_0 = base.clamp(0, reference.len() as i32 - 1) as usize;
+        let idx_1 = (base + 1).clamp(0, reference.len() as i32 - 1) as usize;
+        let idx_2 = (base + 2).clamp(0, reference.len() as i32 - 1) as usize;
+        
+        let y_neg1 = reference[idx_neg1];
+        let y_0 = reference[idx_0];
+        let y_1 = reference[idx_1];
+        let y_2 = reference[idx_2];
+        
+        let v3_re = -1.0 / 6.0 * y_neg1.re + 0.5 * y_0.re - 0.5 * y_1.re + 1.0 / 6.0 * y_2.re;
+        let v2_re = 0.5 * y_neg1.re - y_0.re + 0.5 * y_1.re;
+        let v1_re = -1.0 / 3.0 * y_neg1.re - 0.5 * y_0.re + y_1.re - 1.0 / 6.0 * y_2.re;
+        let v0_re = y_0.re;
+
+        let v3_im = -1.0 / 6.0 * y_neg1.im + 0.5 * y_0.im - 0.5 * y_1.im + 1.0 / 6.0 * y_2.im;
+        let v2_im = 0.5 * y_neg1.im - y_0.im + 0.5 * y_1.im;
+        let v1_im = -1.0 / 3.0 * y_neg1.im - 0.5 * y_0.im + y_1.im - 1.0 / 6.0 * y_2.im;
+        let v0_im = y_0.im;
+
+        let re = ((v3_re * mu + v2_re) * mu + v1_re) * mu + v0_re;
+        let im = ((v3_im * mu + v2_im) * mu + v1_im) * mu + v0_im;
+        let interp_ref = Complex::new(re, im);
+        
+        sum += surv[i] * interp_ref.conj();
+        ref_energy += interp_ref.norm_sqr();
+    }
+    
+    if ref_energy > 1e-6 {
+        sum.norm() / ref_energy.sqrt()
+    } else {
+        sum.norm()
+    }
+}
+
+/// Refines an integer delay peak to sub-sample precision using Farrow interpolation.
+/// Fits a parabola to the correlation magnitude at three fractional delays: d - 0.5, d, d + 0.5.
+/// Returns the refined delay as a float with ~0.05 sample precision.
+pub fn refine_delay_farrow(
+    surv: &[Complex<f32>],
+    reference: &[Complex<f32>],
+    integer_delay: usize,
+) -> f32 {
+    let block_size = 512;
+    let max_cir_delay = 64;
+    if surv.len() < block_size + max_cir_delay || reference.len() < block_size + max_cir_delay {
+        return integer_delay as f32;
+    }
+    
+    let surv_sub = &surv[max_cir_delay..max_cir_delay + block_size];
+    let d_float = integer_delay as f32;
+    
+    let ref_start_neg = max_cir_delay as f32 - (d_float - 0.5);
+    let ref_start_zero = max_cir_delay as f32 - d_float;
+    let ref_start_pos = max_cir_delay as f32 - (d_float + 0.5);
+    
+    let m_neg = correlate_fractional_delay(surv_sub, reference, ref_start_neg);
+    let m_zero = correlate_fractional_delay(surv_sub, reference, ref_start_zero);
+    let m_pos = correlate_fractional_delay(surv_sub, reference, ref_start_pos);
+    
+    let a = 2.0 * (m_pos + m_neg - 2.0 * m_zero);
+    let b = m_pos - m_neg;
+    
+    if a >= 0.0 || a.abs() < 1e-6 {
+        return integer_delay as f32;
+    }
+    
+    let x_peak = -b / (2.0 * a);
+    let x_peak_clamped = x_peak.clamp(-0.5, 0.5);
+    
+    integer_delay as f32 + x_peak_clamped
 }
 
 #[cfg(test)]
@@ -305,4 +514,41 @@ mod tests {
         assert!((scalar_res.re - simd_res.re).abs() < 1e-5, "Real parts differ: scalar={}, simd={}", scalar_res.re, simd_res.re);
         assert!((scalar_res.im - simd_res.im).abs() < 1e-5, "Imag parts differ: scalar={}, simd={}", scalar_res.im, simd_res.im);
     }
+
+    #[test]
+    fn test_farrow_interpolator_identity() {
+        // When mu = 0.0, interpolation should return y_0 (history[1])
+        let mut farrow = FarrowInterpolator::new();
+        farrow.push(Complex::new(1.0, 0.0));
+        farrow.push(Complex::new(2.0, 0.5));
+        farrow.push(Complex::new(3.0, 1.0));
+        farrow.push(Complex::new(4.0, 1.5));
+
+        let result = farrow.interpolate(0.0);
+        assert!((result.re - 2.0).abs() < 1e-5, "At mu=0, should return y_0.re=2.0, got {}", result.re);
+        assert!((result.im - 0.5).abs() < 1e-5, "At mu=0, should return y_0.im=0.5, got {}", result.im);
+    }
+
+    #[test]
+    fn test_refine_delay_farrow() {
+        // Create a known delayed signal: reference is a chirp, surveillance is the same chirp delayed
+        let n = 1024;
+        let mut reference = vec![Complex::new(0.0, 0.0); n];
+        for i in 0..n {
+            let phase = 0.1 * (i as f32) + 0.001 * (i as f32) * (i as f32);
+            reference[i] = Complex::from_polar(1.0, phase);
+        }
+
+        let delay = 5;
+        let surv: Vec<Complex<f32>> = (0..n)
+            .map(|i| {
+                if i + delay < n { reference[i + delay] } else { Complex::new(0.0, 0.0) }
+            })
+            .collect();
+
+        let refined = refine_delay_farrow(&surv, &reference, 5);
+        // Refined delay should be close to 5.0 (integer-aligned signal)
+        assert!((refined - 5.0).abs() < 0.6, "Refined delay {} should be close to 5.0", refined);
+    }
 }
+

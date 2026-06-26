@@ -85,6 +85,9 @@ The system hosts an integrated, concurrent web server that broadcasts real-time 
    - **3D Elevation & JEM Profiles**: Displays 3D target altitude traces and micro-Doppler spectral signatures.
    - **Retro Hacker Shell**: Controls clutter jamming, radar frequency scanning, and threat spoofing scenarios.
 
+![Web HUD Dashboard - Telemetry View](screenshot_web_telemetry.png)
+![Web HUD Dashboard - Tactical Analysis View](screenshot_web_tactical.png)
+
 ### D.C. Metro Area Optimal FM Clusters
 
 When running in the D.C., Bethesda, or Potomac areas, the dense FM radio spectrum allows tracking multiple towers concurrently within a single SDR bandwidth. 

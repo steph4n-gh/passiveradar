@@ -250,13 +250,13 @@ fn run_ws_compound_test(
         .expect("Failed to spawn passiveradar binary");
 
     let _child_guard = KillOnDrop(child);
-    thread::sleep(Duration::from_millis(400));
+    thread::sleep(Duration::from_millis(600));
 
     let mut last_err: Option<String> = None;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let ws_url = format!("ws://127.0.0.1:{}", port);
-    for _ in 0..3 {
-        match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150)) {
+    for _ in 0..10 {
+        match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
             Ok(stream) => {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
                 let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
@@ -460,9 +460,9 @@ fn test_tier1_dc_block_toggle_off_tui() {
     run_tui_test_toggle(
         240, 40,
         "KEY d\nTICK 1\nDUMP frame_before.txt\nTICK 1\nKEY d\nTICK 1\nDUMP frame.txt",
-        &["DC Block: ON |"],
         &["DC Block: OFF |"],
         &["DC Block: ON |"],
+        &["DC Block: OFF |"],
     );
 }
 

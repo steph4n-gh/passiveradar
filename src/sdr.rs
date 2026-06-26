@@ -17,6 +17,7 @@ pub trait SdrSource: Send {
     fn get_gain(&self) -> f64;
     fn set_jamming(&mut self, _active: bool) -> Result<(), Box<dyn Error>> { Ok(()) }
     fn spoof_target(&mut self, _id: u32, _speed: f64) -> Result<(), Box<dyn Error>> { Ok(()) }
+    fn get_aircraft_enu(&self) -> Vec<[f64; 6]> { Vec::new() }
 }
 
 // =========================================================================
@@ -410,6 +411,34 @@ impl SdrSource for SimulationSdrSource {
             precomputed_towers.push(TowerPrecomputed { freq_factor_direct, echoes });
         }
 
+        struct TowerOscillator {
+            oscillator_direct: Complex<f32>,
+            rotator_direct: Complex<f32>,
+            echoes: Vec<EchoOscillator>,
+        }
+        struct EchoOscillator {
+            oscillator_reflected: Complex<f32>,
+            rotator_reflected: Complex<f32>,
+        }
+
+        let mut oscillators = Vec::with_capacity(precomputed_towers.len());
+        for pt in &precomputed_towers {
+            let start_phase_direct = (pt.freq_factor_direct * self.time) % (2.0 * std::f64::consts::PI);
+            let delta_phase_direct = pt.freq_factor_direct * dt;
+            let oscillator_direct = Complex::from_polar(1.0f32, start_phase_direct as f32);
+            let rotator_direct = Complex::from_polar(1.0f32, delta_phase_direct as f32);
+
+            let mut echoes = Vec::with_capacity(pt.echoes.len());
+            for echo in &pt.echoes {
+                let start_phase_reflected = (echo.freq_factor_reflected * self.time) % (2.0 * std::f64::consts::PI);
+                let delta_phase_reflected = echo.freq_factor_reflected * dt;
+                let oscillator_reflected = Complex::from_polar(echo.amp, start_phase_reflected as f32);
+                let rotator_reflected = Complex::from_polar(1.0f32, delta_phase_reflected as f32);
+                echoes.push(EchoOscillator { oscillator_reflected, rotator_reflected });
+            }
+            oscillators.push(TowerOscillator { oscillator_direct, rotator_direct, echoes });
+        }
+
         for n in 0..num_samples {
             let t = self.time + (n as f64) * dt;
 
@@ -422,15 +451,13 @@ impl SdrSource for SimulationSdrSource {
             }
             let mut sample = Complex::new(n_re, n_im);
 
-            for pt in &precomputed_towers {
-                // Direct path
-                let phase_direct = pt.freq_factor_direct * t;
-                sample += Complex::from_polar(1.0f32, phase_direct as f32);
+            for osc in &mut oscillators {
+                sample += osc.oscillator_direct;
+                osc.oscillator_direct = osc.oscillator_direct * osc.rotator_direct;
 
-                // Reflected paths
-                for echo in &pt.echoes {
-                    let phase_reflected = echo.freq_factor_reflected * t;
-                    sample += Complex::from_polar(echo.amp, phase_reflected as f32);
+                for echo in &mut osc.echoes {
+                    sample += echo.oscillator_reflected;
+                    echo.oscillator_reflected = echo.oscillator_reflected * echo.rotator_reflected;
                 }
             }
 
@@ -539,6 +566,10 @@ impl SdrSource for SimulationSdrSource {
             rcs: 15.0,
         });
         Ok(())
+    }
+
+    fn get_aircraft_enu(&self) -> Vec<[f64; 6]> {
+        self.aircraft.iter().map(|ac| [ac.x, ac.y, ac.z, ac.vx, ac.vy, ac.vz]).collect()
     }
 }
 

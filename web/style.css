@@ -103,28 +103,113 @@ body {
 
 /* Layout */
 .hud-main {
-    display: grid;
-    grid-template-columns: 1.15fr 1fr 0.85fr;
-    gap: 12px;
+    display: flex;
+    flex-direction: row;
+    gap: 16px;
     height: calc(100vh - 64px);
     overflow: hidden;
 }
 
-.hud-column {
+.radar-workspace {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    gap: 16px;
+    height: 100%;
+}
+
+.radar-workspace .panel-radar {
+    flex: 1;
+    height: 100%;
+}
+
+.radar-workspace .panel-elevation {
+    flex: 1;
+    height: 100%;
+}
+
+.hud-sidebar {
+    width: 380px;
+    flex-shrink: 0;
+    height: 100%;
     display: flex;
     flex-direction: column;
-    gap: 12px;
-    height: 100%;
     overflow: hidden;
 }
 
-.panel-radar { flex: 1.1; }
-.panel-elevation { flex: 0.9; }
-.panel-aligner { flex: 1.0; }
-.panel-telemetry { flex: 1.15; }
-.panel-fft-spectrogram { flex: 0.9; }
-.panel-iq-constellation { flex: 0.9; }
-.panel-jem { flex: 0.85; }
+/* Sidebar Tab navigation styling */
+.sidebar-tabs {
+    display: flex;
+    border-bottom: 1px solid var(--border-color);
+    background: rgba(0, 5, 15, 0.3);
+}
+
+.tab-btn {
+    flex: 1;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: rgba(0, 229, 255, 0.5);
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px;
+    font-weight: bold;
+    padding: 10px 4px;
+    cursor: pointer;
+    text-align: center;
+    transition: all 0.2s ease;
+    letter-spacing: 0.5px;
+}
+
+.tab-btn:hover {
+    color: var(--accent-cyan);
+    background: rgba(0, 229, 255, 0.05);
+}
+
+.tab-btn.active {
+    color: var(--accent-cyan);
+    border-bottom-color: var(--accent-cyan);
+    background: rgba(0, 229, 255, 0.1);
+    text-shadow: 0 0 6px rgba(0, 229, 255, 0.6);
+}
+
+.tab-content {
+    display: none;
+    flex: 1;
+    flex-direction: column;
+    gap: 12px;
+    padding: 12px;
+    overflow-y: auto;
+}
+
+.tab-content.active {
+    display: flex;
+}
+
+.panel-radar, .panel-elevation {
+    display: flex;
+    flex-direction: column;
+}
+
+.panel-telemetry {
+    flex: 1.2;
+    min-height: 240px;
+    max-height: 320px;
+}
+.panel-controls { flex: 0; min-height: fit-content; }
+.panel-records { flex: 0; min-height: fit-content; }
+
+.panel-fft-spectrogram { flex: 1; min-height: 140px; }
+.panel-iq-constellation { flex: 1; min-height: 140px; }
+.panel-waterfall { flex: 1.2; min-height: 160px; }
+.panel-aligner { flex: 1; min-height: 140px; }
+.panel-multipath { flex: 1; min-height: 140px; }
+
+.panel-jem { flex: 1; min-height: 150px; }
+.panel-cepstrum { flex: 1; min-height: 150px; }
+.panel-isar { flex: 1.2; min-height: 180px; }
+.panel-events { flex: 1; min-height: 120px; }
+.panel-terminal { flex: 1.2; min-height: 180px; }
+
 #jem-toggle-btn {
     width: auto;
     padding: 2px 8px;
@@ -132,11 +217,6 @@ body {
     margin: 0;
     line-height: 1;
 }
-.panel-controls { flex: 0; min-height: fit-content; }
-.panel-records { flex: 0; min-height: fit-content; }
-.panel-waterfall { flex: 1.0; }
-.panel-events { flex: 0.6; }
-.panel-terminal { flex: 0.8; min-height: 180px; }
 
 /* Hacker Terminal Styling */
 .terminal-container {

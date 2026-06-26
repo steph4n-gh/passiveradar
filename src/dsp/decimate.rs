@@ -83,6 +83,16 @@ impl FirFilter {
         Self::new(taps)
     }
 
+    /// Retrieve the original filter coefficients (taps).
+    pub fn get_taps(&self) -> Vec<f32> {
+        let mut original = Vec::with_capacity(self.num_taps);
+        for i in (0..self.taps_simd.len()).step_by(2) {
+            original.push(self.taps_simd[i]);
+        }
+        original.reverse();
+        original
+    }
+
     /// Compute the filter output for a window of samples.
     #[inline(always)]
     pub fn compute(&self, window: &[Complex<f32>]) -> Complex<f32> {
@@ -245,7 +255,12 @@ impl DecimatorStage {
         }
         
         let dropped = i.min(self.buffer.len());
-        self.buffer.drain(0..dropped);
+        let remaining = self.buffer.len() - dropped;
+        unsafe {
+            let ptr = self.buffer.as_mut_ptr();
+            std::ptr::copy(ptr.add(dropped), ptr, remaining);
+        }
+        self.buffer.truncate(remaining);
         self.counter = i - dropped;
     }
 
@@ -261,7 +276,10 @@ impl DecimatorStage {
         }
         
         let dropped = i.min(self.buffer.len());
-        self.buffer.drain(0..dropped);
+        let remaining = self.buffer.len() - dropped;
+        let ptr = self.buffer.as_mut_ptr();
+        std::ptr::copy(ptr.add(dropped), ptr, remaining);
+        self.buffer.truncate(remaining);
         self.counter = i - dropped;
     }
 
@@ -277,7 +295,10 @@ impl DecimatorStage {
         }
         
         let dropped = i.min(self.buffer.len());
-        self.buffer.drain(0..dropped);
+        let remaining = self.buffer.len() - dropped;
+        let ptr = self.buffer.as_mut_ptr();
+        std::ptr::copy(ptr.add(dropped), ptr, remaining);
+        self.buffer.truncate(remaining);
         self.counter = i - dropped;
     }
 }
@@ -389,10 +410,13 @@ impl DigitalDownConverter {
         self.phase_step = (2.0 * std::f64::consts::PI * offset_frequency / sample_rate) as f32;
     }
 
+    pub fn phase_step(&self) -> f32 {
+        self.phase_step
+    }
+
     pub fn process_block(&mut self, input: &[Complex<f32>], output: &mut Vec<Complex<f32>>) {
-        // Reuse pre-allocated buffer
-        self.mixed_buf.clear();
-        self.mixed_buf.reserve(input.len());
+        // Reuse pre-allocated buffer with pre-resized length to avoid push allocation overhead
+        self.mixed_buf.resize(input.len(), Complex::new(0.0, 0.0));
 
         // Rotating phasor oscillator: compute one sin/cos for the step,
         // then multiply forward with complex rotation per sample.
@@ -401,8 +425,8 @@ impl DigitalDownConverter {
         let rotation = Complex::new(cos_step, -sin_step);
         let mut carrier = Complex::from_polar(1.0, -self.phase);
 
-        for (i, &sample) in input.iter().enumerate() {
-            self.mixed_buf.push(sample * carrier);
+        for i in 0..input.len() {
+            self.mixed_buf[i] = input[i] * carrier;
             carrier = carrier * rotation;
 
             // Renormalize every 1024 samples to prevent magnitude drift
