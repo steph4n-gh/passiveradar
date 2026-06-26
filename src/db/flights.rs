@@ -15,6 +15,15 @@ pub struct FlightState {
     pub heading_deg: f64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MatchedFlightTelemetry {
+    pub callsign: String,
+    pub icao24: String,
+    pub pos_enu: [f64; 3],
+    pub distance_error_m: f64,
+    pub accuracy_pct: f64,
+}
+
 #[derive(Deserialize, Debug)]
 struct OpenSkyResponse {
     states: Option<Vec<Vec<serde_json::Value>>>,
@@ -68,7 +77,7 @@ impl FlightLookupEngine {
                     )
                     .ok();
                 loop {
-                    let mut sleep_secs = 30;
+                    let mut sleep_secs = 10;
                     if let Err(e) = Self::fetch_live_flights_static(
                         ref_lat,
                         ref_lon,
@@ -230,6 +239,99 @@ impl FlightLookupEngine {
         }
 
         best_match
+    }
+
+    pub fn seed_mock_flights(&self, aircraft_list: &[[f64; 6]]) {
+        let mut flights = Vec::new();
+        for (i, ac) in aircraft_list.iter().enumerate() {
+            let (lat, lon, alt) = enu_to_latlon(&[ac[0], ac[1], ac[2]], self.ref_lat, self.ref_lon, self.ref_alt);
+            let speed = (ac[3]*ac[3] + ac[4]*ac[4] + ac[5]*ac[5]).sqrt();
+            let heading = ac[4].atan2(ac[3]).to_degrees();
+            let callsign = if alt > 8000.0 && speed > 200.0 {
+                "AAL191".to_string()
+            } else {
+                "N420SP".to_string()
+            };
+            flights.push(FlightState {
+                icao24: format!("mock{:02x}", i),
+                callsign,
+                lat,
+                lon,
+                altitude_m: alt,
+                speed_mps: speed,
+                heading_deg: heading,
+            });
+        }
+        if let Ok(mut lock) = self.cached_flights.write() {
+            *lock = flights;
+        }
+    }
+
+    pub fn match_flight_detailed(&self, state: &[f64; 6]) -> Option<MatchedFlightTelemetry> {
+        let flights_guard = self.cached_flights.read().ok()?;
+        if flights_guard.is_empty() {
+            return None;
+        }
+
+        // Convert EKF coordinates (ENU) to Lat/Lon GPS coordinates
+        let (_t_lat, _t_lon, t_alt) = enu_to_latlon(
+            &[state[0], state[1], state[2]],
+            self.ref_lat,
+            self.ref_lon,
+            self.ref_alt,
+        );
+
+        let vx = state[3];
+        let vy = state[4];
+        let vz = state[5];
+        let t_speed = (vx * vx + vy * vy + vz * vz).sqrt();
+
+        let mut best_match = None;
+        let mut best_score = 3.0; // matching score gate threshold
+        let mut best_dist_m = 0.0;
+        let mut best_enu = [0.0; 3];
+
+        for flight in flights_guard.iter() {
+            let enu_coord = latlon_to_enu(
+                flight.lat,
+                flight.lon,
+                flight.altitude_m,
+                self.ref_lat,
+                self.ref_lon,
+                self.ref_alt,
+            );
+            let dx = state[0] - enu_coord[0];
+            let dy = state[1] - enu_coord[1];
+            let dz = state[2] - enu_coord[2];
+            let dist_m = (dx * dx + dy * dy + dz * dz).sqrt();
+            let dist_km = dist_m / 1000.0;
+
+            let speed_diff = (t_speed - flight.speed_mps).abs();
+            let alt_diff = (t_alt - flight.altitude_m).abs();
+
+            let score = dist_km / 10.0 + alt_diff / 1500.0 + speed_diff / 40.0;
+
+            if score < best_score {
+                best_score = score;
+                best_dist_m = dist_m;
+                best_enu = enu_coord;
+                best_match = Some((flight.callsign.clone(), flight.icao24.clone()));
+            }
+        }
+
+        if let Some((callsign, icao24)) = best_match {
+            // max gate distance is 15 km (15000 m).
+            let accuracy_pct = (1.0 - (best_dist_m / 15000.0)).clamp(0.0, 1.0) * 100.0;
+            Some(MatchedFlightTelemetry {
+                callsign,
+                icao24,
+                pos_enu: best_enu,
+                distance_error_m: best_dist_m,
+                accuracy_pct,
+            })
+        } else {
+            None
+        }
     }
 }
 

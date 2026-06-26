@@ -77,7 +77,7 @@ impl BistaticEkf {
         }
     }
 
-    pub fn predict(&mut self, dt: f64) {
+    pub fn predict(&mut self, dt: f64, is_coasting: bool) {
         if self.stare_mode_active {
             self.state = [
                 self.stare_coords[0],
@@ -114,6 +114,7 @@ impl BistaticEkf {
         }
 
         let mut next_cov = [[0.0f64; 6]; 6];
+        let q_mult = if is_coasting { 0.1 } else { 1.0 };
         for r in 0..6 {
             for c in 0..6 {
                 let val = if c < 3 {
@@ -121,7 +122,7 @@ impl BistaticEkf {
                 } else {
                     f_p[r][c]
                 };
-                next_cov[r][c] = val + self.q[r][c] * dt;
+                next_cov[r][c] = val + self.q[r][c] * q_mult * dt;
             }
         }
 
@@ -522,7 +523,7 @@ mod tests {
         let meas = 12.5;
 
         for _ in 0..50 {
-            ekf.predict(0.1);
+            ekf.predict(0.1, false);
             ekf.update(&tower_pos, &[0.0, 0.0, 0.0], fc, meas);
         }
 
@@ -545,11 +546,13 @@ mod tests {
         let f2 = 90.9e6;
         
         let v = 100.0;
-        let fd1 = -2.0 * v * f1 / crate::sdr::C;
-        let fd2 = -2.0 * v * f2 / crate::sdr::C;
+        let b_disp = 1.2e14; // Add a non-zero dispersion parameter to the simulation
+        let fd1 = -2.0 * v * f1 / crate::sdr::C + b_disp / f1;
+        let fd2 = -2.0 * v * f2 / crate::sdr::C + b_disp / f2;
         
         let fd_free = AppletonHartreeDispersion::cancel(f1, f2, fd1, fd2);
-        assert!((fd_free - fd1).abs() < 1e-5);
+        let expected_fd1_free = -2.0 * v * f1 / crate::sdr::C;
+        assert!((fd_free - expected_fd1_free).abs() < 1e-5); // Verify that dispersion is successfully canceled
     }
 
     #[test]
@@ -559,7 +562,7 @@ mod tests {
         let tower_pos = [10.0, 20.0, 5.0];
         let fc = 90.9e6;
 
-        ekf.predict(0.1);
+        ekf.predict(0.1, false);
 
         let r_cov = [[0.5, 0.0], [0.0, 1e-12]];
         let z_doppler = 15.0;
@@ -590,7 +593,7 @@ mod tests {
         assert_eq!(ekf.state[4], 0.0);
         assert_eq!(ekf.state[5], 0.0);
 
-        ekf.predict(1.0);
+        ekf.predict(1.0, false);
         assert_eq!(ekf.state[0], 500.0);
         assert_eq!(ekf.state[3], 0.0);
         assert!(ekf.cov[0][0] <= 1e-8);

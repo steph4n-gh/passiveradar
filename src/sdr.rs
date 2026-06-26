@@ -17,6 +17,7 @@ pub trait SdrSource: Send {
     fn get_gain(&self) -> f64;
     fn set_jamming(&mut self, _active: bool) -> Result<(), Box<dyn Error>> { Ok(()) }
     fn spoof_target(&mut self, _id: u32, _speed: f64) -> Result<(), Box<dyn Error>> { Ok(()) }
+    fn get_aircraft_enu(&self) -> Vec<[f64; 6]> { Vec::new() }
 }
 
 // =========================================================================
@@ -565,6 +566,10 @@ impl SdrSource for SimulationSdrSource {
             rcs: 15.0,
         });
         Ok(())
+    }
+
+    fn get_aircraft_enu(&self) -> Vec<[f64; 6]> {
+        self.aircraft.iter().map(|ac| [ac.x, ac.y, ac.z, ac.vx, ac.vy, ac.vz]).collect()
     }
 }
 

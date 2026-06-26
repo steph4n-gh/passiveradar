@@ -8,6 +8,7 @@ pub struct VirtualTcxo {
     sample_rate: f32,
     phase: f32,
     frequency_offset_rad: f32,
+    drift_phase: f32, // Track drift phase separately from nominal pilot phase
     // Loop filter coefficients
     alpha: f32,
     beta: f32,
@@ -32,6 +33,7 @@ impl VirtualTcxo {
             sample_rate,
             phase: 0.0,
             frequency_offset_rad: 0.0,
+            drift_phase: 0.0,
             alpha,
             beta,
             ppm_drift: 0.0,
@@ -40,7 +42,7 @@ impl VirtualTcxo {
 
     /// Process a block of samples. Lock onto the pilot tone, update loop filter,
     /// compute the PPM drift of the HackRF oscillator, and apply corrective phase rotation.
-    pub fn discipline_block(&mut self, input: &[Complex<f32>], output: &mut [Complex<f32>]) {
+    pub fn discipline_block(&mut self, input: &[Complex<f32>], output: &mut [Complex<f32>], center_freq_hz: f32) {
         let n = input.len().min(output.len());
         
         // Expected phase step per sample at target pilot frequency
@@ -62,14 +64,19 @@ impl VirtualTcxo {
             let phase_error = i_mixed * q_mixed;
 
             // 3. Loop Filter: Update phase and frequency accumulators
-            self.phase += self.frequency_offset_rad + self.alpha * phase_error;
+            let drift_update = self.frequency_offset_rad + self.alpha * phase_error;
+            self.phase += drift_update;
             self.frequency_offset_rad += self.beta * phase_error;
+            
+            // Accumulate only drift components for correction
+            self.drift_phase += drift_update;
 
             // Accumulate expected phase step
             self.phase += pilot_phase_step;
             
             // Wrap phase
             self.phase = (self.phase + std::f32::consts::PI) % (2.0 * std::f32::consts::PI) - std::f32::consts::PI;
+            self.drift_phase = (self.drift_phase + std::f32::consts::PI) % (2.0 * std::f32::consts::PI) - std::f32::consts::PI;
 
             // 4. Calculate HackRF's hardware PPM drift
             // frequency_offset_rad is in radians/sample. Convert to Hz:
@@ -79,7 +86,8 @@ impl VirtualTcxo {
 
             // 5. Apply corrective phase rotation to the wideband input stream
             // Rotate the input sample in the opposite direction of the tracked drift phase
-            let correction_phase = -self.phase;
+            // Scale correction phase from pilot frequency to RF center frequency
+            let correction_phase = -self.drift_phase * (center_freq_hz / self.pilot_frequency_hz);
             output[i] = sample * Complex::from_polar(1.0, correction_phase);
         }
     }

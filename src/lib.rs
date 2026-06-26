@@ -13,9 +13,12 @@ pub mod dsp {
     pub mod pll;
     pub mod remod;
     pub mod tropical;
+    pub mod morse;
 }
 pub mod math {
     pub mod adelic;
+    pub mod e8;
+    pub mod cohomology;
 }
 pub mod tracking {
     pub mod bank;

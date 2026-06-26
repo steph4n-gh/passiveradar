@@ -54,6 +54,7 @@ pub struct SdrBlock {
     pub buf: Vec<Complex<f32>>,
     pub freq: f64,
     pub illuminator: IlluminatorType,
+    pub aircraft: Vec<[f64; 6]>,
 }
 use ratatui::{
     backend::{Backend, CrosstermBackend, TestBackend},
@@ -279,6 +280,7 @@ fn handle_key_code(
     paused: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     speed_factor: &std::sync::Arc<std::sync::atomic::AtomicU32>,
     step_requested: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    is_hopping_atomic: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     dashboard: &mut Dashboard,
     tracking_bank: &TrackingBank,
     should_exit: &mut bool,
@@ -305,6 +307,12 @@ fn handle_key_code(
             if paused.load(std::sync::atomic::Ordering::SeqCst) {
                 step_requested.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+        }
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            let current = is_hopping_atomic.load(std::sync::atomic::Ordering::SeqCst);
+            is_hopping_atomic.store(!current, std::sync::atomic::Ordering::SeqCst);
+            dashboard.is_hopping = !current;
+            dashboard.add_log(format!("Frequency Hopping: {}", if !current { "ENABLED" } else { "DISABLED (LOCKED)" }));
         }
         KeyCode::Up => {
             let mut sorted_targets: Vec<&tracking::bank::TrackedTarget> = tracking_bank.targets.iter().collect();
@@ -588,7 +596,12 @@ fn to_ws_json_string<T: serde::Serialize>(val: &T) -> String {
     result
 }
 
-fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard, tracking_bank: &mut TrackingBank) -> serde_json::Value {
+fn process_ws_command(
+    cmd_text: String,
+    dashboard: &mut Dashboard,
+    tracking_bank: &mut TrackingBank,
+    flight_engine: &db::flights::FlightLookupEngine,
+) -> serde_json::Value {
     let raw_val: serde_json::Value = match serde_json::from_str(&cmd_text) {
         Ok(v) => v,
         Err(_) => return serde_json::json!({"error": "Invalid arguments"}),
@@ -783,6 +796,18 @@ fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard, tracking_bank
                     return serde_json::json!({
                         "screen_shake": d,
                         "sync_status": format!("Screen Shake: {}", if d { "ON" } else { "OFF" })
+                    });
+                }
+            }
+            serde_json::json!({"error": "Invalid arguments"})
+        }
+        "set_hopping" => {
+            if let Some(val) = raw_val.get("value") {
+                if let Some(d) = val.as_bool() {
+                    dashboard.is_hopping = d;
+                    return serde_json::json!({
+                        "is_hopping": d,
+                        "sync_status": format!("Frequency Hopping: {}", if d { "ON" } else { "OFF" })
                     });
                 }
             }
@@ -1246,9 +1271,20 @@ fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard, tracking_bank
         }
         "GetTelemetry" => {
             let serialized_targets: Vec<serde_json::Value> = tracking_bank.targets.iter()
-                .filter(|t| t.state != tracking::bank::TrackState::Terminated)
+                .filter(|t| t.state != tracking::bank::TrackState::Terminated || Some(t.id) == dashboard.selected_target_id)
                 .map(|t| {
                     let speed = (t.ekf.state[3].powi(2) + t.ekf.state[4].powi(2) + t.ekf.state[5].powi(2)).sqrt();
+                    let matched_flight = if let Some(mf) = flight_engine.match_flight_detailed(&t.ekf.state) {
+                        serde_json::json!({
+                            "callsign": mf.callsign,
+                            "icao24": mf.icao24,
+                            "pos_enu": mf.pos_enu,
+                            "distance_error_m": mf.distance_error_m,
+                            "accuracy_pct": mf.accuracy_pct,
+                        })
+                    } else {
+                        serde_json::Value::Null
+                    };
                     serde_json::json!({
                         "id": t.id,
                         "callsign": t.callsign(),
@@ -1256,9 +1292,11 @@ fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard, tracking_bank
                         "pos_enu": [t.ekf.state[0], t.ekf.state[1], t.ekf.state[2]],
                         "vel_enu": [t.ekf.state[3], t.ekf.state[4], t.ekf.state[5]],
                         "speed_mps": speed,
+                        "tracking_towers": t.tracking_towers,
                         "payload_class": t.jem.payload_class,
                         "respiration_rate": t.jem.respiration_rate,
                         "stare_mode_active": t.ekf.stare_mode_active,
+                        "matched_flight": matched_flight,
                     })
                 })
                 .collect();
@@ -1275,6 +1313,9 @@ fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard, tracking_bank
                 "fundamental_rpm": dashboard.fundamental_rpm,
                 "breathing_rate_hz": dashboard.breathing_rate_hz,
                 "payload_class": dashboard.payload_class_override,
+                "e8_mode_enabled": dashboard.e8_mode_enabled,
+                "morse_persistence": dashboard.morse_persistence as f64,
+                "cohomology_firewall_enabled": dashboard.cohomology_firewall_enabled,
             })
         }
         "SetMasterEkf" => {
@@ -1576,6 +1617,24 @@ fn process_ws_command(cmd_text: String, dashboard: &mut Dashboard, tracking_bank
                     serde_json::json!({"error": format!("Invalid TrackReport: {}", e)})
                 }
             }
+        }
+        "ToggleE8Mode" => {
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            dashboard.e8_mode_enabled = enabled;
+            serde_json::json!({"e8_mode_enabled": enabled})
+        }
+        "SetMorsePersistence" => {
+            if let Some(val) = req_value {
+                dashboard.morse_persistence = val as f32;
+                serde_json::json!({"morse_persistence": val})
+            } else {
+                serde_json::json!({"error": "Invalid arguments"})
+            }
+        }
+        "ToggleCohomologyFirewall" => {
+            let enabled = raw_val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            dashboard.cohomology_firewall_enabled = enabled;
+            serde_json::json!({"cohomology_firewall_enabled": enabled})
         }
         _ => serde_json::json!({"error": "Unknown command"}),
     }
@@ -2132,6 +2191,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let speed_factor = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(100)); // speed * 100
     let step_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sdr_gain = std::sync::Arc::new(std::sync::atomic::AtomicU32::new((dashboard.gain * 100.0) as u32));
+    let is_hopping_atomic = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(dashboard.is_hopping));
 
     let (sdr_cmd_tx, sdr_cmd_rx) = std::sync::mpsc::channel::<SdrCommand>();
     let jamming_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2141,6 +2201,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let speed_factor_clone = speed_factor.clone();
     let step_requested_clone = step_requested.clone();
     let sdr_gain_clone = sdr_gain.clone();
+    let is_hopping_atomic_clone = is_hopping_atomic.clone();
 
     // Spawn ingestion thread
     std::thread::spawn(move || {
@@ -2202,7 +2263,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 }
                                 buf[0..len].copy_from_slice(&local_buf[0..len]);
                                 buf.resize(len, Complex::new(0.0f32, 0.0f32));
-                                let block = SdrBlock { buf, freq: hops[current_hop_idx].0, illuminator: hops[current_hop_idx].1 };
+                                let aircraft = sdr_source.get_aircraft_enu();
+                                let block = SdrBlock { buf, freq: hops[current_hop_idx].0, illuminator: hops[current_hop_idx].1, aircraft };
                                 if sdr_tx_clone.send(block).is_err() {
                                     break;
                                 }
@@ -2217,9 +2279,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             } else {
-                if samples_this_hop >= samples_per_hop {
-                    current_hop_idx = (current_hop_idx + 1) % hops.len();
-                    let _ = sdr_source.set_frequency(hops[current_hop_idx].0);
+                if is_hopping_atomic_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                    if samples_this_hop >= samples_per_hop {
+                        current_hop_idx = (current_hop_idx + 1) % hops.len();
+                        let _ = sdr_source.set_frequency(hops[current_hop_idx].0);
+                        samples_this_hop = 0;
+                    }
+                } else {
                     samples_this_hop = 0;
                 }
 
@@ -2233,7 +2299,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                             }
                             buf[0..len].copy_from_slice(&local_buf[0..len]);
                             buf.resize(len, Complex::new(0.0f32, 0.0f32));
-                            let block = SdrBlock { buf, freq: hops[current_hop_idx].0, illuminator: hops[current_hop_idx].1 };
+                            let aircraft = sdr_source.get_aircraft_enu();
+                            let block = SdrBlock { buf, freq: hops[current_hop_idx].0, illuminator: hops[current_hop_idx].1, aircraft };
                             if sdr_tx_clone.send(block).is_err() {
                                 break; // Main thread exited
                             }
@@ -2280,7 +2347,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     'main_loop: loop {
         // Process any incoming WS commands
         while let Ok((cmd_text, resp_tx)) = ws_cmd_rx.try_recv() {
-            let resp_json = process_ws_command(cmd_text, &mut dashboard, &mut tracking_bank);
+            let resp_json = process_ws_command(cmd_text, &mut dashboard, &mut tracking_bank, &flight_engine);
             let resp_str = if let Some(raw_str) = resp_json.get("__raw_json_string").and_then(|v| v.as_str()) {
                 raw_str.to_string()
             } else {
@@ -2301,6 +2368,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         if (dashboard.gain - current_gain_f64).abs() > 0.01 {
             sdr_gain.store((dashboard.gain * 100.0) as u32, Ordering::SeqCst);
         }
+
+        // Sync frequency hopping state from dashboard to ingestion thread
+        is_hopping_atomic.store(dashboard.is_hopping, std::sync::atomic::Ordering::SeqCst);
+
+        // Sync selected target ID from dashboard to tracking bank
+        tracking_bank.selected_target_id = dashboard.selected_target_id;
 
         let mut pending_dump = None;
 
@@ -2335,6 +2408,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             &paused,
                             &speed_factor,
                             &step_requested,
+                            &is_hopping_atomic,
                             &mut dashboard,
                             &tracking_bank,
                             &mut should_exit,
@@ -2374,6 +2448,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         &paused,
                         &speed_factor,
                         &step_requested,
+                        &is_hopping_atomic,
                         &mut dashboard,
                         &tracking_bank,
                         &mut should_exit,
@@ -2387,6 +2462,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         // Process all queued SDR blocks (limit to at most 8 blocks per iteration to prevent UI starvation/freeze)
         let mut got_data = false;
+        let mut latest_sim_aircraft = Vec::new();
         let mut processed_blocks = 0;
         let is_paused_val = paused.load(std::sync::atomic::Ordering::SeqCst);
         let has_step_val = step_requested.load(std::sync::atomic::Ordering::SeqCst);
@@ -2418,6 +2494,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             let block_buf = block.buf;
             let illuminator = block.illuminator;
+            latest_sim_aircraft = block.aircraft;
             let freq_changed = (dashboard.center_freq - block.freq).abs() > 1.0;
             dashboard.center_freq = block.freq;
 
@@ -2437,7 +2514,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut block = block_buf;
             if let Some(ref mut tcxo) = virtual_tcxo {
                 let mut disciplined = vec![Complex::new(0.0, 0.0); block.len()];
-                tcxo.discipline_block(&block, &mut disciplined);
+                tcxo.discipline_block(&block, &mut disciplined, dashboard.center_freq as f32);
                 block = disciplined;
             }
 
@@ -2889,6 +2966,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 // Cross-reference trajectories with flight data
+                if args.mode == "sim" {
+                    flight_engine.seed_mock_flights(&latest_sim_aircraft);
+                }
+
                 for target in &mut tracking_bank.targets {
                     if target.state == tracking::bank::TrackState::Active {
                         if let Some(flight) =
@@ -3058,11 +3139,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             let serialized_targets: Vec<serde_json::Value> = tracking_bank.targets.iter()
-                .filter(|t| t.state != tracking::bank::TrackState::Terminated)
-                .filter(|t| dashboard.show_unconfirmed || t.state != tracking::bank::TrackState::Suspect)
+                .filter(|t| t.state != tracking::bank::TrackState::Terminated || Some(t.id) == dashboard.selected_target_id)
+                .filter(|t| dashboard.show_unconfirmed || t.state != tracking::bank::TrackState::Suspect || Some(t.id) == dashboard.selected_target_id)
                 .map(|t| {
                     let speed = (t.ekf.state[3].powi(2) + t.ekf.state[4].powi(2) + t.ekf.state[5].powi(2)).sqrt();
                     let ekf_cov = vec![t.ekf.cov[0][0], t.ekf.cov[0][1], t.ekf.cov[1][1]];
+                    let matched_flight = if let Some(mf) = flight_engine.match_flight_detailed(&t.ekf.state) {
+                        serde_json::json!({
+                            "callsign": mf.callsign,
+                            "icao24": mf.icao24,
+                            "pos_enu": mf.pos_enu,
+                            "distance_error_m": mf.distance_error_m,
+                            "accuracy_pct": mf.accuracy_pct,
+                        })
+                    } else {
+                        serde_json::Value::Null
+                    };
                     serde_json::json!({
                         "id": t.id,
                         "callsign": t.callsign(),
@@ -3086,6 +3178,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         } else {
                             None
                         },
+                        "matched_flight": matched_flight,
                     })
                 })
                 .collect();
@@ -3134,6 +3227,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "antenna_heading": dashboard.heading_deg,
                 "sdr_alive": dashboard.sdr_alive,
                 "jamming_active": dashboard.jamming_active,
+                "is_hopping": dashboard.is_hopping,
                 "sdr_gain": dashboard.gain,
                 "sdr_offset": dashboard.frequency_offset,
                 "sdr_dc_block": dashboard.dc_alpha,

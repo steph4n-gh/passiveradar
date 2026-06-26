@@ -387,6 +387,7 @@ pub struct TrackingBank {
     vel_uncert: f64,
     r_variance: f64,
     pub osm_network: Option<crate::tracking::osm::OsmRailNetwork>,
+    pub selected_target_id: Option<u32>,
 }
 
 impl TrackingBank {
@@ -417,6 +418,7 @@ impl TrackingBank {
             vel_uncert: 120.0,    // 120 m/s initial velocity uncertainty
             r_variance: 4.0,
             osm_network: None,
+            selected_target_id: None,
         }
     }
 
@@ -629,7 +631,7 @@ impl TrackingBank {
         // 1. Predict all active/suspect tracks forward
         for target in &mut self.targets {
             if target.state != TrackState::Terminated {
-                target.ekf.predict(dt);
+                target.ekf.predict(dt, target.state == TrackState::Coasting);
             }
         }
 
@@ -658,7 +660,7 @@ impl TrackingBank {
                         peak_freq as f64,
                     );
 
-                    if d_m_sq <= 10.828 {
+                    if d_m_sq <= 9.210 {
                         candidates.push((t_idx, p_idx, d_m_sq));
                     }
                 }
@@ -675,16 +677,40 @@ impl TrackingBank {
                     continue;
                 }
 
-                target_associated_in_tower[t_idx] = true;
-                associated_peaks[p_idx] = true;
-                associated_for_target[t_idx] = true;
-
                 let target = &mut self.targets[t_idx];
                 let meas_doppler = peaks[p_idx].0 as f64;
                 let snr_db = peaks[p_idx].1 as f64;
 
+                let old_state = target.ekf.state;
+                let old_cov = target.ekf.cov;
+
                 // EKF measurement update for this tower!
                 target.ekf.update(&tower_pos, &[0.0, 0.0, 0.0], fc, meas_doppler);
+
+                // Validate 3D physical constraints
+                let updated_z = target.ekf.state[2];
+                let updated_vx = target.ekf.state[3];
+                let updated_vy = target.ekf.state[4];
+                let updated_vz = target.ekf.state[5];
+                let updated_speed = (updated_vx * updated_vx + updated_vy * updated_vy + updated_vz * updated_vz).sqrt();
+
+                let is_physical = updated_z >= -100.0 && updated_z <= 18000.0 &&
+                                  updated_speed <= 450.0 &&
+                                  updated_vx.abs() <= 450.0 && updated_vy.abs() <= 450.0 && updated_vz.abs() <= 100.0;
+
+                if !is_physical {
+                    target.ekf.state = old_state;
+                    target.ekf.cov = old_cov;
+                    log.push(format!(
+                        "TrackedTarget Bank: Reverted EKF update for target {} because updated 3D state was unphysical (z: {:.1}m, speed: {:.1}m/s)",
+                        target.id, updated_z, updated_speed
+                    ));
+                    continue;
+                }
+
+                target_associated_in_tower[t_idx] = true;
+                associated_peaks[p_idx] = true;
+                associated_for_target[t_idx] = true;
 
                 // Target classification updates based on updated state
                 target.classification = Self::classify_target(&target.ekf.state);
@@ -825,11 +851,11 @@ impl TrackingBank {
                     
                     // Dynamic coast limit: well-established tracks coast longer to survive large dropouts (time-based)
                     let max_coast_time = if target.hits > 50 {
-                        40.0 // seconds
+                        50.0 // seconds
                     } else if target.hits > 20 {
-                        20.0 // seconds
+                        30.0 // seconds
                     } else {
-                        7.0  // seconds
+                        18.0  // seconds
                     };
                     let max_coast_frames = (max_coast_time / dt).round().max(1.0) as u32;
 
@@ -858,11 +884,11 @@ impl TrackingBank {
 
                     // Raised thresholds: reduces churn from brief signal dropouts (time-based)
                     let max_miss_time = if is_airliner && target.state == TrackState::Active {
-                        3.2 // seconds
+                        6.0 // seconds
                     } else if target.state == TrackState::Suspect {
-                        2.3 // seconds
+                        4.0 // seconds
                     } else {
-                        1.8 // seconds
+                        5.0 // seconds
                     };
                     let max_misses = (max_miss_time / dt).round().max(1.0) as usize;
 
@@ -936,8 +962,8 @@ impl TrackingBank {
         // 4. Update and promote candidates, and prune old candidates
         let mut next_candidates = Vec::new();
         for mut cand in self.candidates.drain(..) {
-            if cand.hits >= 3 {
-                // Confirm track! We have seen it 3 times consecutively, spawn EKF suspect track
+            if cand.hits >= 4 {
+                // Confirm track! We have seen it 4 times consecutively, spawn EKF suspect track
                 let peak_doppler = cand.frequency;
                 let direction_sign = -peak_doppler.signum(); // positive Doppler means approaching, negative receding
 
@@ -1168,6 +1194,7 @@ impl TrackingBank {
 
                     // Try to resolve exact 3D coordinates using Adelic Langevin multilateration (Frontier B)
                     let mut resolved_state = init_state;
+                    let mut should_spawn = true;
 
                     if towers_data.len() >= 2 && matching_towers >= 2 {
                         let mut opt = crate::math::adelic::AdelicLangevinOptimizer::new();
@@ -1223,39 +1250,42 @@ impl TrackingBank {
 
                         let (best_state, best_rss) =
                             opt.optimize(init_state, &bounds, cost_fn, 100);
-                        if best_rss < 200.0 {
+                        if best_rss < 150.0 {
                             resolved_state = best_state;
                             log.push(format!("TrackedTarget Bank: Resolved 3D multilateration for new target (RSS: {:.1})", best_rss));
                         } else {
-                            log.push(format!("TrackedTarget Bank: Multilateration RSS {:.1} above threshold, falling back to initial track state", best_rss));
+                            should_spawn = false;
+                            log.push(format!("TrackedTarget Bank: Rejected track candidate due to high multilateration RSS error ({:.1})", best_rss));
                         }
                     }
 
-                    let ekf = BistaticEkf::new(
-                        resolved_state,
-                        self.pos_uncert,
-                        self.vel_uncert,
-                        self.r_variance,
-                    );
-                    let classification = Self::classify_target(&resolved_state);
+                    if should_spawn {
+                        let ekf = BistaticEkf::new(
+                            resolved_state,
+                            self.pos_uncert,
+                            self.vel_uncert,
+                            self.r_variance,
+                        );
+                        let classification = Self::classify_target(&resolved_state);
 
-                    let new_target = TrackedTarget {
-                        id: Self::allocate_id(&self.targets),
-                        ekf,
-                        state: TrackState::Suspect,
-                        hits: 1,
-                        misses: 0,
-                        history: vec![resolved_state],
-                        classification,
-                        terminated_at: None,
-                        start_time: Instant::now(),
-                        fingerprint_history: Vec::new(),
-                        jem: crate::tracking::jem::JemAnalyzer::new(),
-                        tracking_towers: Vec::new(),
-                        coasting_frames: 0,
-                    };
+                        let new_target = TrackedTarget {
+                            id: Self::allocate_id(&self.targets),
+                            ekf,
+                            state: TrackState::Suspect,
+                            hits: 1,
+                            misses: 0,
+                            history: vec![resolved_state],
+                            classification,
+                            terminated_at: None,
+                            start_time: Instant::now(),
+                            fingerprint_history: Vec::new(),
+                            jem: crate::tracking::jem::JemAnalyzer::new(),
+                            tracking_towers: Vec::new(),
+                            coasting_frames: 0,
+                        };
 
-                    self.targets.push(new_target);
+                        self.targets.push(new_target);
+                    }
                 }
             } else {
                 // If it missed this frame, increment misses
@@ -1517,6 +1547,9 @@ impl TrackingBank {
 
         // 7. Remove terminated targets after a timeout to keep them on list with "OFFLINE" indicator
         self.targets.retain(|t| {
+            if Some(t.id) == self.selected_target_id {
+                return true; // Keep selected target indefinitely
+            }
             if t.state == TrackState::Terminated {
                 if let Some(t_time) = t.terminated_at {
                     let is_identified_airliner = t.classification.contains("(")
@@ -2128,18 +2161,18 @@ mod tests {
 
         let empty_peaks: &[(f32, f32)] = &[];
 
-        // Run updates with NO peaks for 18 iterations (new time-based threshold for non-airliner Active tracks)
-        for _ in 0..18 {
+        // Run updates with NO peaks for 50 iterations (new time-based threshold for non-airliner Active tracks: 5.0s / 0.1s)
+        for _ in 0..50 {
             bank.update(&tower_pos, fc, dt, empty_peaks, &mut log);
         }
 
-        // After 18 iterations:
-        // - Drone target (ID 1) should be Coasting (threshold 1.8s / 0.1s = 18 misses)
-        // - Airliners (ID 2 and 3) should still be active (threshold 3.2s / 0.1s = 32 misses)
+        // After 50 iterations:
+        // - Drone target (ID 1) should be Coasting (threshold 5.0s / 0.1s = 50 misses)
+        // - Airliners (ID 2 and 3) should still be active (threshold 6.0s / 0.1s = 60 misses)
         assert_eq!(
             bank.targets.iter().find(|t| t.id == 1).unwrap().state,
             TrackState::Coasting,
-            "Drone target should be coasting after 18 misses"
+            "Drone target should be coasting after 50 misses"
         );
         assert_eq!(
             bank.targets.iter().find(|t| t.id == 2).unwrap().state,
@@ -2152,13 +2185,13 @@ mod tests {
             "Airliner target 2 should still be active"
         );
 
-        // Run 70 more iterations to push the drone through coasting into Terminated
-        // (New dynamic coasting limit for low-hit tracks is 7.0s / 0.1s = 70 frames)
-        for _ in 0..70 {
+        // Run 180 more iterations to push the drone through coasting into Terminated
+        // (New dynamic coasting limit for low-hit tracks is 18.0s / 0.1s = 180 frames)
+        for _ in 0..180 {
             bank.update(&tower_pos, fc, dt, empty_peaks, &mut log);
         }
 
-        // After 18 + 70 = 88 total iterations: drone should be Terminated
+        // After 50 + 180 = 230 total iterations: drone should be Terminated
         assert_eq!(
             bank.targets.iter().find(|t| t.id == 1).unwrap().state,
             TrackState::Terminated,
@@ -2304,7 +2337,8 @@ mod tests {
         // Seed candidate: frequency = 113.0 Hz (matching extrapolated Doppler)
         bank.update(&tower_pos, fc, dt, &[(113.0, 15.0)], &mut log);
         bank.update(&tower_pos, fc, dt, &[(113.0, 15.0)], &mut log);
-        bank.update(&tower_pos, fc, dt, &[(113.0, 15.0)], &mut log); // 3rd hit triggers promotion
+        bank.update(&tower_pos, fc, dt, &[(113.0, 15.0)], &mut log);
+        bank.update(&tower_pos, fc, dt, &[(113.0, 15.0)], &mut log); // 4th hit triggers promotion
 
         // 3. Verify that the newly promoted candidate was mapped to the original target ID 42
         // rather than spawning a new target ID 1
@@ -2528,9 +2562,9 @@ mod tests {
         let dop_wiyy = calc_doppler(&wiyy_pos, &true_state, lambda_wiyy);
 
         // We will seed a candidate plot for WETA frequency
-        // We run updates 3 times to promote it.
-        // On the 3rd update, when it promotes, it will run Adelic solver using the peaks from all towers
-        for _ in 1..=3 {
+        // We run updates 4 times to promote it.
+        // On the 4th update, when it promotes, it will run Adelic solver using the peaks from all towers
+        for _ in 1..=4 {
             let peaks_weta = [(dop_weta as f32, 15.0)];
             let peaks_wtop = [(dop_wtop as f32, 18.0)];
             let peaks_wiyy = [(dop_wiyy as f32, 16.5)];
@@ -2976,7 +3010,6 @@ mod tests {
         let dot_r = (ext_vx * ext_x + ext_vy * ext_y + ext_vz * ext_z) / r_r;
         let expected_doppler = -(dot_t + dot_r) / lambda;
 
-        // 3. Feed Doppler plots close to its extrapolated trajectory
         bank.update(
             &tower_pos,
             fc,
@@ -2997,7 +3030,14 @@ mod tests {
             dt_step,
             &[(expected_doppler as f32, 15.0)],
             &mut log,
-        ); // 3rd update promotes candidate
+        );
+        bank.update(
+            &tower_pos,
+            fc,
+            dt_step,
+            &[(expected_doppler as f32, 15.0)],
+            &mut log,
+        ); // 4th update promotes candidate
 
         // 4. Verify that the target is successfully re-identified and loaded back
         assert!(

@@ -123,7 +123,19 @@ let currentJemTemplate = 'none';
 let yaw3d = -0.6;
 let pitch3d = 0.5;
 let isDragging3d = false;
+let isPanning3d = false;
 let previousMousePosition = { x: 0, y: 0 };
+let elevationScale = 1.0;
+let elevationPanX = 0.0;
+let elevationPanY = 0.0;
+
+// 2D Radar Interactivity State
+let radarZoom = 1.0;
+let radarPanX = 0.0;
+let radarPanY = 0.0;
+let isDraggingRadar = false;
+let radarDragStart = { x: 0, y: 0 };
+let radarHasMoved = false;
 
 // Target History Cache
 const targetHistoryCache = new Map();
@@ -475,6 +487,10 @@ function handleTelemetry(data) {
     const sdrOneBitInput = document.getElementById("sdr-one-bit");
     if (data.one_bit_mode !== undefined && sdrOneBitInput && document.activeElement !== sdrOneBitInput) {
         sdrOneBitInput.checked = data.one_bit_mode;
+    }
+    const sdrHoppingInput = document.getElementById("sdr-hopping");
+    if (data.is_hopping !== undefined && sdrHoppingInput && document.activeElement !== sdrHoppingInput) {
+        sdrHoppingInput.checked = data.is_hopping;
     }
 
     const unconfirmedToggle = document.getElementById("unconfirmed-toggle");
@@ -1032,36 +1048,14 @@ function drawRadarScope() {
     // Coordinate conversion helper (ENU km -> pixels)
     // Map bounds: [-70, 70] km
     const enuToPixel = (x_km, y_km) => {
-        const px = cx + (x_km / 70) * maxRadius;
-        const py = cy - (y_km / 70) * maxRadius; // invert Y for screen space
+        const px = cx + radarPanX + (x_km / 70) * maxRadius * radarZoom;
+        const py = cy + radarPanY - (y_km / 70) * maxRadius * radarZoom; // invert Y for screen space
         return { x: px, y: py };
     };
 
-    // 1. Draw Range Rings & Axes
-    radarCtx.strokeStyle = "rgba(0, 229, 255, 0.1)";
-    radarCtx.lineWidth = 1;
-    
-    // Axes
-    radarCtx.beginPath();
-    radarCtx.moveTo(cx - maxRadius, cy); radarCtx.lineTo(cx + maxRadius, cy);
-    radarCtx.moveTo(cx, cy - maxRadius); radarCtx.lineTo(cx, cy + maxRadius);
-    radarCtx.stroke();
+    const pannedCenter = enuToPixel(0, 0);
 
-    // Rings
-    const ringRanges = [25, 50, 70];
-    ringRanges.forEach(r => {
-        const radius = (r / 70) * maxRadius;
-        radarCtx.beginPath();
-        radarCtx.arc(cx, cy, radius, 0, Math.PI * 2);
-        radarCtx.stroke();
-
-        // Print ring tags
-        radarCtx.fillStyle = "rgba(0, 229, 255, 0.3)";
-        radarCtx.font = "10px Share Tech Mono";
-        radarCtx.fillText(`${r} km`, cx + 5, cy - radius + 12);
-    });
-
-    // Outer azimuth ticks
+    // 1. Draw Outer Azimuth Ticks (Fixed on Bezel)
     radarCtx.strokeStyle = "rgba(0, 229, 255, 0.2)";
     for (let angle = 0; angle < 360; angle += 10) {
         const rad = (angle - 90) * Math.PI / 180;
@@ -1085,6 +1079,38 @@ function drawRadarScope() {
             );
         }
     }
+
+    // Save context and clip all subsequent drawings to the inner radar circle
+    radarCtx.save();
+    radarCtx.beginPath();
+    radarCtx.arc(cx, cy, maxRadius, 0, Math.PI * 2);
+    radarCtx.clip();
+
+    // 2. Draw Range Rings & Axes (Panned & Zoomed)
+    radarCtx.strokeStyle = "rgba(0, 229, 255, 0.1)";
+    radarCtx.lineWidth = 1;
+    
+    // Axes
+    radarCtx.beginPath();
+    radarCtx.moveTo(pannedCenter.x - maxRadius * radarZoom, pannedCenter.y); 
+    radarCtx.lineTo(pannedCenter.x + maxRadius * radarZoom, pannedCenter.y);
+    radarCtx.moveTo(pannedCenter.x, pannedCenter.y - maxRadius * radarZoom); 
+    radarCtx.lineTo(pannedCenter.x, pannedCenter.y + maxRadius * radarZoom);
+    radarCtx.stroke();
+
+    // Rings
+    const ringRanges = [25, 50, 70];
+    ringRanges.forEach(r => {
+        const radius = (r / 70) * maxRadius * radarZoom;
+        radarCtx.beginPath();
+        radarCtx.arc(pannedCenter.x, pannedCenter.y, radius, 0, Math.PI * 2);
+        radarCtx.stroke();
+
+        // Print ring tags
+        radarCtx.fillStyle = "rgba(0, 229, 255, 0.3)";
+        radarCtx.font = "10px Share Tech Mono";
+        radarCtx.fillText(`${r} km`, pannedCenter.x + 5, pannedCenter.y - radius + 12);
+    });
 
     // 1.1 Draw Bistatic Range Ellipses for Active Towers
     if (ellipseMode !== "None" && ellipseMode !== "NONE") {
@@ -1123,8 +1149,8 @@ function drawRadarScope() {
                         const a_km = r_b / 2;
                         const b_km = Math.sqrt(Math.max(0, a_km * a_km - (baseline / 2) * (baseline / 2)));
                         
-                        const aPixels = (a_km / 70) * maxRadius;
-                        const bPixels = (b_km / 70) * maxRadius;
+                        const aPixels = (a_km / 70) * maxRadius * radarZoom;
+                        const bPixels = (b_km / 70) * maxRadius * radarZoom;
                         const centerPos = enuToPixel(xc, yc);
                         const phi = Math.atan2(tx_y, tx_x);
 
@@ -1151,11 +1177,11 @@ function drawRadarScope() {
     // 2. Draw Receiver center (Rx)
     radarCtx.fillStyle = "#00e676";
     radarCtx.beginPath();
-    radarCtx.arc(cx, cy, 3, 0, Math.PI * 2);
+    radarCtx.arc(pannedCenter.x, pannedCenter.y, 3, 0, Math.PI * 2);
     radarCtx.fill();
     radarCtx.strokeStyle = "rgba(0, 230, 118, 0.5)";
     radarCtx.beginPath();
-    radarCtx.arc(cx, cy, 8, 0, Math.PI * 2);
+    radarCtx.arc(pannedCenter.x, pannedCenter.y, 8, 0, Math.PI * 2);
     radarCtx.stroke();
 
     // 3. Draw Transmitter Towers
@@ -1182,9 +1208,28 @@ function drawRadarScope() {
         
         // Target status color mapping
         let color = "#00e676";
-        if (t.state === "Coasting") color = "#ff9100";
-        if (t.state === "Suspect") color = "#ffea00";
-        if (t.state === "Terminated") color = "#90a4ae";
+        if (t.state === "Coasting") {
+            color = "#ff9100";
+        } else if (t.state === "Suspect") {
+            color = "#ffea00";
+        } else if (t.state === "Terminated") {
+            color = "#90a4ae";
+        } else {
+            if (t.tracking_towers && t.tracking_towers.length > 0) {
+                const lastTower = t.tracking_towers[t.tracking_towers.length - 1].toUpperCase();
+                if (lastTower.includes("WETA")) {
+                    color = "#00e5ff";
+                } else if (lastTower.includes("WTOP")) {
+                    color = "#e040fb";
+                } else if (lastTower.includes("WIYY")) {
+                    color = "#ffea00";
+                } else if (lastTower.includes("5G") || lastTower.includes("FIVEEG")) {
+                    color = "#29b6f6";
+                } else if (lastTower.includes("ATSC")) {
+                    color = "#ff8a80";
+                }
+            }
+        }
 
         // 4.1 Draw 95% confidence EKF uncertainty ellipse
         if (t.ekf_cov && t.ekf_cov.length >= 3) {
@@ -1201,8 +1246,8 @@ function drawRadarScope() {
             const theta = 0.5 * Math.atan2(2 * p_xy, diff);
 
             // Convert axes from meters to kilometers, scale by 2.448 for 95% confidence, then map to pixels
-            const aPixels = ((semiMajor / 1000) * 2.448 / 70) * maxRadius;
-            const bPixels = ((semiMinor / 1000) * 2.448 / 70) * maxRadius;
+            const aPixels = ((semiMajor / 1000) * 2.448 / 70) * maxRadius * radarZoom;
+            const bPixels = ((semiMinor / 1000) * 2.448 / 70) * maxRadius * radarZoom;
 
             radarCtx.save();
             radarCtx.strokeStyle = color;
@@ -1274,37 +1319,68 @@ function drawRadarScope() {
                 radarCtx.arc(pos.x, pos.y, 3, 0, Math.PI*2);
                 radarCtx.fill();
             }
-
-            // Minimal label
-            radarCtx.fillStyle = "rgba(0, 229, 255, 0.7)";
-            radarCtx.font = "9px Share Tech Mono";
-            radarCtx.fillText(t.callsign || `T${t.id}`, pos.x + 8, pos.y - 4);
         }
+
+        // Draw matched flight ADS-B overlay and accuracy metrics
+        if (t.matched_flight) {
+            const flightPos = enuToPixel(t.matched_flight.pos_enu[0] / 1000, t.matched_flight.pos_enu[1] / 1000);
+
+            // 1. Draw dashed correlation line
+            radarCtx.save();
+            radarCtx.strokeStyle = "rgba(255, 234, 0, 0.4)";
+            radarCtx.lineWidth = 1;
+            radarCtx.setLineDash([2, 2]);
+            radarCtx.beginPath();
+            radarCtx.moveTo(pos.x, pos.y);
+            radarCtx.lineTo(flightPos.x, flightPos.y);
+            radarCtx.stroke();
+            radarCtx.restore();
+
+            // 2. Draw true flight ADS-B marker (orange outline with semi-transparent fill)
+            radarCtx.save();
+            radarCtx.strokeStyle = "#f4511e";
+            radarCtx.fillStyle = "rgba(244, 81, 30, 0.2)";
+            radarCtx.lineWidth = 1.5;
+            radarCtx.beginPath();
+            radarCtx.arc(flightPos.x, flightPos.y, 4, 0, Math.PI * 2);
+            radarCtx.fill();
+            radarCtx.stroke();
+
+            // 3. Draw callsign label and accuracy percentage
+            radarCtx.fillStyle = "rgba(255, 255, 255, 0.75)";
+            radarCtx.font = "9px Share Tech Mono";
+            radarCtx.fillText(`${t.matched_flight.callsign} (ADS-B)`, flightPos.x + 8, flightPos.y - 4);
+
+            const midX = (pos.x + flightPos.x) / 2;
+            const midY = (pos.y + flightPos.y) / 2;
+            radarCtx.fillStyle = "#ffeb3b";
+            radarCtx.fillText(`Err: ${t.matched_flight.distance_error_m.toFixed(0)}m (${t.matched_flight.accuracy_pct.toFixed(1)}%)`, midX + 5, midY - 2);
+            radarCtx.restore();
+        }
+
+        // Minimal label
+        radarCtx.fillStyle = "rgba(0, 229, 255, 0.7)";
+        radarCtx.font = "9px Share Tech Mono";
+        radarCtx.fillText(t.callsign || `T${t.id}`, pos.x + 8, pos.y - 4);
     });
 
     // 5. Draw Sweeper Beam
-    const sweepRadius = maxRadius;
-    const gradient = radarCtx.createRadialGradient(cx, cy, 0, cx, cy, sweepRadius);
-    gradient.addColorStop(0, "rgba(0, 229, 255, 0.15)");
-    gradient.addColorStop(1, "rgba(0, 229, 255, 0.0)");
+    const sweepRadius = maxRadius * radarZoom;
 
-    radarCtx.fillStyle = gradient;
-    radarCtx.beginPath();
-    radarCtx.moveTo(cx, cy);
     // Draw sector for sweep fading trail
     const arcSegments = 20;
     for (let i = 0; i <= arcSegments; i++) {
         const angle = sweepAngle - (i / arcSegments) * (Math.PI / 6); // 30 deg trail
-        const rx = cx + Math.cos(angle) * sweepRadius;
-        const ry = cy + Math.sin(angle) * sweepRadius;
+        const rx = pannedCenter.x + Math.cos(angle) * sweepRadius;
+        const ry = pannedCenter.y + Math.sin(angle) * sweepRadius;
         
         // fade gradient relative to trail age
         radarCtx.fillStyle = `rgba(0, 229, 255, ${0.15 * (1 - i / arcSegments)})`;
         radarCtx.beginPath();
-        radarCtx.moveTo(cx, cy);
+        radarCtx.moveTo(pannedCenter.x, pannedCenter.y);
         const nextAngle = sweepAngle - ((i - 1) / arcSegments) * (Math.PI / 6);
-        radarCtx.lineTo(cx + Math.cos(angle) * sweepRadius, cy + Math.sin(angle) * sweepRadius);
-        radarCtx.lineTo(cx + Math.cos(nextAngle) * sweepRadius, cy + Math.sin(nextAngle) * sweepRadius);
+        radarCtx.lineTo(pannedCenter.x + Math.cos(angle) * sweepRadius, pannedCenter.y + Math.sin(angle) * sweepRadius);
+        radarCtx.lineTo(pannedCenter.x + Math.cos(nextAngle) * sweepRadius, pannedCenter.y + Math.sin(nextAngle) * sweepRadius);
         radarCtx.closePath();
         radarCtx.fill();
     }
@@ -1313,8 +1389,8 @@ function drawRadarScope() {
     radarCtx.strokeStyle = "rgba(0, 229, 255, 0.8)";
     radarCtx.lineWidth = 1.5;
     radarCtx.beginPath();
-    radarCtx.moveTo(cx, cy);
-    radarCtx.lineTo(cx + Math.cos(sweepAngle) * sweepRadius, cy + Math.sin(sweepAngle) * sweepRadius);
+    radarCtx.moveTo(pannedCenter.x, pannedCenter.y);
+    radarCtx.lineTo(pannedCenter.x + Math.cos(sweepAngle) * sweepRadius, pannedCenter.y + Math.sin(sweepAngle) * sweepRadius);
     radarCtx.stroke();
 
     const prevAngle = sweepAngle;
@@ -1323,7 +1399,7 @@ function drawRadarScope() {
     // Check sweep crossing for each target
     targets.forEach(t => {
         const pos = enuToPixel(t.pos_enu[0] / 1000, t.pos_enu[1] / 1000);
-        let tAngle = normAngle(Math.atan2(pos.y - cy, pos.x - cx));
+        let tAngle = normAngle(Math.atan2(pos.y - pannedCenter.y, pos.x - pannedCenter.x));
         if (angleBetween(tAngle, prevAngle, sweepAngle)) {
             // Trigger Doppler Beep
             const tx = t.pos_enu[0];
@@ -1344,10 +1420,14 @@ function drawRadarScope() {
             playDopplerBeep(pitch);
         }
     });
+
+    radarCtx.restore();
 }
 
 // Canvas Click interaction to select target
 radarCanvas.addEventListener("click", (e) => {
+    if (radarHasMoved) return; // Suppress selection click if the user was drag-panning
+
     const rect = radarCanvas.getBoundingClientRect();
     const clickX = e.clientX - rect.left;
     const clickY = e.clientY - rect.top;
@@ -1358,10 +1438,10 @@ radarCanvas.addEventListener("click", (e) => {
     const cy = h / 2;
     const maxRadius = Math.min(cx, cy) * 0.95;
 
-    // Convert pixel to ENU
+    // Convert pixel to ENU (taking zoom and pan into account)
     const pxToEnu = (x, y) => {
-        const x_km = ((x - cx) / maxRadius) * 70;
-        const y_km = -((y - cy) / maxRadius) * 70;
+        const x_km = ((x - cx - radarPanX) / (maxRadius * radarZoom)) * 70;
+        const y_km = -((y - cy - radarPanY) / (maxRadius * radarZoom)) * 70;
         return { x: x_km * 1000, y: y_km * 1000 };
     };
 
@@ -1417,8 +1497,8 @@ function project3D(x_km, y_km, z_km, w, h) {
     const maxDim = 140;
     const scale = Math.min(w, h) * 0.72 / maxDim;
 
-    const screenX = cx + x3 * scale;
-    const screenY = cy - z3 * scale; // screen coordinates are y-down
+    const screenX = cx + x3 * scale * elevationScale + elevationPanX;
+    const screenY = cy - z3 * scale * elevationScale + elevationPanY; // screen coordinates are y-down
 
     return { x: screenX, y: screenY };
 }
@@ -1535,9 +1615,28 @@ function draw3DElevation() {
         const groundPos = project3D(tx, ty, 0, w, h);
 
         let color = "#00e676";
-        if (t.state === "Coasting") color = "#ff9100";
-        if (t.state === "Suspect") color = "#ffea00";
-        if (t.state === "Terminated") color = "#90a4ae";
+        if (t.state === "Coasting") {
+            color = "#ff9100";
+        } else if (t.state === "Suspect") {
+            color = "#ffea00";
+        } else if (t.state === "Terminated") {
+            color = "#90a4ae";
+        } else {
+            if (t.tracking_towers && t.tracking_towers.length > 0) {
+                const lastTower = t.tracking_towers[t.tracking_towers.length - 1].toUpperCase();
+                if (lastTower.includes("WETA")) {
+                    color = "#00e5ff";
+                } else if (lastTower.includes("WTOP")) {
+                    color = "#e040fb";
+                } else if (lastTower.includes("WIYY")) {
+                    color = "#ffea00";
+                } else if (lastTower.includes("5G") || lastTower.includes("FIVEEG")) {
+                    color = "#29b6f6";
+                } else if (lastTower.includes("ATSC")) {
+                    color = "#ff8a80";
+                }
+            }
+        }
 
         // Vertical drop line to ground plane
         elevationCtx.strokeStyle = "rgba(0, 229, 255, 0.3)";
@@ -1564,9 +1663,28 @@ function draw3DElevation() {
                 const opacity = i / history.length;
                 
                 let baseColor = [0, 230, 118];
-                if (t.state === "Coasting") baseColor = [255, 145, 0];
-                if (t.state === "Suspect") baseColor = [255, 234, 0];
-                if (t.state === "Terminated") baseColor = [144, 164, 174];
+                if (t.state === "Coasting") {
+                    baseColor = [255, 145, 0];
+                } else if (t.state === "Suspect") {
+                    baseColor = [255, 234, 0];
+                } else if (t.state === "Terminated") {
+                    baseColor = [144, 164, 174];
+                } else {
+                    if (t.tracking_towers && t.tracking_towers.length > 0) {
+                        const lastTower = t.tracking_towers[t.tracking_towers.length - 1].toUpperCase();
+                        if (lastTower.includes("WETA")) {
+                            baseColor = [0, 229, 255];
+                        } else if (lastTower.includes("WTOP")) {
+                            baseColor = [224, 64, 251];
+                        } else if (lastTower.includes("WIYY")) {
+                            baseColor = [255, 234, 0];
+                        } else if (lastTower.includes("5G") || lastTower.includes("FIVEEG")) {
+                            baseColor = [41, 182, 246];
+                        } else if (lastTower.includes("ATSC")) {
+                            baseColor = [255, 138, 128];
+                        }
+                    }
+                }
 
                 elevationCtx.strokeStyle = `rgba(${baseColor[0]}, ${baseColor[1]}, ${baseColor[2]}, ${opacity * 0.75})`;
                 elevationCtx.lineWidth = isSelected ? 2.0 : 1.0;
@@ -1621,6 +1739,38 @@ function draw3DElevation() {
             elevationCtx.font = "9px Share Tech Mono";
             elevationCtx.textAlign = "left";
             elevationCtx.fillText(t.callsign || `T${t.id}`, targetPos.x + 6, targetPos.y - 2);
+        }
+
+        // Draw matched flight ADS-B overlay in 3D projection
+        if (t.matched_flight) {
+            const fx = t.matched_flight.pos_enu[0] / 1000;
+            const fy = t.matched_flight.pos_enu[1] / 1000;
+            const fz = t.matched_flight.pos_enu[2] / 1000;
+            const flightPos = project3D(fx, fy, fz, w, h);
+
+            // 1. Draw dashed correlation line in 3D
+            elevationCtx.save();
+            elevationCtx.strokeStyle = "rgba(255, 234, 0, 0.4)";
+            elevationCtx.lineWidth = 1;
+            elevationCtx.setLineDash([2, 2]);
+            elevationCtx.beginPath();
+            elevationCtx.moveTo(targetPos.x, targetPos.y);
+            elevationCtx.lineTo(flightPos.x, flightPos.y);
+            elevationCtx.stroke();
+            elevationCtx.restore();
+
+            // 2. Draw true flight ADS-B dot in 3D (orange)
+            elevationCtx.save();
+            elevationCtx.fillStyle = "#f4511e";
+            elevationCtx.beginPath();
+            elevationCtx.arc(flightPos.x, flightPos.y, 3, 0, Math.PI * 2);
+            elevationCtx.fill();
+
+            // 3. Draw callsign label
+            elevationCtx.fillStyle = "rgba(255, 255, 255, 0.75)";
+            elevationCtx.font = "8px Share Tech Mono";
+            elevationCtx.fillText(`${t.matched_flight.callsign} (ADS-B)`, flightPos.x + 6, flightPos.y - 2);
+            elevationCtx.restore();
         }
     });
 }
@@ -1870,23 +2020,34 @@ function drawJEMSpectrum() {
     }
 }
 
-// 3D Drag Rotation Event Listeners
+// 3D View Drag Rotation, Panning, and Zooming Event Listeners
 if (elevationCanvas) {
     elevationCanvas.addEventListener("mousedown", (e) => {
-        isDragging3d = true;
+        // If Right-click (button 2) or Shift key is pressed, trigger panning
+        if (e.button === 2 || e.shiftKey) {
+            isPanning3d = true;
+            isDragging3d = false;
+        } else {
+            isDragging3d = true;
+            isPanning3d = false;
+        }
         previousMousePosition = { x: e.clientX, y: e.clientY };
     });
 
     window.addEventListener("mousemove", (e) => {
-        if (isDragging3d) {
+        if (isDragging3d || isPanning3d) {
             const deltaX = e.clientX - previousMousePosition.x;
             const deltaY = e.clientY - previousMousePosition.y;
 
-            yaw3d += deltaX * 0.007;
-            pitch3d += deltaY * 0.007;
-
-            // clamp pitch to avoid flipping upside down
-            pitch3d = Math.max(-Math.PI / 2 + 0.05, Math.min(Math.PI / 2 - 0.05, pitch3d));
+            if (isDragging3d) {
+                yaw3d += deltaX * 0.007;
+                pitch3d += deltaY * 0.007;
+                // clamp pitch to avoid flipping upside down
+                pitch3d = Math.max(-Math.PI / 2 + 0.05, Math.min(Math.PI / 2 - 0.05, pitch3d));
+            } else if (isPanning3d) {
+                elevationPanX += deltaX;
+                elevationPanY += deltaY;
+            }
 
             previousMousePosition = { x: e.clientX, y: e.clientY };
         }
@@ -1894,6 +2055,66 @@ if (elevationCanvas) {
 
     window.addEventListener("mouseup", () => {
         isDragging3d = false;
+        isPanning3d = false;
+    });
+
+    elevationCanvas.addEventListener("contextmenu", (e) => {
+        e.preventDefault(); // Suppress context menu on right-click drag
+    });
+
+    elevationCanvas.addEventListener("wheel", (e) => {
+        e.preventDefault();
+        const zoomFactor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+        elevationScale = Math.min(10.0, Math.max(0.1, elevationScale * zoomFactor));
+    });
+}
+
+// 2D Radar PPI Scope Drag Panning and Zooming Event Listeners
+if (radarCanvas) {
+    radarCanvas.addEventListener("mousedown", (e) => {
+        isDraggingRadar = true;
+        radarHasMoved = false;
+        previousMousePosition = { x: e.clientX, y: e.clientY };
+    });
+
+    window.addEventListener("mousemove", (e) => {
+        if (isDraggingRadar) {
+            const deltaX = e.clientX - previousMousePosition.x;
+            const deltaY = e.clientY - previousMousePosition.y;
+
+            radarPanX += deltaX;
+            radarPanY += deltaY;
+
+            if (Math.abs(deltaX) > 2 || Math.abs(deltaY) > 2) {
+                radarHasMoved = true;
+            }
+
+            previousMousePosition = { x: e.clientX, y: e.clientY };
+        }
+    });
+
+    window.addEventListener("mouseup", () => {
+        isDraggingRadar = false;
+    });
+
+    radarCanvas.addEventListener("wheel", (e) => {
+        e.preventDefault();
+        const rect = radarCanvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+
+        const w = radarCanvas.width;
+        const h = radarCanvas.height;
+        const cx = w / 2;
+        const cy = h / 2;
+
+        const zoomFactor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+        const nextZoom = Math.min(20.0, Math.max(0.2, radarZoom * zoomFactor));
+
+        // Adjust translation offsets to center zoom on the mouse pointer position
+        radarPanX = mouseX - cx - (mouseX - cx - radarPanX) * (nextZoom / radarZoom);
+        radarPanY = mouseY - cy - (mouseY - cy - radarPanY) * (nextZoom / radarZoom);
+        radarZoom = nextZoom;
     });
 }
 // Fullscreen Zoom Buttons Click Handler
@@ -1979,6 +2200,16 @@ if (sdrOneBitInputListener) {
         const val = e.target.checked;
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ command: "set_one_bit_mode", value: val }));
+        }
+    });
+}
+
+const sdrHoppingInputListener = document.getElementById("sdr-hopping");
+if (sdrHoppingInputListener) {
+    sdrHoppingInputListener.addEventListener("change", (e) => {
+        const val = e.target.checked;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ command: "set_hopping", value: val }));
         }
     });
 }

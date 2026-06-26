@@ -198,6 +198,9 @@ pub struct Dashboard {
     pub payload_class_override: String,
     pub tracking_mode: crate::tracking::ekf::TrackingMode,
     pub is_hopping: bool,
+    pub e8_mode_enabled: bool,
+    pub morse_persistence: f32,
+    pub cohomology_firewall_enabled: bool,
 }
 
 impl Dashboard {
@@ -330,6 +333,9 @@ impl Dashboard {
             payload_class_override: "Auto".to_string(),
             tracking_mode: crate::tracking::ekf::TrackingMode::Airspace,
             is_hopping: false,
+            e8_mode_enabled: false,
+            morse_persistence: 0.0f32,
+            cohomology_firewall_enabled: false,
         }
     }
 
@@ -1323,6 +1329,9 @@ impl Dashboard {
         // Filter out OFFLINE tracks that terminated more than 30 seconds ago, and unconfirmed tracks if show_unconfirmed is false
         const OFFLINE_DISPLAY_SECS: f64 = 30.0;
         sorted_targets.retain(|t| {
+            if Some(t.id) == self.selected_target_id {
+                return true; // Keep selected target indefinitely
+            }
             if !self.show_unconfirmed && t.state == crate::tracking::bank::TrackState::Suspect {
                 return false;
             }
@@ -1776,11 +1785,32 @@ impl Dashboard {
                     continue;
                 }
                 let is_selected = selected_target_id == Some(target.id);
-                let color = match target.state {
-                    crate::tracking::bank::TrackState::Active => Color::Green,
-                    crate::tracking::bank::TrackState::Coasting => Color::Rgb(180, 140, 0),
-                    crate::tracking::bank::TrackState::Suspect => Color::Yellow,
-                    crate::tracking::bank::TrackState::Terminated => Color::DarkGray,
+                let color = if target.state == crate::tracking::bank::TrackState::Active {
+                    if let Some(last_tower) = target.tracking_towers.last() {
+                        let upper = last_tower.to_uppercase();
+                        if upper.contains("WETA") {
+                            Color::Cyan
+                        } else if upper.contains("WTOP") {
+                            Color::Magenta
+                        } else if upper.contains("WIYY") {
+                            Color::Yellow
+                        } else if upper.contains("5G") || upper.contains("FIVEEG") {
+                            Color::LightBlue
+                        } else if upper.contains("ATSC") {
+                            Color::LightRed
+                        } else {
+                            Color::Green
+                        }
+                    } else {
+                        Color::Green
+                    }
+                } else {
+                    match target.state {
+                        crate::tracking::bank::TrackState::Active => Color::Green,
+                        crate::tracking::bank::TrackState::Coasting => Color::Rgb(180, 140, 0),
+                        crate::tracking::bank::TrackState::Suspect => Color::Yellow,
+                        crate::tracking::bank::TrackState::Terminated => Color::DarkGray,
+                    }
                 };
 
                 // Draw history trail (draw this even for terminated tracks to show snail trails)
@@ -1797,11 +1827,32 @@ impl Dashboard {
                             1.0
                         };
 
-                        let base_color = match target.state {
-                            crate::tracking::bank::TrackState::Active => (0.0, 255.0, 0.0),
-                            crate::tracking::bank::TrackState::Coasting => (180.0, 140.0, 0.0),
-                            crate::tracking::bank::TrackState::Suspect => (255.0, 255.0, 0.0),
-                            crate::tracking::bank::TrackState::Terminated => (100.0, 100.0, 100.0),
+                        let base_color = if target.state == crate::tracking::bank::TrackState::Active {
+                            if let Some(last_tower) = target.tracking_towers.last() {
+                                let upper = last_tower.to_uppercase();
+                                if upper.contains("WETA") {
+                                    (0.0, 229.0, 255.0)
+                                } else if upper.contains("WTOP") {
+                                    (224.0, 64.0, 251.0)
+                                } else if upper.contains("WIYY") {
+                                    (255.0, 234.0, 0.0)
+                                } else if upper.contains("5G") || upper.contains("FIVEEG") {
+                                    (41.0, 182.0, 246.0)
+                                } else if upper.contains("ATSC") {
+                                    (255.0, 138.0, 128.0)
+                                } else {
+                                    (0.0, 255.0, 0.0)
+                                }
+                            } else {
+                                (0.0, 255.0, 0.0)
+                            }
+                        } else {
+                            match target.state {
+                                crate::tracking::bank::TrackState::Active => (0.0, 255.0, 0.0),
+                                crate::tracking::bank::TrackState::Coasting => (180.0, 140.0, 0.0),
+                                crate::tracking::bank::TrackState::Suspect => (255.0, 255.0, 0.0),
+                                crate::tracking::bank::TrackState::Terminated => (100.0, 100.0, 100.0),
+                            }
                         };
 
                         let r = (base_color.0 * alpha).min(255.0) as u8;
