@@ -34,10 +34,14 @@ A high-performance, real-time software-defined radio (SDR) passive radar system 
 cargo build --release
 ```
 
-To compile completely without GPU support (e.g., for minimal edge devices):
+To disable the optional GPU FFT feature (for example, to use the CPU FFT path):
 ```bash
 cargo build --release --no-default-features
 ```
+
+The manifest also includes `wgpu` as a regular dependency, so this option
+does not remove every GPU-related crate from the build. At runtime,
+`--disable-gpu` selects the CPU FFT path.
 
 ## Usage
 
